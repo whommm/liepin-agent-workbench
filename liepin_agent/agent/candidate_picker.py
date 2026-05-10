@@ -1,0 +1,97 @@
+"""Decide whether and which candidate details should be fetched."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import List
+
+from ..domain.models import CandidateSummary, FetchDecision, Observation
+from ..domain.states import RoundType
+
+
+class CandidatePicker:
+    def decide(
+        self,
+        observation: Observation,
+        candidates: List[CandidateSummary],
+        remaining_detail_budget: int,
+    ) -> FetchDecision:
+        round_type = observation.recommended_round_type
+        if round_type == RoundType.SKIP_DETAIL.value or remaining_detail_budget <= 0:
+            return FetchDecision(
+                action="skip_detail",
+                round_type=RoundType.SKIP_DETAIL.value,
+                reason=observation.reason,
+            )
+
+        if round_type == RoundType.SAMPLE_DETAIL.value:
+            limit = min(4, remaining_detail_budget)
+            policy = {"mode": "wait_min_results", "min_results": min(2, limit), "timeout_seconds": 90}
+            strategy = {"high_confidence": 1, "diversity": 2, "uncertain": 1}
+        elif round_type == RoundType.VALIDATE_DETAIL.value:
+            limit = min(8, remaining_detail_budget)
+            policy = {"mode": "wait_min_results", "min_results": min(5, limit), "timeout_seconds": 180}
+            strategy = {"high_confidence": 5, "diversity": 2, "uncertain": 1}
+        else:
+            limit = min(15, remaining_detail_budget)
+            policy = {"mode": "no_wait"}
+            strategy = {"high_confidence": 12, "diversity": 2, "uncertain": 1}
+
+        picked = self._pick_candidates(candidates, limit)
+        return FetchDecision(
+            action="fetch_details" if picked else "skip_detail",
+            round_type=round_type,
+            candidate_ids=[item.id for item in picked],
+            fetch_limit=len(picked),
+            sampling_strategy=strategy,
+            match_wait_policy=policy,
+            reason="按{}策略选择 {} 位候选人抓详情。{}".format(
+                round_type,
+                len(picked),
+                observation.reason,
+            ),
+        )
+
+    @staticmethod
+    def _pick_candidates(
+        candidates: List[CandidateSummary], limit: int
+    ) -> List[CandidateSummary]:
+        if limit <= 0:
+            return []
+        sorted_candidates = sorted(
+            candidates or [],
+            key=lambda item: (
+                0 if item.card_decision == "fetch" else 1 if item.card_decision == "maybe" else 2,
+                -len(item.card_signals or []),
+                item.result_index,
+            ),
+        )
+        picked: List[CandidateSummary] = []
+        seen = set()
+
+        for item in sorted_candidates:
+            if item.id not in seen and item.card_decision == "fetch":
+                picked.append(item)
+                seen.add(item.id)
+            if len(picked) >= max(1, int(limit * 0.65)):
+                break
+
+        by_company = defaultdict(list)
+        for item in sorted_candidates:
+            by_company[item.current_company or "未知公司"].append(item)
+        for _, group in by_company.items():
+            for item in group:
+                if item.id not in seen:
+                    picked.append(item)
+                    seen.add(item.id)
+                    break
+            if len(picked) >= limit:
+                return picked[:limit]
+
+        for item in sorted_candidates:
+            if item.id not in seen:
+                picked.append(item)
+                seen.add(item.id)
+            if len(picked) >= limit:
+                break
+        return picked[:limit]

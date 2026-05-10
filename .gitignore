@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.db
+*.db-shm
+*.db-wal
+config.json
+.env
+logs/
+exports/
+debug_artifacts/
+browser_profile/

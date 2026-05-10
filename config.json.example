@@ -1,0 +1,7 @@
+{
+  "theme": "light",
+  "liepin_browser_channel": "msedge",
+  "liepin_browser_headless": false,
+  "liepin_browser_profile_dir": "browser_profile/liepin",
+  "debug_snapshots_enabled": false
+}
