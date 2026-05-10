@@ -289,6 +289,7 @@ class AgentRuntime:
                     "正在打开/操作猎聘搜索页，读取结果卡片。",
                     {"query": plan.query, "position_filter": plan.position_filter},
                 )
+                search_started = time.monotonic()
                 try:
                     raw_candidates = self.browser_queue.run(
                         self.liepin_tool.run_search_round,
@@ -307,7 +308,7 @@ class AgentRuntime:
                         AgentEventType.SEARCH_EXECUTED.value,
                         "本轮无搜索结果",
                         "当前关键词未搜索到候选人，Agent 将复盘并尝试下一组关键词。",
-                        {"query": plan.query, "reason": str(exc)},
+                        {"duration_ms": int((time.monotonic() - search_started) * 1000)},
                     )
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 candidates = self._persist_round_candidates(
@@ -341,6 +342,7 @@ class AgentRuntime:
                     {
                         "raw_count": len(raw_candidates),
                         "prequalified_count": prequalified_count,
+                        "duration_ms": int((time.monotonic() - search_started) * 1000),
                     },
                 )
 
@@ -649,6 +651,7 @@ class AgentRuntime:
             self.store.update_candidate_status(
                 candidate_id, CandidateStatus.DETAIL_FETCHING.value
             )
+            detail_started = time.monotonic()
             try:
                 detail = self.browser_queue.run(
                     self.liepin_tool.fetch_candidate_detail,
@@ -670,7 +673,10 @@ class AgentRuntime:
                     AgentEventType.ERROR.value,
                     "简历详情抓取失败",
                     "{}：{}".format(candidate.get("name") or "候选人", exc),
-                    {"candidate_id": candidate_id},
+                    {
+                        "candidate_id": candidate_id,
+                        "duration_ms": int((time.monotonic() - detail_started) * 1000),
+                    },
                 )
                 continue
             self.store.save_candidate_detail(detail)
