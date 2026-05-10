@@ -1,10 +1,12 @@
-"""配置管理模块"""
+"""配置管理模块（支持 Pydantic 校验）"""
 
 import json
 import os
 import sys
-from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Optional
+
+from pydantic import BaseModel, Field, field_validator
 
 
 API_ENV_NAMES = {
@@ -15,22 +17,28 @@ API_ENV_NAMES = {
 }
 
 
-@dataclass
-class AppConfig:
-    """应用配置数据类"""
+class AppConfig(BaseModel):
+    """应用配置数据类（Pydantic 校验）"""
 
     api_base_url: str = ""
     api_key: str = ""
     api_key_env: str = "LIEPIN_AGENT_API_KEY"
     model_name: str = "deepseek-chat"
     tavily_api_key: str = ""
-    timeout: int = 120
+    timeout: int = Field(default=120, ge=1, le=3600)
     theme: str = "light"
-    liepin_browser_channel: str = "msedge"  # 默认使用 Edge 浏览器
+    liepin_browser_channel: str = "msedge"
     liepin_browser_headless: bool = False
     liepin_browser_profile_dir: str = "browser_profile/liepin"
     greeting_template: str = ""
     debug_snapshots_enabled: bool = False
+
+    @field_validator("timeout", mode="before")
+    @classmethod
+    def _coerce_timeout(cls, v):
+        if v is None or v == "":
+            return 120
+        return int(v)
 
 
 class ConfigManager:
@@ -38,7 +46,6 @@ class ConfigManager:
 
     def __init__(self, config_path: Optional[str] = None):
         if config_path is None:
-            # 配置文件放在程序同级目录
             self.config_path = self._get_default_config_path()
         else:
             self.config_path = config_path
@@ -47,7 +54,6 @@ class ConfigManager:
 
     def _get_default_config_path(self) -> str:
         """获取默认配置文件路径"""
-        # 支持打包后的路径
         if getattr(sys, "frozen", False):
             base_dir = os.path.dirname(sys.executable)
         else:
@@ -58,16 +64,16 @@ class ConfigManager:
 
     def _load_config(self) -> AppConfig:
         """从文件加载配置"""
-        config = AppConfig()
+        data = {}
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                valid_fields = {f.name for f in AppConfig.__dataclass_fields__.values()}
-                filtered = {k: v for k, v in data.items() if k in valid_fields}
-                config = AppConfig(**filtered)
-            except (json.JSONDecodeError, TypeError, KeyError):
-                config = AppConfig()
+                    file_data = json.load(f)
+                if isinstance(file_data, dict):
+                    data = file_data
+            except (json.JSONDecodeError, TypeError, OSError):
+                pass
+        config = AppConfig.model_validate(data)
         self._apply_env_config(config)
         return config
 
@@ -75,13 +81,13 @@ class ConfigManager:
         """保存配置到文件"""
         try:
             self._save_env_config()
-            data = asdict(self.config)
+            data = self.config.model_dump()
             # API settings live in .env. Keep config.json for non-sensitive UI
             # and browser options so restarting does not require retyping keys.
             data["api_base_url"] = ""
             data["api_key"] = ""
             data["model_name"] = ""
-            data["timeout"] = AppConfig.timeout
+            data["timeout"] = AppConfig.model_fields["timeout"].default
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             return True

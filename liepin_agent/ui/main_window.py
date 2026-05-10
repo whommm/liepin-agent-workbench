@@ -283,8 +283,9 @@ class MainWindow(QMainWindow):
         self._connect_events()
         self._apply_style()
 
+        # Use event-driven refresh with a long-interval heartbeat fallback
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(900)
+        self.refresh_timer.setInterval(10000)
         self.refresh_timer.timeout.connect(self._refresh_if_dirty)
         self.refresh_timer.start()
         self.refresh_all()
@@ -867,6 +868,9 @@ class MainWindow(QMainWindow):
 
     def _mark_dirty(self) -> None:
         self._dirty = True
+        # Trigger refresh on next event loop iteration instead of waiting for timer
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._refresh_if_dirty)
 
     def _handle_runtime_event(
         self, event_type: str, payload: Dict[str, object]

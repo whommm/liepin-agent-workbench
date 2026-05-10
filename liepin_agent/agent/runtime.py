@@ -295,6 +295,7 @@ class AgentRuntime:
                         session_id,
                         round_id,
                         plan,
+                        cancel_event=cancel_event,
                     )
                 except Exception as exc:
                     if not self._is_no_results_error(exc):
@@ -650,7 +651,9 @@ class AgentRuntime:
             )
             try:
                 detail = self.browser_queue.run(
-                    self.liepin_tool.fetch_candidate_detail, candidate
+                    self.liepin_tool.fetch_candidate_detail,
+                    candidate,
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
                 detail = CandidateDetail(
@@ -759,6 +762,11 @@ class AgentRuntime:
         min_results = len(futures)
         deadline = time.time() + max(1, timeout_seconds)
         while time.time() < deadline:
+            if cancel_event.is_set():
+                for future in futures:
+                    if not future.done():
+                        future.cancel()
+                break
             self._respect_control_flags(session_id, cancel_event, pause_event)
             completed = sum(1 for item in futures if item.done())
             if completed >= min_results or completed >= len(futures):

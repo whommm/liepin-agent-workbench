@@ -1,10 +1,11 @@
-"""Concurrent queue for LLM candidate matching tasks."""
+"""Concurrent queue for LLM candidate matching tasks with cancellation support."""
 
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, Iterable, List
+from typing import Any, Callable, Iterable, List, Optional
 
 
 class MatchQueue:
@@ -23,6 +24,7 @@ class MatchQueue:
         futures: Iterable[Future],
         min_results: int,
         timeout_seconds: int,
+        cancel_event: Optional[threading.Event] = None,
     ) -> int:
         future_list: List[Future] = list(futures or [])
         if not future_list:
@@ -30,6 +32,10 @@ class MatchQueue:
         deadline = time.time() + max(1, int(timeout_seconds or 1))
         min_results = max(1, int(min_results or 1))
         while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                for f in future_list:
+                    f.cancel()
+                return sum(1 for item in future_list if item.done())
             completed = sum(1 for item in future_list if item.done())
             if completed >= min_results or completed >= len(future_list):
                 return completed
@@ -37,10 +43,18 @@ class MatchQueue:
         return sum(1 for item in future_list if item.done())
 
     @staticmethod
-    def wait_all(futures: Iterable[Future], timeout_seconds: int = 600) -> int:
+    def wait_all(
+        futures: Iterable[Future],
+        timeout_seconds: int = 600,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> int:
         future_list = list(futures or [])
         deadline = time.time() + max(1, int(timeout_seconds or 1))
         while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                for f in future_list:
+                    f.cancel()
+                return sum(1 for item in future_list if item.done())
             completed = sum(1 for item in future_list if item.done())
             if completed >= len(future_list):
                 return completed
@@ -49,4 +63,3 @@ class MatchQueue:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
-
