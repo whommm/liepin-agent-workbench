@@ -241,11 +241,13 @@ class _DetailMixin:
         return result_page
 
 
+    @staticmethod
     def _is_detail_page_url(url: str) -> bool:
         normalized = (url or "").lower()
         return "showresumedetail" in normalized or "/resume/" in normalized
 
 
+    @staticmethod
     def _ensure_absolute_url(url: str) -> str:
         if url and url.startswith("/") and not url.startswith("//"):
             return "https://h.liepin.com" + url

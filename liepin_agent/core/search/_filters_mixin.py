@@ -440,6 +440,7 @@ class _FiltersMixin:
         return normalized
 
 
+    @staticmethod
     def _normalize_dropdown_filter_value(
         spec: LiepinFilterFieldSpec, value: str
     ) -> str:
@@ -487,6 +488,7 @@ class _FiltersMixin:
         return normalized
 
 
+    @staticmethod
     def _normalize_range_filter_value(value: object) -> Tuple[str, str]:
         if isinstance(value, dict):
             low_keys = (
@@ -559,10 +561,12 @@ class _FiltersMixin:
         return "", ""
 
 
+    @staticmethod
     def _normalize_filter_title_text(value: str) -> str:
         return re.sub(r"[\s:：]", "", value or "")
 
 
+    @staticmethod
     def _extract_tag_texts(container) -> List[str]:
         try:
             text = container.inner_text(timeout=1200) or ""
@@ -572,6 +576,7 @@ class _FiltersMixin:
         return [item for item in patterns if item in text]
 
 
+    @staticmethod
     def _focus_dropdown_input(container, input_locator) -> None:
         """Focus an Ant Select field without clicking through its display text."""
         try:
@@ -620,6 +625,7 @@ class _FiltersMixin:
         raise LiepinSearchPageChangedError("未找到下拉选项: {}".format(value))
 
 
+    @staticmethod
     def _select_dropdown_option_by_keyboard(page: Page, value: str) -> None:
         """Fallback for Ant Select fields where visible option locators are unstable."""
         steps_by_value = {
@@ -677,6 +683,7 @@ class _FiltersMixin:
         raise LiepinSearchPageChangedError(error_message)
 
 
+    @staticmethod
     def _fill_filter_input(locator, value: str) -> None:
         locator.click(timeout=3000)
         try:

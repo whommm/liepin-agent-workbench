@@ -107,6 +107,7 @@ class _BaseMixin:
             logger.debug("JS dismiss modal failed: %s", exc)
 
 
+    @staticmethod
     def _first_visible_locator(owner, selectors: List[str], timeout: int = 500):
         fallback = None
         for selector in selectors:
@@ -151,6 +152,7 @@ class _BaseMixin:
         raise LiepinSearchPageChangedError("城市筛选确认按钮未启用")
 
 
+    @staticmethod
     def _is_enabled_locator(locator) -> bool:
         try:
             disabled = locator.get_attribute("disabled")
@@ -165,6 +167,7 @@ class _BaseMixin:
             return False
 
 
+    @staticmethod
     def _locator_top(locator) -> float:
         """Return the vertical position for one locator."""
         try:
@@ -236,6 +239,7 @@ class _BaseMixin:
             raise LiepinSearchPageChangedError("关键词未能写入搜索输入框")
 
 
+    @staticmethod
     def _is_editable_input(locator) -> bool:
         """Return whether a locator points to a visible, enabled text input."""
         try:

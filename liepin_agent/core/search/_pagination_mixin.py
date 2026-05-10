@@ -345,6 +345,7 @@ class _PaginationMixin:
             return False
 
 
+    @staticmethod
     def _is_disabled_pagination(locator) -> bool:
         try:
             disabled = locator.get_attribute("disabled")

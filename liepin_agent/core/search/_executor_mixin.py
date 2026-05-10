@@ -186,6 +186,7 @@ class _ExecutorMixin:
                 break
 
 
+    @staticmethod
     def _click_text_control(page: Page, text: str) -> bool:
         if not text:
             return False
@@ -327,6 +328,7 @@ class _ExecutorMixin:
         return hits >= 1
 
 
+    @staticmethod
     def _page_looks_empty(page: Page) -> bool:
         empty_markers = (
             "没找到相关匹配项",
