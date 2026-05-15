@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 class LiepinBrowserManager:
     """Manage a persistent Playwright browser context for Liepin."""
 
-    LOGIN_URL = "https://www.liepin.com/"
+    LOGIN_URL = "https://h.liepin.com/"
     SEARCH_URL = "https://h.liepin.com/search/getConditionItem"
 
     def __init__(self, config_manager: Optional[ConfigManager] = None):

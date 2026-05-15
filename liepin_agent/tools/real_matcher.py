@@ -36,11 +36,15 @@ class RealMatchService:
     def from_config(cls, config_manager: Optional[ConfigManager] = None) -> "RealMatchService":
         manager = config_manager or ConfigManager()
         config = manager.config
+        # Backend LLM config: fallback to default if any field is empty
+        backend_url = config.backend_api_base_url or config.api_base_url
+        backend_key = config.backend_api_key or config.api_key
+        backend_model = config.backend_model_name or config.model_name
         return cls(
             LLMClient(
-                api_base_url=config.api_base_url,
-                api_key=config.api_key,
-                model_name=config.model_name,
+                api_base_url=backend_url,
+                api_key=backend_key,
+                model_name=backend_model,
                 timeout=config.timeout,
             )
         )

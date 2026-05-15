@@ -68,12 +68,13 @@ class _MatchMixin:
                     now_text(),
                 ),
             )
-        self.update_candidate_status(
-            result.candidate_id,
-            CandidateStatus.SHORTLISTED.value
-            if (result.tier or "").upper() in ("A", "B")
-            else CandidateStatus.REJECTED.value,
-        )
+        if result.status == "failed":
+            candidate_status = CandidateStatus.DEFERRED.value
+        elif (result.tier or "").upper() in ("A", "B"):
+            candidate_status = CandidateStatus.SHORTLISTED.value
+        else:
+            candidate_status = CandidateStatus.REJECTED.value
+        self.update_candidate_status(result.candidate_id, candidate_status)
         return match_id
 
 

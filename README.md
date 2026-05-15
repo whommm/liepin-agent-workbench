@@ -20,6 +20,8 @@
 
 ## 启动
 
+### 开发环境
+
 安装依赖：
 
 ```powershell
@@ -31,6 +33,40 @@ python -m pip install -e .[dev]
 ```powershell
 python -m liepin_agent.main
 ```
+
+### 虚拟环境（推荐）
+
+项目提供了虚拟环境管理脚本：
+
+1. **创建虚拟环境**：双击运行 `创建虚拟环境.bat`
+   - 自动创建 `.venv` 虚拟环境
+   - 安装项目依赖 + PyInstaller 打包工具
+   - 自动安装 Playwright Chromium 浏览器
+
+2. **启动程序**：`.venv\Scripts\python -m liepin_agent.main`
+
+### 打包为 EXE
+
+使用 PyInstaller 打包成独立可执行文件：
+
+1. 确保已创建虚拟环境（见上一步）
+2. 双击运行 `打包为exe.bat`
+3. 打包完成后，输出在 `dist\猎聘寻访Agent工作台\` 目录
+
+打包后输出单个可执行文件：
+- `猎聘寻访Agent工作台.exe`（约 110MB）— 双击即可运行
+
+首次运行后，exe 同级目录会自动生成：
+- `config.json` + `.env` — 配置文件
+- `liepin_agent_workbench.db` — SQLite 数据库
+- `browser_profile/` — 浏览器 Profile 目录
+- `exports/` — 导出文件目录
+- `logs/` — 运行日志
+
+> **注意**：
+> - 首次启动会稍慢（需要把依赖解压到临时目录）
+> - 目标机器若已安装 **Edge** 或 **Chrome**，程序会自动调用系统浏览器，无需额外操作
+> - 仅在目标机器没有 Edge/Chrome 时，才需要运行 `playwright install chromium`
 
 运行测试：
 
@@ -70,7 +106,7 @@ python -m liepin_agent.check_real_runtime
 
 1. 继续：启动或恢复该任务。
 2. 终止：请求停止该任务。
-3. 导出：导出该任务候选人。
+3. 导出：导出该任务候选人。Excel 会包含推荐总览、合格/待复核/不合格分组和全字段明细，同时生成每位候选人的 Word 档案。
 4. 删除：删除该任务及全部候选人、日志和匹配结果。
 
 任务状态中：
@@ -87,7 +123,7 @@ python -m liepin_agent.check_real_runtime
 本项目定位为寻访辅助和证据整理工具，不做自动雇佣决策：
 
 1. 不自动淘汰候选人。
-2. 不自动联系候选人。
+2. 不自动联系候选人；打招呼只能由人工在任务结束或暂停后选中候选人手动触发。
 3. 不把分数作为最终判断。
 4. 匹配结果应以证据、缺口、风险和待确认问题为核心，A/B/C/D 只是标签。
 

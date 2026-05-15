@@ -10,6 +10,8 @@ def test_api_config_persists_to_project_env_not_config_json(tmp_path):
         api_base_url="https://api.example.com/v1",
         api_key="secret-key",
         model_name="demo-model",
+        auto_greeting_enabled=True,
+        greeting_template="您好，方便沟通吗？",
     )
 
     assert manager.save_config() is True
@@ -22,12 +24,16 @@ def test_api_config_persists_to_project_env_not_config_json(tmp_path):
     assert "LIEPIN_AGENT_API_BASE_URL=https://api.example.com/v1" in env_text
     assert "LIEPIN_AGENT_API_KEY=secret-key" in env_text
     assert "LIEPIN_AGENT_MODEL_NAME=demo-model" in env_text
+    assert data["auto_greeting_enabled"] is True
+    assert data["greeting_template"] == "您好，方便沟通吗？"
 
     reloaded = ConfigManager(str(config_path))
 
     assert reloaded.config.api_base_url == "https://api.example.com/v1"
     assert reloaded.config.api_key == "secret-key"
     assert reloaded.config.model_name == "demo-model"
+    assert reloaded.config.auto_greeting_enabled is True
+    assert reloaded.config.greeting_template == "您好，方便沟通吗？"
 
 
 def test_os_env_overrides_project_env(tmp_path, monkeypatch):

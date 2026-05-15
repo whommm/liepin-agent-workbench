@@ -173,6 +173,7 @@ class AgentRuntime:
                     target_met=False,
                     should_stop=False,
                     stop_reason="",
+                    criteria=criteria,
                 )
                 plan = recovery_review.next_plan or self.brain.initial_plan(
                     jd_text, user_notes, criteria
@@ -196,9 +197,9 @@ class AgentRuntime:
                 )
                 plan = self.brain.initial_plan(jd_text, user_notes, criteria)
             consecutive_low_yield_rounds = 0
-            max_rounds = int(session.get("max_rounds") or 6)
-            max_detail_fetches = int(session.get("max_detail_fetches") or 50)
-            target_ab_count = int(session.get("target_ab_count") or 10)
+            max_rounds = int(session.get("max_rounds") or 10)
+            max_detail_fetches = int(session.get("max_detail_fetches") or 999)
+            target_ab_count = int(session.get("target_ab_count") or 999)
             max_runtime_minutes = int(session.get("max_runtime_minutes") or 0)
             run_mode = str(session.get("mode") or "自动")
 
@@ -436,7 +437,9 @@ class AgentRuntime:
                         cancel_event,
                         pause_event,
                         session_id,
+                        round_id,
                     )
+                    self._respect_control_flags(session_id, cancel_event, pause_event)
                 else:
                     self.store.update_round(round_id, status=RoundStatus.SKIPPED.value)
 
@@ -487,6 +490,7 @@ class AgentRuntime:
                     target_met=total_ab_count >= target_ab_count,
                     should_stop=stop.should_stop,
                     stop_reason=stop.reason,
+                    criteria=criteria,
                 )
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 self.store.update_round(
@@ -518,6 +522,24 @@ class AgentRuntime:
                 if review.action == "stop" or not review.next_plan:
                     break
                 plan = review.next_plan
+
+                user_cmd = self.store.consume_pending_user_command(session_id)
+                if user_cmd:
+                    adjusted = self.brain.apply_user_command(
+                        user_cmd, plan, criteria
+                    )
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.JOB_UNDERSTANDING.value,
+                        "已采纳用户指令",
+                        user_cmd,
+                        {
+                            "original_query": plan.query,
+                            "adjusted_query": adjusted.query,
+                        },
+                    )
+                    plan = adjusted
 
                 if run_mode in {"单步", "监督"} and round_index < max_rounds:
                     self.store.update_session_status(
@@ -706,6 +728,8 @@ class AgentRuntime:
                 candidate_id,
                 detail.resume_text,
                 criteria,
+                cancel_event,
+                pause_event,
             )
             futures.append(future)
         self._notify(session_id)
@@ -718,17 +742,49 @@ class AgentRuntime:
         candidate_id: str,
         resume_text: str,
         criteria: Dict[str, object],
+        cancel_event: Optional[threading.Event] = None,
+        pause_event: Optional[threading.Event] = None,
     ) -> MatchResult:
         if not self._session_allows_background_write(session_id):
             raise RuntimeError("任务已取消，跳过后台匹配写入")
         self.store.update_candidate_status(candidate_id, CandidateStatus.MATCHING.value)
-        result = self.matcher.match_candidate(
-            session_id=session_id,
-            round_id=round_id,
-            candidate_id=candidate_id,
-            resume_text=resume_text,
-            criteria=criteria,
-        )
+        try:
+            result = self.matcher.match_candidate(
+                session_id=session_id,
+                round_id=round_id,
+                candidate_id=candidate_id,
+                resume_text=resume_text,
+                criteria=criteria,
+            )
+        except Exception as exc:
+            if not self._session_allows_background_write(session_id):
+                raise
+            result = MatchResult(
+                candidate_id=candidate_id,
+                session_id=session_id,
+                round_id=round_id,
+                tier="C",
+                summary="匹配失败，需人工复核。",
+                risks=str(exc),
+                recommendation="人工复核后再决定是否推进。",
+                detail=str(exc),
+                status="failed",
+                criteria_version_id=str(criteria.get("criteria_version_id") or ""),
+                missing_or_unclear=["模型匹配任务失败"],
+                questions_to_verify=["请人工复核该候选人与岗位要求的匹配度"],
+                confidence="low",
+            )
+            self.store.save_match_result(result)
+            self._event(
+                session_id,
+                round_id,
+                AgentEventType.ERROR.value,
+                "候选人匹配失败",
+                str(exc),
+                {"candidate_id": candidate_id},
+            )
+            self._notify(session_id)
+            return result
         if not self._session_allows_background_write(session_id):
             raise RuntimeError("任务已取消，跳过后台匹配写入")
         self.store.save_match_result(result)
@@ -754,6 +810,7 @@ class AgentRuntime:
         cancel_event: threading.Event,
         pause_event: threading.Event,
         session_id: str,
+        round_id: Optional[str] = None,
     ) -> None:
         mode = str((policy or {}).get("mode") or "no_wait")
         if not futures:
@@ -783,8 +840,17 @@ class AgentRuntime:
                 continue
             try:
                 future.result()
-            except Exception:
-                pass
+            except Exception as exc:
+                if "取消" in str(exc):
+                    continue
+                self._event(
+                    session_id,
+                    round_id,
+                    AgentEventType.ERROR.value,
+                    "后台匹配任务异常",
+                    str(exc),
+                    {},
+                )
 
     def _session_status(self, session_id: str) -> str:
         session = self.store.get_session(session_id) or {}

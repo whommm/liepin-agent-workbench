@@ -9,7 +9,10 @@ from ..domain.models import SearchPlan
 
 
 CITY_NAMES = ["北京", "上海", "深圳", "广州", "杭州", "成都", "苏州", "南京", "武汉", "东莞", "惠州"]
-POSITION_HINTS = ["产品", "研发", "算法", "结构", "设计", "运营", "销售", "市场", "财务", "人力"]
+# POSITION_HINTS ordered by specificity (more specific first) to reduce false positives.
+POSITION_HINTS = [
+    "电机", "算法", "结构", "研发", "设计", "运营", "销售", "市场", "财务", "人力", "产品"
+]
 DOMAIN_TERMS = [
     "文创",
     "潮玩",
@@ -29,6 +32,19 @@ DOMAIN_TERMS = [
     "SaaS",
     "增长",
     "商业化",
+    "无刷电机",
+    "电机",
+    "轨道交通",
+    "天然气",
+    "小家电",
+    "水泵",
+    "压缩机",
+    "制冷",
+    "LNG",
+    "BOG",
+    "销售总监",
+    "销售经理",
+    "研发经理",
 ]
 
 
@@ -141,7 +157,16 @@ class Planner:
         for hint in POSITION_HINTS:
             if hint in text:
                 return hint
-        return "产品"
+        # Try to extract position from title patterns
+        import re
+        for pattern in [
+            r'(?:岗位|职位|招聘)[：:\s]*([\u4e00-\u9fa5]{2,8})',
+            r'^([\u4e00-\u9fa5]{2,8})(?:经理|工程师|总监|主管|专员|顾问|销售|开发)',
+        ]:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1).strip()
+        return ""
 
     @staticmethod
     def extract_domain_terms(text: str) -> List[str]:
@@ -150,9 +175,78 @@ class Planner:
             if term in (text or "") and term not in result:
                 result.append(term)
         if not result:
-            # Keep one sensible default so sparse JD text still produces a search hypothesis.
-            result.extend(["文创", "潮玩", "IP衍生品", "量产"])
+            # Fallback: extract meaningful terms from the JD text itself
+            # instead of hard-coding a specific industry.
+            result = Planner._fallback_terms_from_text(text or "")
         return result
+
+    @staticmethod
+    def _fallback_terms_from_text(text: str) -> List[str]:
+        """Extract candidate keywords from raw JD text when no DOMAIN_TERMS match."""
+        import re
+        terms: List[str] = []
+        seen = set()
+
+        # Stop-words / verb prefixes that usually produce sentence fragments
+        STOP_PREFIXES = (
+            "负责", "建立", "完成", "进行", "开展", "组织", "协调", "参与", "协助",
+            "配合", "根据", "按照", "依据", "通过", "需要", "要求", "必须", "具备",
+            "具有", "拥有", "熟悉", "了解", "掌握", "能够", "可以", "独立", "主导",
+            "带领", "岗位", "职位", "职责", "任职", "工作", "相关", "优先", "以上",
+            "以下", "以内", "左右", "至少", "不少于", "就是", "必须", "最大",
+            "负责所有", "建立产品", "负责项目", "负责新", "公司目前",
+        )
+
+        def _is_clean(t: str) -> bool:
+            if not t or len(t) < 2 or len(t) > 8:
+                return False
+            if any(t.startswith(p) for p in STOP_PREFIXES):
+                return False
+            # Avoid fragments that end with grammatical particles
+            if t.endswith(("的", "了", "和", "与", "或", "等", "及", "以", "要")):
+                return False
+            return True
+
+        # 1. Extract quoted phrases
+        for match in re.finditer(r'[""]([^""]{2,20})[""]', text):
+            t = match.group(1).strip()
+            if _is_clean(t) and t not in seen:
+                terms.append(t)
+                seen.add(t)
+
+        # 2. Extract title/position mentions (e.g. "岗位：研发经理")
+        for pattern in [
+            r'(?:岗位|职位|招聘|拟聘)[：:\s]*([\u4e00-\u9fa5]{2,10})',
+        ]:
+            for match in re.finditer(pattern, text):
+                t = match.group(1).strip()
+                if _is_clean(t) and t not in seen:
+                    terms.append(t)
+                    seen.add(t)
+
+        # 3. Extract clean noun phrases before顿号/逗号 (2-8 CJK chars)
+        for match in re.finditer(r'([\u4e00-\u9fa5]{2,8})(?=[、，,；;])', text):
+            t = match.group(1).strip()
+            if _is_clean(t) and t not in seen:
+                terms.append(t)
+                seen.add(t)
+
+        # 4. Extract core skill phrases (X经验 / Y背景 / Z技能)
+        for match in re.finditer(r'([\u4e00-\u9fa5]{2,8})(?:经验|背景|技能|能力)', text):
+            t = match.group(1).strip()
+            if _is_clean(t) and t not in seen:
+                terms.append(t)
+                seen.add(t)
+
+        # 5. If still too few, extract 2-6 char phrases before common separators
+        if len(terms) < 3:
+            for match in re.finditer(r'([\u4e00-\u9fa5]{2,6})(?:设计|开发|管理|制造|生产|测试|维护|优化)', text):
+                t = match.group(1).strip()
+                if _is_clean(t) and t not in seen:
+                    terms.append(t)
+                    seen.add(t)
+
+        return terms[:12] if terms else []
 
     @staticmethod
     def extract_city_scope(text: str) -> List[str]:
@@ -232,6 +326,6 @@ class Planner:
             if i + 1 < len(terms):
                 pairs.append("{} {}".format(terms[i], terms[i + 1]))
         pairs.extend(terms)
-        if position_filter == "产品":
-            pairs.extend(["IP衍生品 文创衍生品", "文创产品 量产", "潮玩 供应链"])
+        if position_filter and position_filter not in pairs:
+            pairs.append(position_filter)
         return pairs

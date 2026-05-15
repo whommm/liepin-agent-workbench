@@ -143,6 +143,11 @@ class _BaseMixin:
                     resume_text TEXT,
                     resume_summary TEXT,
                     raw_payload_json TEXT,
+                    is_gold_collar INTEGER NOT NULL DEFAULT 0,
+                    greeting_status TEXT,
+                    greeting_message TEXT,
+                    greeting_error TEXT,
+                    greeted_at TEXT,
                     capture_status TEXT NOT NULL,
                     error_message TEXT,
                     fetched_at TEXT NOT NULL
@@ -243,6 +248,16 @@ class _BaseMixin:
                     finished_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS project_pool (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT UNIQUE NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    order_index INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pool_order ON project_pool(order_index);
+
                 CREATE INDEX IF NOT EXISTS idx_sessions_updated
                 ON search_sessions(updated_at DESC);
 
@@ -274,6 +289,12 @@ class _BaseMixin:
             self._ensure_column(connection, "match_results", "unknowns_json", "TEXT")
             self._ensure_column(connection, "match_results", "questions_json", "TEXT")
             self._ensure_column(connection, "match_results", "confidence", "TEXT")
+            self._ensure_column(connection, "candidate_details", "is_gold_collar", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(connection, "search_sessions", "pending_user_command", "TEXT")
+            self._ensure_column(connection, "candidate_details", "greeting_status", "TEXT")
+            self._ensure_column(connection, "candidate_details", "greeting_message", "TEXT")
+            self._ensure_column(connection, "candidate_details", "greeting_error", "TEXT")
+            self._ensure_column(connection, "candidate_details", "greeted_at", "TEXT")
 
 
     @staticmethod

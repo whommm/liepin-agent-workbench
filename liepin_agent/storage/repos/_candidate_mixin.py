@@ -120,22 +120,31 @@ class _CandidateMixin:
                    mr.evidence_json AS evidence_json,
                    mr.unknowns_json AS unknowns_json,
                    mr.questions_json AS questions_json,
-                   mr.confidence AS confidence,
-                   mr.criteria_version_id AS criteria_version_id,
-                   CASE WHEN d.id IS NULL THEN '' ELSE d.capture_status END AS detail_capture_status
+                    mr.confidence AS confidence,
+                    mr.criteria_version_id AS criteria_version_id,
+                    CASE WHEN d.id IS NULL THEN '' ELSE d.capture_status END AS detail_capture_status,
+                    CASE WHEN d.id IS NULL THEN 0 ELSE COALESCE(d.is_gold_collar, 0) END AS is_gold_collar,
+                    COALESCE(d.greeting_status, '') AS greeting_status,
+                    COALESCE(d.greeting_message, '') AS greeting_message,
+                    COALESCE(d.greeting_error, '') AS greeting_error,
+                    COALESCE(d.greeted_at, '') AS greeted_at
             FROM candidate_summaries c
-            LEFT JOIN (
-                SELECT m1.*
-                FROM match_results m1
-                INNER JOIN (
-                    SELECT candidate_id, MAX(created_at) AS created_at
-                    FROM match_results
-                    GROUP BY candidate_id
-                ) latest
-                ON latest.candidate_id = m1.candidate_id
-                AND latest.created_at = m1.created_at
-            ) mr ON mr.candidate_id = c.id
-            LEFT JOIN candidate_details d ON d.candidate_id = c.id
+            LEFT JOIN match_results mr
+              ON mr.id = (
+                  SELECT m2.id
+                  FROM match_results m2
+                  WHERE m2.candidate_id = c.id
+                  ORDER BY m2.created_at DESC, m2.id DESC
+                  LIMIT 1
+              )
+            LEFT JOIN candidate_details d
+              ON d.id = (
+                  SELECT d2.id
+                  FROM candidate_details d2
+                  WHERE d2.candidate_id = c.id
+                  ORDER BY d2.fetched_at DESC, d2.id DESC
+                  LIMIT 1
+              )
             WHERE c.session_id = ?
         """
         params: List[Any] = [session_id]
@@ -249,8 +258,8 @@ class _CandidateMixin:
                 """
                 INSERT INTO candidate_details (
                     id, candidate_id, resume_text, resume_summary, raw_payload_json,
-                    capture_status, error_message, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    is_gold_collar, capture_status, error_message, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     detail_id,
@@ -258,6 +267,7 @@ class _CandidateMixin:
                     detail.resume_text,
                     detail.resume_summary,
                     to_json(detail.raw_payload),
+                    1 if detail.is_gold_collar else 0,
                     detail.capture_status,
                     detail.error_message,
                     now_text(),
@@ -270,6 +280,37 @@ class _CandidateMixin:
             else CandidateStatus.DETAIL_FAILED.value,
         )
         return detail_id
+
+
+    def update_candidate_greeting_status(
+        self,
+        candidate_id: str,
+        status: str,
+        message: str = "",
+        error: str = "",
+    ) -> None:
+        if not candidate_id:
+            return
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id FROM candidate_details
+                WHERE candidate_id = ?
+                ORDER BY fetched_at DESC
+                LIMIT 1
+                """,
+                (candidate_id,),
+            ).fetchone()
+            if not row:
+                return
+            connection.execute(
+                """
+                UPDATE candidate_details
+                SET greeting_status = ?, greeting_message = ?, greeting_error = ?, greeted_at = ?
+                WHERE id = ?
+                """,
+                (status or "", message or "", error or "", now_text(), row["id"]),
+            )
 
 
     def get_candidate_detail(self, candidate_id: str) -> Optional[Dict[str, Any]]:

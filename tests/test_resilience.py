@@ -277,6 +277,62 @@ class SlowMatcher:
         )
 
 
+class GreetingLiepinTool(FakeLiepinTool):
+    def __init__(self, gold=True):
+        self.gold = gold
+        self.greeted = []
+        self.config_manager = type(
+            "ConfigManagerStub",
+            (),
+            {
+                "config": type(
+                    "ConfigStub",
+                    (),
+                    {"auto_greeting_enabled": True, "greeting_template": ""},
+                )()
+            },
+        )()
+
+    def fetch_candidate_detail(self, candidate):
+        detail = super().fetch_candidate_detail(candidate)
+        detail.is_gold_collar = self.gold
+        detail.raw_payload["is_gold_collar"] = self.gold
+        return detail
+
+    def greet_candidate(self, candidate, message_template=""):
+        self.greeted.append(candidate["id"])
+        return {"status": "success", "message": "已发送打招呼", "error": ""}
+
+
+class TierBrain(NoWaitBrain):
+    def decide_fetch(self, observation, candidates, remaining_detail_budget):
+        from liepin_agent.domain.models import FetchDecision
+
+        return FetchDecision(
+            action="fetch_details",
+            round_type="validate_detail",
+            candidate_ids=[item.id for item in candidates[:1]],
+            fetch_limit=1,
+            match_wait_policy={"mode": "wait_all"},
+            reason="测试手动打招呼边界",
+        )
+
+    def review_round(
+        self,
+        previous_plan,
+        jd_text,
+        used_queries,
+        match_results,
+        noise_patterns,
+        target_met,
+        should_stop,
+        stop_reason,
+    ):
+        from liepin_agent.domain.models import RoundReview
+
+        return RoundReview(action="stop", summary="完成")
+
+
 def test_no_wait_policy_still_waits_before_round_review(tmp_path):
     store = SQLiteStore(str(tmp_path / "runtime.db"))
     session_id = store.create_session(
@@ -308,6 +364,106 @@ def test_no_wait_policy_still_waits_before_round_review(tmp_path):
     assert session["status"] == "completed"
     assert len(matches) == 1
     assert matches[0]["tier"] == "B"
+
+
+def test_runtime_does_not_greet_gold_ab_candidates_automatically(tmp_path):
+    store = SQLiteStore(str(tmp_path / "runtime.db"))
+    session_id = store.create_session(
+        title="销售总监",
+        jd_text="岗位名称：销售总监\n天然气销售。",
+        mode="自动",
+        max_rounds=1,
+        max_detail_fetches=2,
+        target_ab_count=99,
+    )
+    confirm_test_criteria(store, session_id, "天然气\n销售")
+    tool = GreetingLiepinTool(gold=True)
+    runtime = AgentRuntime(
+        store=store,
+        event_bus=EventBus(),
+        browser_queue=BrowserQueue(),
+        match_queue=MatchQueue(max_workers=1),
+        liepin_tool=tool,
+        matcher=SlowMatcher(),
+        agent_brain=TierBrain(),
+    )
+
+    runtime.run_session(session_id)
+    candidates = store.list_candidates(session_id)
+
+    runtime.browser_queue.shutdown()
+    runtime.match_queue.shutdown()
+
+    assert tool.greeted == []
+    assert candidates[0]["is_gold_collar"] == 1
+    assert candidates[0]["greeting_status"] == ""
+
+
+def test_runtime_does_not_greet_non_gold_candidates_automatically(tmp_path):
+    store = SQLiteStore(str(tmp_path / "runtime.db"))
+    session_id = store.create_session(
+        title="销售总监",
+        jd_text="岗位名称：销售总监\n天然气销售。",
+        mode="自动",
+        max_rounds=1,
+        max_detail_fetches=2,
+        target_ab_count=99,
+    )
+    confirm_test_criteria(store, session_id, "天然气\n销售")
+    tool = GreetingLiepinTool(gold=False)
+    runtime = AgentRuntime(
+        store=store,
+        event_bus=EventBus(),
+        browser_queue=BrowserQueue(),
+        match_queue=MatchQueue(max_workers=1),
+        liepin_tool=tool,
+        matcher=SlowMatcher(),
+        agent_brain=TierBrain(),
+    )
+
+    runtime.run_session(session_id)
+    candidates = store.list_candidates(session_id)
+
+    runtime.browser_queue.shutdown()
+    runtime.match_queue.shutdown()
+
+    assert tool.greeted == []
+    assert candidates[0]["is_gold_collar"] == 0
+    assert candidates[0]["greeting_status"] == ""
+
+
+def test_runtime_greeting_is_manual_even_when_legacy_config_is_disabled(tmp_path):
+    store = SQLiteStore(str(tmp_path / "runtime.db"))
+    session_id = store.create_session(
+        title="销售总监",
+        jd_text="岗位名称：销售总监\n天然气销售。",
+        mode="自动",
+        max_rounds=1,
+        max_detail_fetches=2,
+        target_ab_count=99,
+    )
+    confirm_test_criteria(store, session_id, "天然气\n销售")
+    tool = GreetingLiepinTool(gold=True)
+    tool.config_manager.config.auto_greeting_enabled = False
+    runtime = AgentRuntime(
+        store=store,
+        event_bus=EventBus(),
+        browser_queue=BrowserQueue(),
+        match_queue=MatchQueue(max_workers=1),
+        liepin_tool=tool,
+        matcher=SlowMatcher(),
+        agent_brain=TierBrain(),
+    )
+
+    runtime.run_session(session_id)
+    candidates = store.list_candidates(session_id)
+
+    runtime.browser_queue.shutdown()
+    runtime.match_queue.shutdown()
+
+    assert tool.greeted == []
+    assert candidates[0]["is_gold_collar"] == 1
+    assert candidates[0]["greeting_status"] == ""
 
 
 def test_active_days_normalizes_half_month():

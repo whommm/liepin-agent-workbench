@@ -17,7 +17,11 @@ def main() -> int:
     from .storage.sqlite_store import SQLiteStore
     from .ui.main_window import MainWindow
 
-    root = Path(__file__).resolve().parents[1]
+    if getattr(sys, "frozen", False):
+        # Running as PyInstaller bundle
+        root = Path(sys.executable).parent
+    else:
+        root = Path(__file__).resolve().parents[1]
     db_path = root / "liepin_agent_workbench.db"
 
     app = QApplication(sys.argv)

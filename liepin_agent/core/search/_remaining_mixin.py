@@ -23,6 +23,7 @@ from ._models import (
     LiepinSearchPageChangedError,
     LiepinSearchNoResultsError,
 )
+from ..liepin_browser import LiepinBrowserManager
 
 class _RemainingMixin:
     """Mixin providing remaining functionality."""

@@ -1,6 +1,7 @@
 from openpyxl import load_workbook
+from zipfile import ZipFile
 
-from liepin_agent.domain.models import CandidateSummary, MatchResult, SearchPlan
+from liepin_agent.domain.models import CandidateDetail, CandidateSummary, MatchResult, SearchPlan
 from liepin_agent.storage.sqlite_store import SQLiteStore
 from liepin_agent.tools.exporter import ExportService
 from liepin_agent.tools.real_matcher import RealMatchService
@@ -66,6 +67,17 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
         card_decision="fetch",
         card_signals=["天然气"],
     )
+    store.save_candidate_detail(
+        CandidateDetail(
+            candidate_id=candidate_id,
+            resume_text="天然气销售简历",
+            capture_status="success",
+            is_gold_collar=True,
+        )
+    )
+    store.update_candidate_greeting_status(
+        candidate_id, "success", message="已发送打招呼"
+    )
     store.save_match_result(
         MatchResult(
             candidate_id=candidate_id,
@@ -87,21 +99,76 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
             confidence="medium",
         )
     )
-    path = ExportService(store, tmp_path).export_session(session_id)
+    rejected = CandidateSummary(
+        session_id=session_id,
+        round_id=round_id,
+        profile_url="https://example.com/c",
+        name="不合格候选人",
+        current_title="销售经理",
+        current_company="普通贸易公司",
+        card_decision="fetch",
+    )
+    rejected_id = store.save_candidate_summary(rejected)
+    store.save_match_result(
+        MatchResult(
+            candidate_id=rejected_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier="C",
+            summary="天然气行业证据不足",
+            criteria_version_id=criteria_id,
+        )
+    )
+    unmatched = CandidateSummary(
+        session_id=session_id,
+        round_id=round_id,
+        profile_url="https://example.com/pending",
+        name="待复核候选人",
+        current_title="销售负责人",
+        current_company="能源公司",
+        card_decision="maybe",
+    )
+    store.save_candidate_summary(unmatched)
+
+    exporter = ExportService(store, tmp_path)
+    path = exporter.export_session(session_id)
     workbook = load_workbook(path)
 
+    assert "推荐总览" in workbook.sheetnames
+    assert "合格A_B" in workbook.sheetnames
+    assert "待复核_未匹配" in workbook.sheetnames
+    assert "不合格C" in workbook.sheetnames
     assert "候选人" in workbook.sheetnames
     assert "寻访基准" in workbook.sheetnames
     assert "效率总结" in workbook.sheetnames
+    overview_headers = [cell.value for cell in workbook["推荐总览"][1]]
+    assert "结论" in overview_headers
+    assert "候选人档案" in overview_headers
+    assert workbook["推荐总览"]["A2"].value == "可推荐"
+    assert workbook["合格A_B"]["C2"].value == "候选人"
+    assert workbook["待复核_未匹配"]["C2"].value == "待复核候选人"
+    assert workbook["不合格C"]["C2"].value == "不合格候选人"
     headers = [cell.value for cell in workbook["候选人"][1]]
     assert "命中证据" in headers
     assert "基准版本" in headers
     assert "简历链接" in headers
+    assert "金领" in headers
+    assert "打招呼状态" in headers
     link_column = headers.index("简历链接") + 1
+    gold_column = headers.index("金领") + 1
+    greeting_column = headers.index("打招呼状态") + 1
     assert workbook["候选人"].cell(row=2, column=link_column).value == "https://example.com/a"
     assert workbook["候选人"].cell(row=2, column=link_column).hyperlink.target == "https://example.com/a"
+    assert workbook["候选人"].cell(row=2, column=gold_column).value == "是"
+    assert workbook["候选人"].cell(row=2, column=greeting_column).value == "已发送"
     assert workbook["寻访基准"]["B2"].value == "天然气\nLNG"
     workbook.close()
+    report_files = sorted(exporter.last_candidate_reports_dir.glob("*.docx"))
+    assert len(report_files) == 3
+    with ZipFile(report_files[0]) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert "候选人" in document_xml
+    assert "有天然气销售背景" in document_xml
 
 
 def test_export_repairs_legacy_card_field_misalignment(tmp_path):

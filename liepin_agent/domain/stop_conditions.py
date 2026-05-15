@@ -26,9 +26,9 @@ def evaluate_stop_conditions(
         return StopDecision(True, "已达到最大运行时长")
     if round_index >= max_rounds:
         return StopDecision(True, "已达到最大搜索轮次")
-    if fetched_details >= max_detail_fetches:
+    if 0 < max_detail_fetches < 999 and fetched_details >= max_detail_fetches:
         return StopDecision(True, "已达到最大详情抓取数量")
-    if target_ab_count and ab_count >= target_ab_count:
+    if 0 < target_ab_count < 999 and ab_count >= target_ab_count:
         return StopDecision(True, "A/B 候选人数量已达到目标")
     if consecutive_low_yield_rounds >= 2:
         return StopDecision(True, "连续低产出轮次过多，建议人工校准")

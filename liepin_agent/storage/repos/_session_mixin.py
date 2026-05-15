@@ -39,10 +39,10 @@ class _SessionMixin:
         jd_text: str,
         user_notes: str = "",
         mode: str = "单步",
-        max_rounds: int = 6,
-        max_detail_fetches: int = 50,
+        max_rounds: int = 10,
+        max_detail_fetches: int = 999,
         max_runtime_minutes: int = 90,
-        target_ab_count: int = 10,
+        target_ab_count: int = 999,
     ) -> str:
         session_id = uuid.uuid4().hex
         ts = now_text()
@@ -62,10 +62,10 @@ class _SessionMixin:
                     user_notes,
                     SessionStatus.CRITERIA_DRAFT.value,
                     mode or "单步",
-                    int(max_rounds or 6),
-                    int(max_detail_fetches or 50),
+                    int(max_rounds or 10),
+                    int(max_detail_fetches or 999),
                     int(max_runtime_minutes or 90),
-                    int(target_ab_count or 10),
+                    int(target_ab_count or 999),
                     ts,
                     ts,
                 ),
@@ -163,6 +163,35 @@ class _SessionMixin:
             connection.execute("DELETE FROM search_sessions WHERE id = ?", (session_id,))
         return True
 
+
+    def set_pending_user_command(self, session_id: str, command: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE search_sessions
+                SET pending_user_command = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (command, now_text(), session_id),
+            )
+
+    def consume_pending_user_command(self, session_id: str) -> Optional[str]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT pending_user_command FROM search_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            command = row["pending_user_command"] if row else None
+            if command:
+                connection.execute(
+                    """
+                    UPDATE search_sessions
+                    SET pending_user_command = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_text(), session_id),
+                )
+            return command
 
     def update_session_status(
         self, session_id: str, status: str, error_message: str = ""

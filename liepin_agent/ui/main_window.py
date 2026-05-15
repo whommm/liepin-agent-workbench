@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import threading
+from collections import deque
 from html import escape
 from pathlib import Path
+import re
 from typing import Dict, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QComboBox,
     QDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -42,6 +47,50 @@ from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
 
 
+class PoolNotificationDialog(QDialog):
+    """Top-most notification dialog for pool queue."""
+
+    def __init__(self, title: str, session_id: str, parent=None):
+        super().__init__(parent)
+        self.session_id = session_id
+        self.setWindowTitle("项目池提醒")
+        self.setWindowFlags(
+            Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint
+        )
+        self.resize(400, 160)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.addWidget(
+            QLabel(
+                '<b style="font-size:15px;">项目《{}》</b>'.format(title)
+            )
+        )
+        info = QLabel("寻访基准（匹配词与岗位要求）已生成，请确认后开始搜索。")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch(1)
+        self.later_btn = QPushButton("稍后")
+        self.confirm_btn = QPushButton("去确认")
+        self.confirm_btn.setDefault(True)
+        self.confirm_btn.setStyleSheet(
+            "background: #2563eb; color: white; font-weight: 700; padding: 6px 16px;"
+        )
+        self.later_btn.clicked.connect(self.reject)
+        self.confirm_btn.clicked.connect(self._on_confirm)
+        btn_layout.addWidget(self.later_btn)
+        btn_layout.addWidget(self.confirm_btn)
+        layout.addLayout(btn_layout)
+
+        if parent:
+            QApplication.alert(parent, 0)
+
+    def _on_confirm(self) -> None:
+        self.done(100)
+
+
 class NewSessionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -61,17 +110,17 @@ class NewSessionDialog(QDialog):
 
         self.max_rounds = QSpinBox()
         self.max_rounds.setRange(1, 12)
-        self.max_rounds.setValue(4)
+        self.max_rounds.setValue(10)
         form.addRow("最大轮次", self.max_rounds)
 
         self.max_details = QSpinBox()
-        self.max_details.setRange(1, 200)
-        self.max_details.setValue(35)
+        self.max_details.setRange(1, 9999)
+        self.max_details.setValue(999)
         form.addRow("最大详情抓取", self.max_details)
 
         self.target_ab = QSpinBox()
-        self.target_ab.setRange(1, 100)
-        self.target_ab.setValue(8)
+        self.target_ab.setRange(1, 9999)
+        self.target_ab.setValue(999)
         form.addRow("目标 A/B 数", self.target_ab)
 
         layout.addLayout(form)
@@ -128,7 +177,7 @@ class SettingsDialog(QDialog):
         self.config_manager = config_manager
         config = config_manager.config
         self.setWindowTitle("设置")
-        self.resize(640, 360)
+        self.resize(640, 520)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -152,6 +201,25 @@ class SettingsDialog(QDialog):
         self.timeout.setValue(int(config.timeout or 120))
         form.addRow("API 超时秒数", self.timeout)
 
+        # Backend LLM (Matcher)
+        form.addRow(QLabel(""))
+        backend_label = QLabel("后端 LLM 配置（候选人匹配专用，留空则共用上方配置）")
+        backend_label.setStyleSheet("color: #64748b; font-size: 12px;")
+        form.addRow(backend_label)
+
+        self.backend_api_base_url = QLineEdit(config.backend_api_base_url)
+        self.backend_api_base_url.setPlaceholderText("https://api.deepseek.com/v1")
+        form.addRow("后端 API Base URL", self.backend_api_base_url)
+
+        self.backend_api_key = QLineEdit(config.backend_api_key)
+        self.backend_api_key.setEchoMode(QLineEdit.Password)
+        self.backend_api_key.setPlaceholderText("留空则使用上方 API Key")
+        form.addRow("后端 API Key", self.backend_api_key)
+
+        self.backend_model_name = QLineEdit(config.backend_model_name)
+        self.backend_model_name.setPlaceholderText("留空则使用上方模型名称")
+        form.addRow("后端模型名称", self.backend_model_name)
+
         self.browser_channel = QComboBox()
         self.browser_channel.addItems(["msedge", "chrome", "chromium"])
         index = self.browser_channel.findText(config.liepin_browser_channel or "msedge")
@@ -162,6 +230,13 @@ class SettingsDialog(QDialog):
             config.liepin_browser_profile_dir or "browser_profile/liepin"
         )
         form.addRow("猎聘 Profile", self.profile_dir)
+
+        self.greeting_template = QTextEdit(config.greeting_template or "")
+        self.greeting_template.setMaximumHeight(90)
+        self.greeting_template.setPlaceholderText(
+            "留空则只触发平台默认打招呼；填写后，手动打招呼会发送这段消息。"
+        )
+        form.addRow("手动打招呼话术", self.greeting_template)
 
         layout.addLayout(form)
 
@@ -181,9 +256,13 @@ class SettingsDialog(QDialog):
             api_key=self.api_key.text().strip(),
             model_name=self.model_name.text().strip() or "deepseek-chat",
             timeout=self.timeout.value(),
+            backend_api_base_url=self.backend_api_base_url.text().strip(),
+            backend_api_key=self.backend_api_key.text().strip(),
+            backend_model_name=self.backend_model_name.text().strip(),
             liepin_browser_channel=self.browser_channel.currentText(),
             liepin_browser_profile_dir=self.profile_dir.text().strip()
             or "browser_profile/liepin",
+            greeting_template=self.greeting_template.toPlainText().strip(),
         )
         if not self.config_manager.save_config():
             QMessageBox.warning(self, "保存失败", "配置文件写入失败")
@@ -230,24 +309,41 @@ class SessionListItemWidget(QFrame):
         info.setObjectName("SessionInfo")
         layout.addWidget(info)
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(4)
-        self.continue_btn = QPushButton("继续")
+        buttons = QGridLayout()
+        buttons.setSpacing(5)
+        self.continue_btn = QPushButton("暂停" if status == "running" else "继续")
         self.stop_btn = QPushButton("终止")
         self.export_btn = QPushButton("导出")
         self.delete_btn = QPushButton("删除")
-        for button in [
-            self.continue_btn,
-            self.stop_btn,
-            self.export_btn,
-            self.delete_btn,
-        ]:
+        for button in [self.continue_btn, self.stop_btn, self.export_btn, self.delete_btn]:
             button.setFixedHeight(26)
-            buttons.addWidget(button)
+        buttons.addWidget(self.continue_btn, 0, 0)
+        buttons.addWidget(self.stop_btn, 0, 1)
+        buttons.addWidget(self.export_btn, 1, 0)
+        buttons.addWidget(self.delete_btn, 1, 1)
+        buttons.setColumnStretch(0, 1)
+        buttons.setColumnStretch(1, 1)
         layout.addLayout(buttons)
 
+        self.command_input = QLineEdit()
+        self.command_input.setPlaceholderText("输入指令，例如：去掉BLDC，只保留无刷电机")
+        self.command_input.setFixedHeight(26)
+        self.send_cmd_btn = QPushButton("发送指令")
+        self.send_cmd_btn.setFixedHeight(26)
+        cmd_layout = QHBoxLayout()
+        cmd_layout.setSpacing(5)
+        cmd_layout.addWidget(self.command_input, 1)
+        cmd_layout.addWidget(self.send_cmd_btn)
+        layout.addLayout(cmd_layout)
+
+        self.send_cmd_btn.clicked.connect(
+            lambda: parent_window.send_user_command(
+                self.session_id, self.command_input.text()
+            )
+        )
+
         self.continue_btn.clicked.connect(
-            lambda: parent_window.continue_session(self.session_id)
+            lambda: parent_window.toggle_session_run(self.session_id)
         )
         self.stop_btn.clicked.connect(
             lambda: parent_window.stop_session(self.session_id)
@@ -261,6 +357,7 @@ class SessionListItemWidget(QFrame):
 
         if status in {"completed", "failed", "cancelled"}:
             self.stop_btn.setEnabled(False)
+            self.send_cmd_btn.setEnabled(False)
 
 
 class MainWindow(QMainWindow):
@@ -273,19 +370,25 @@ class MainWindow(QMainWindow):
         self.config_manager = ConfigManager()
         self.runtime = self._build_runtime()
         self.selected_session_id: Optional[str] = None
+        self.selected_candidate_id: Optional[str] = None
         self._dirty = True
         self._criteria_dirty = False
         self._pending_status_text = ""
         self._pending_browser_error = ""
+        self._runtime_events = deque()
+        self._runtime_events_lock = threading.Lock()
+        self._queue_running = False
+        self._active_pool_session_id: Optional[str] = None
 
         self.setWindowTitle("猎聘寻访 Agent 工作台")
         self._build_ui()
         self._connect_events()
         self._apply_style()
 
-        # Use event-driven refresh with a long-interval heartbeat fallback
+        # Runtime events may come from worker threads; poll a tiny queue on the
+        # UI thread so Qt widgets are only touched from the main thread.
         self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(10000)
+        self.refresh_timer.setInterval(500)
         self.refresh_timer.timeout.connect(self._refresh_if_dirty)
         self.refresh_timer.start()
         self.refresh_all()
@@ -342,21 +445,13 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
 
         self.new_btn = QPushButton("新建")
-        self.start_btn = QPushButton("开始")
-        self.pause_btn = QPushButton("暂停")
-        self.resume_btn = QPushButton("继续")
-        self.cancel_btn = QPushButton("停止")
-        self.export_btn = QPushButton("导出")
+        self.add_to_pool_btn = QPushButton("添加到池")
         self.open_liepin_btn = QPushButton("打开猎聘")
         self.close_liepin_btn = QPushButton("关闭浏览器")
         self.settings_btn = QPushButton("设置")
         for button in [
             self.new_btn,
-            self.start_btn,
-            self.pause_btn,
-            self.resume_btn,
-            self.cancel_btn,
-            self.export_btn,
+            self.add_to_pool_btn,
             self.open_liepin_btn,
             self.close_liepin_btn,
             self.settings_btn,
@@ -365,14 +460,54 @@ class MainWindow(QMainWindow):
         return frame
 
     def _build_left_panel(self) -> QWidget:
-        frame = QFrame()
-        frame.setObjectName("Panel")
-        layout = QVBoxLayout(frame)
-        layout.addWidget(QLabel("寻访任务"))
+        container = QWidget()
+        container.setMinimumWidth(280)
+        outer_layout = QVBoxLayout(container)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(6)
+
+        splitter = QSplitter(Qt.Vertical)
+
+        # --- Project Pool ---
+        pool_frame = QFrame()
+        pool_frame.setObjectName("Panel")
+        pool_layout = QVBoxLayout(pool_frame)
+        pool_layout.setContentsMargins(6, 6, 6, 6)
+        pool_header = QHBoxLayout()
+        pool_header.addWidget(QLabel("项目池"))
+        pool_header.addStretch(1)
+        self.start_queue_btn = QPushButton("开始队列")
+        self.stop_queue_btn = QPushButton("停止队列")
+        self.stop_queue_btn.setVisible(False)
+        self.clear_completed_btn = QPushButton("清理")
+        pool_header.addWidget(self.start_queue_btn)
+        pool_header.addWidget(self.stop_queue_btn)
+        pool_header.addWidget(self.clear_completed_btn)
+        pool_layout.addLayout(pool_header)
+
+        self.pool_list = QListWidget()
+        self.pool_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.pool_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.pool_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pool_list.model().rowsMoved.connect(self._on_pool_reordered)
+        pool_layout.addWidget(self.pool_list, 1)
+        splitter.addWidget(pool_frame)
+
+        # --- Session List ---
+        sessions_frame = QFrame()
+        sessions_frame.setObjectName("Panel")
+        sessions_layout = QVBoxLayout(sessions_frame)
+        sessions_layout.setContentsMargins(6, 6, 6, 6)
+        sessions_layout.addWidget(QLabel("寻访任务"))
         self.session_list = QListWidget()
         self.session_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        layout.addWidget(self.session_list, 1)
-        return frame
+        self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sessions_layout.addWidget(self.session_list, 1)
+        splitter.addWidget(sessions_frame)
+
+        splitter.setSizes([220, 380])
+        outer_layout.addWidget(splitter)
+        return container
 
     def _build_center_panel(self) -> QWidget:
         splitter = QSplitter(Qt.Vertical)
@@ -388,7 +523,7 @@ class MainWindow(QMainWindow):
         table_frame.setObjectName("Panel")
         table_layout = QVBoxLayout(table_frame)
         table_layout.addWidget(QLabel("候选人池"))
-        self.candidate_table = QTableWidget(0, 10)
+        self.candidate_table = QTableWidget(0, 12)
         self.candidate_table.setHorizontalHeaderLabels(
             [
                 "姓名",
@@ -397,13 +532,16 @@ class MainWindow(QMainWindow):
                 "城市",
                 "年限",
                 "学历",
+                "金领",
                 "卡片判断",
                 "匹配",
+                "打招呼",
                 "状态",
                 "摘要",
             ]
         )
         self.candidate_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.candidate_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.candidate_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.candidate_table.verticalHeader().setVisible(False)
         table_layout.addWidget(self.candidate_table, 1)
@@ -438,7 +576,13 @@ class MainWindow(QMainWindow):
         self.strategy_view = QTextBrowser()
         self.strategy_view.setMinimumHeight(220)
         layout.addWidget(self.strategy_view)
-        layout.addWidget(QLabel("候选人详情"))
+        detail_header = QHBoxLayout()
+        detail_header.addWidget(QLabel("候选人详情"))
+        detail_header.addStretch(1)
+        self.manual_greeting_btn = QPushButton("手动打招呼")
+        self.manual_greeting_btn.setEnabled(False)
+        detail_header.addWidget(self.manual_greeting_btn)
+        layout.addLayout(detail_header)
         self.detail_view = QTextBrowser()
         layout.addWidget(self.detail_view, 2)
         layout.addWidget(QLabel("详细日志"))
@@ -448,14 +592,15 @@ class MainWindow(QMainWindow):
 
     def _connect_events(self) -> None:
         self.new_btn.clicked.connect(self.create_session)
-        self.start_btn.clicked.connect(self.start_selected_session)
-        self.pause_btn.clicked.connect(self.pause_selected_session)
-        self.resume_btn.clicked.connect(self.resume_selected_session)
-        self.cancel_btn.clicked.connect(self.cancel_selected_session)
-        self.export_btn.clicked.connect(self.export_selected_session)
+        self.add_to_pool_btn.clicked.connect(self.create_session_and_add_to_pool)
         self.open_liepin_btn.clicked.connect(self.open_liepin_browser)
         self.close_liepin_btn.clicked.connect(self.close_liepin_browser)
         self.settings_btn.clicked.connect(self.open_settings)
+        self.start_queue_btn.clicked.connect(self._start_queue)
+        self.stop_queue_btn.clicked.connect(self._stop_queue)
+        self.clear_completed_btn.clicked.connect(self._clear_completed_pool)
+        self.pool_list.currentItemChanged.connect(self._on_pool_item_selected)
+        self.manual_greeting_btn.clicked.connect(self.greet_selected_candidate)
         self.regenerate_criteria_btn.clicked.connect(self.regenerate_criteria_draft)
         self.confirm_criteria_btn.clicked.connect(self.confirm_current_criteria)
         self.confirm_and_start_btn.clicked.connect(self.confirm_criteria_and_start)
@@ -463,7 +608,7 @@ class MainWindow(QMainWindow):
         self.criteria_requirements_input.textChanged.connect(self._mark_criteria_dirty)
         self.session_list.currentItemChanged.connect(self._on_session_changed)
         self.candidate_table.itemSelectionChanged.connect(self._on_candidate_selected)
-        self.event_bus.subscribe(self._handle_runtime_event)
+        self.event_bus.subscribe(self._queue_runtime_event)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -541,11 +686,42 @@ class MainWindow(QMainWindow):
         self._select_session_in_list(session_id)
         self._queue_criteria_draft(session_id)
 
+    def create_session_and_add_to_pool(self) -> None:
+        dialog = NewSessionDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.payload()
+        session_id = self.store.create_session(
+            title=str(payload["title"]),
+            jd_text=str(payload["jd_text"]),
+            user_notes=str(payload["user_notes"]),
+            mode=str(payload["mode"]),
+            max_rounds=int(payload["max_rounds"]),
+            max_detail_fetches=int(payload["max_detail_fetches"]),
+            target_ab_count=int(payload["target_ab_count"]),
+        )
+        self.store.add_session_to_pool(session_id)
+        self.selected_session_id = session_id
+        self.refresh_all()
+        self._select_session_in_list(session_id)
+        self._queue_criteria_draft(session_id)
+
     def start_selected_session(self) -> None:
         if not self.selected_session_id:
             QMessageBox.information(self, "提示", "请先选择或新建任务")
             return
         self.continue_session(self.selected_session_id)
+
+    def toggle_session_run(self, session_id: str) -> None:
+        session = self.store.get_session(session_id) or {}
+        if (
+            str(session.get("status") or "") == "running"
+            and self.runtime.is_active(session_id)
+        ):
+            self.runtime.pause_session(session_id)
+            self._mark_dirty()
+            return
+        self.continue_session(session_id)
 
     def continue_session(self, session_id: str) -> None:
         self.selected_session_id = session_id
@@ -642,10 +818,202 @@ class MainWindow(QMainWindow):
         self._criteria_dirty = False
         self._mark_dirty()
 
+    def send_user_command(self, session_id: str, command: str) -> None:
+        command = command.strip()
+        if not command:
+            return
+        self.store.set_pending_user_command(session_id, command)
+        self.store.add_event(
+            session_id,
+            None,
+            "user_command",
+            "用户发送指令",
+            command,
+            {},
+        )
+        self._mark_dirty()
+
     def export_session(self, session_id: str) -> None:
         exporter = ExportService(self.store, self.workspace_root / "exports")
         path = exporter.export_session(session_id)
-        QMessageBox.information(self, "导出完成", "已导出到：\n{}".format(path))
+        message = "Excel 总览：\n{}".format(path)
+        if exporter.last_candidate_reports_dir:
+            message += "\n\n候选人 Word 档案：\n{}".format(
+                exporter.last_candidate_reports_dir
+            )
+        QMessageBox.information(self, "导出完成", message)
+
+    def greet_selected_candidate(self) -> None:
+        session_id = self.selected_session_id
+        candidate_ids = self._selected_candidate_ids()
+        if not candidate_ids or not session_id:
+            QMessageBox.information(
+                self, "提示", "请先在候选人池中选择一位或多位候选人。"
+            )
+            return
+        if self.runtime.is_active(session_id):
+            QMessageBox.information(
+                self,
+                "任务运行中",
+                "请先暂停或等待任务结束后，再手动打招呼，避免浏览器页面被并发操作。",
+            )
+            return
+        candidates = self.store.get_candidates_by_ids(candidate_ids)
+        if not candidates:
+            QMessageBox.warning(self, "提示", "未找到选中的候选人记录。")
+            return
+        candidates_by_id = {str(item.get("id") or ""): dict(item) for item in candidates}
+        targets = []
+        skipped = []
+        already_greeted = []
+        contact_present = []
+        for candidate_id in candidate_ids:
+            candidate = candidates_by_id.get(candidate_id)
+            if not candidate:
+                skipped.append("候选人记录不存在")
+                continue
+            name = str(candidate.get("name") or "候选人")
+            detail = self.store.get_candidate_detail(candidate_id) or {}
+            if not detail:
+                skipped.append("{}：尚未抓取详情".format(name))
+                continue
+            current_status = str(detail.get("greeting_status") or "")
+            if current_status == "pending":
+                skipped.append("{}：手动打招呼正在执行".format(name))
+                continue
+            profile_url = self._candidate_profile_url(candidate, detail)
+            if not profile_url:
+                skipped.append("{}：缺少抓取到的候选人链接".format(name))
+                continue
+            if current_status in {"success", "already_greeted"}:
+                already_greeted.append(
+                    "{}（{}）".format(name, self._greeting_status_label(current_status))
+                )
+            if self._resume_has_contact_info(str(detail.get("resume_text") or "")):
+                contact_present.append(name)
+            candidate["profile_url"] = profile_url
+            targets.append(
+                {
+                    "candidate_id": candidate_id,
+                    "candidate": candidate,
+                    "profile_url": profile_url,
+                }
+            )
+        if not targets:
+            message = "选中的候选人暂不能打招呼。"
+            if skipped:
+                message += "\n{}".format("\n".join(skipped[:6]))
+            QMessageBox.information(self, "提示", message)
+            return
+        confirm_lines = []
+        if len(targets) > 1:
+            confirm_lines.append(
+                "将按队列依次为 {} 位候选人打开抓取到的详情链接并打招呼。".format(
+                    len(targets)
+                )
+            )
+        if skipped:
+            confirm_lines.append(
+                "已跳过 {} 位：{}".format(len(skipped), "；".join(skipped[:4]))
+            )
+        if already_greeted:
+            confirm_lines.append(
+                "{} 位已标记打过招呼：{}".format(
+                    len(already_greeted), "；".join(already_greeted[:4])
+                )
+            )
+        if contact_present:
+            confirm_lines.append(
+                "{} 位简历详情中已出现联系方式：{}".format(
+                    len(contact_present), "；".join(contact_present[:4])
+                )
+            )
+        if confirm_lines:
+            confirm_lines.append("仍要继续吗？")
+            reply = QMessageBox.question(
+                self,
+                "确认打招呼",
+                "\n".join(confirm_lines),
+            )
+            if reply != QMessageBox.Yes:
+                return
+        template = str(self.config_manager.config.greeting_template or "")
+        for target in targets:
+            candidate_id = str(target["candidate_id"])
+            candidate = dict(target["candidate"])
+            profile_url = str(target["profile_url"])
+            self.store.update_candidate_greeting_status(
+                candidate_id, "pending", message="手动打招呼进行中。"
+            )
+            self.store.add_event(
+                session_id,
+                None,
+                "manual_greeting",
+                "手动打招呼已启动",
+                "{} / {}".format(
+                    candidate.get("name") or "候选人",
+                    candidate.get("current_title") or "",
+                ),
+                {"candidate_id": candidate_id, "profile_url": profile_url},
+            )
+            future = self.runtime.browser_queue.submit(
+                self.runtime.liepin_tool.greet_candidate,
+                candidate,
+                message_template=template,
+            )
+            future.add_done_callback(
+                self._manual_greeting_done_callback(
+                    session_id, candidate_id, profile_url
+                )
+            )
+        self.manual_greeting_btn.setEnabled(False)
+        self.manual_greeting_btn.setToolTip("手动打招呼正在执行。")
+        self._mark_dirty()
+
+    def _manual_greeting_done_callback(
+        self, session_id: str, candidate_id: str, profile_url: str
+    ):
+        def _done(done_future):
+            try:
+                result = done_future.result()
+                status = str(result.get("status") or "failed")
+                message = str(result.get("message") or "")
+                error = str(result.get("error") or "")
+            except Exception as exc:
+                status = "failed"
+                message = ""
+                error = str(exc)
+            self.store.update_candidate_greeting_status(
+                candidate_id, status, message=message, error=error
+            )
+            title = {
+                "success": "手动打招呼成功",
+                "already_greeted": "候选人已打过招呼",
+                "skipped": "手动打招呼已跳过",
+            }.get(status, "手动打招呼失败")
+            self.store.add_event(
+                session_id,
+                None,
+                "manual_greeting",
+                title,
+                message or error or status,
+                {
+                    "candidate_id": candidate_id,
+                    "status": status,
+                    "profile_url": profile_url,
+                },
+            )
+            self.event_bus.publish(
+                "manual_greeting_done",
+                {
+                    "session_id": session_id,
+                    "candidate_id": candidate_id,
+                    "status": status,
+                    "error": error,
+                },
+            )
+
+        return _done
 
     def delete_session(self, session_id: str) -> None:
         session = self.store.get_session(session_id) or {}
@@ -720,6 +1088,19 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config_manager, self)
         if dialog.exec() != QDialog.Accepted:
+            return
+        active_session_ids = [
+            session_id
+            for session_id in list(self.runtime._threads.keys())
+            if self.runtime.is_active(session_id)
+        ]
+        if active_session_ids:
+            QMessageBox.information(
+                self,
+                "设置已保存",
+                "当前仍有任务运行，暂不重载浏览器和匹配服务；停止任务后重新打开设置即可让新配置生效。",
+            )
+            self._mark_dirty()
             return
         self._rebuild_runtime_tools()
         QMessageBox.information(
@@ -853,24 +1234,109 @@ class MainWindow(QMainWindow):
         if current is None:
             return
         self.selected_session_id = current.data(Qt.UserRole)
+        self.selected_candidate_id = None
+        self.detail_view.clear()
+        self._update_manual_greeting_button_state()
         self._mark_dirty()
 
     def _on_candidate_selected(self) -> None:
-        selected = self.candidate_table.selectedItems()
-        if not selected:
+        candidate_ids = self._selected_candidate_ids()
+        if not candidate_ids:
+            self.selected_candidate_id = None
+            self.detail_view.clear()
+            self._update_manual_greeting_button_state()
             return
-        row = selected[0].row()
-        item = self.candidate_table.item(row, 0)
-        if not item:
+        self.selected_candidate_id = candidate_ids[0]
+        self._render_candidate_detail(candidate_ids[0])
+        self._update_manual_greeting_button_state()
+
+    def _selected_candidate_ids(self) -> list[str]:
+        if not hasattr(self, "candidate_table"):
+            return []
+        selection_model = self.candidate_table.selectionModel()
+        rows = []
+        if selection_model is not None:
+            rows = sorted({index.row() for index in selection_model.selectedRows()})
+        if not rows:
+            rows = sorted({item.row() for item in self.candidate_table.selectedItems()})
+        candidate_ids = []
+        for row in rows:
+            item = self.candidate_table.item(row, 0)
+            if not item:
+                continue
+            candidate_id = str(item.data(Qt.UserRole) or "")
+            if candidate_id and candidate_id not in candidate_ids:
+                candidate_ids.append(candidate_id)
+        return candidate_ids
+
+    def _update_manual_greeting_button_state(self) -> None:
+        if not hasattr(self, "manual_greeting_btn"):
             return
-        candidate_id = item.data(Qt.UserRole)
-        self._render_candidate_detail(candidate_id)
+        enabled = False
+        candidate_ids = self._selected_candidate_ids()
+        count = len(candidate_ids)
+        self.manual_greeting_btn.setText(
+            "批量打招呼({})".format(count) if count > 1 else "手动打招呼"
+        )
+        tooltip = "请先选择一位或多位已抓取详情的候选人。"
+        if self.selected_session_id and candidate_ids:
+            if self.runtime.is_active(self.selected_session_id):
+                tooltip = "任务运行中，暂停或结束后再手动打招呼。"
+            else:
+                candidates = self.store.get_candidates_by_ids(candidate_ids)
+                candidates_by_id = {
+                    str(candidate.get("id") or ""): candidate for candidate in candidates
+                }
+                eligible = 0
+                pending = 0
+                missing = 0
+                for candidate_id in candidate_ids:
+                    detail = self.store.get_candidate_detail(candidate_id) or {}
+                    candidate = candidates_by_id.get(candidate_id) or {}
+                    if not detail:
+                        missing += 1
+                        continue
+                    if str(detail.get("greeting_status") or "") == "pending":
+                        pending += 1
+                        continue
+                    if not self._candidate_profile_url(candidate, detail):
+                        missing += 1
+                        continue
+                    eligible += 1
+                if eligible:
+                    enabled = True
+                    tooltip = "已选 {} 位，其中 {} 位可用抓取到的详情链接依次打招呼。".format(
+                        count, eligible
+                    )
+                    if pending or missing:
+                        tooltip += " 其余 {} 位会被跳过。".format(pending + missing)
+                elif pending:
+                    tooltip = "选中的候选人正在执行手动打招呼。"
+                else:
+                    tooltip = "选中的候选人缺少详情或抓取到的候选人链接。"
+        self.manual_greeting_btn.setEnabled(enabled)
+        self.manual_greeting_btn.setToolTip(tooltip)
 
     def _mark_dirty(self) -> None:
         self._dirty = True
         # Trigger refresh on next event loop iteration instead of waiting for timer
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self._refresh_if_dirty)
+
+    def _queue_runtime_event(
+        self, event_type: str, payload: Dict[str, object]
+    ) -> None:
+        with self._runtime_events_lock:
+            self._runtime_events.append((event_type, payload or {}))
+        self._dirty = True
+
+    def _drain_runtime_events(self) -> None:
+        events = []
+        with self._runtime_events_lock:
+            while self._runtime_events:
+                events.append(self._runtime_events.popleft())
+        for event_type, payload in events:
+            self._handle_runtime_event(event_type, payload)
 
     def _handle_runtime_event(
         self, event_type: str, payload: Dict[str, object]
@@ -882,10 +1348,25 @@ class MainWindow(QMainWindow):
         elif event_type == "browser_error":
             self._pending_status_text = "猎聘浏览器打开失败"
             self._pending_browser_error = str(payload.get("error") or "未知错误")
+        elif event_type == "manual_greeting_done":
+            if str(payload.get("status") or "") in {"success", "already_greeted"}:
+                self._pending_status_text = "手动打招呼完成"
+            else:
+                self._pending_status_text = "手动打招呼未完成"
+        elif event_type == "criteria_ready":
+            session_id = str(payload.get("session_id") or "")
+            if self._queue_running and session_id:
+                entry = self.store.get_pool_entry(session_id)
+                if entry and entry.get("status") == "active":
+                    self._show_pool_notification(
+                        session_id, entry.get("title") or "未命名"
+                    )
+            self._mark_dirty()
         else:
             self._mark_dirty()
 
     def _refresh_if_dirty(self) -> None:
+        self._drain_runtime_events()
         if self._pending_status_text:
             if "打开失败" in self._pending_status_text:
                 self.browser_label.setText("浏览器：打开失败")
@@ -901,9 +1382,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "猎聘浏览器打开失败", error)
         if self._dirty:
             self.refresh_all()
+        self._check_queue_advance()
 
     def refresh_all(self) -> None:
         self._dirty = False
+        self._refresh_pool()
         self._refresh_sessions()
         self._refresh_selected_session()
 
@@ -935,6 +1418,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_selected_session(self) -> None:
         if not self.selected_session_id:
+            self.selected_candidate_id = None
             self.title_label.setText("未选择任务")
             self.stage_label.setText("就绪")
             self.timeline.clear()
@@ -942,6 +1426,7 @@ class MainWindow(QMainWindow):
             self.strategy_view.clear()
             self.detail_view.clear()
             self.log_view.clear()
+            self._update_manual_greeting_button_state()
             return
         session = self.store.get_session(self.selected_session_id) or {}
         sessions = {item["id"]: item for item in self.store.list_sessions()}
@@ -975,6 +1460,7 @@ class MainWindow(QMainWindow):
         self._render_candidates()
         self._render_strategy()
         self._render_logs()
+        self._update_manual_greeting_button_state()
 
     def _render_timeline(self) -> None:
         events = self.store.list_events(self.selected_session_id)
@@ -1052,9 +1538,18 @@ class MainWindow(QMainWindow):
         return events[-1] if events else {}
 
     def _render_candidates(self) -> None:
+        selected_ids = set(self._selected_candidate_ids())
+        if self.selected_candidate_id:
+            selected_ids.add(self.selected_candidate_id)
         candidates = self.store.list_candidates(self.selected_session_id)
+        available_ids = {str(candidate.get("id") or "") for candidate in candidates}
+        selected_ids = {
+            candidate_id for candidate_id in selected_ids if candidate_id in available_ids
+        }
+        self.candidate_table.blockSignals(True)
         self.candidate_table.setRowCount(len(candidates))
         for row, candidate in enumerate(candidates):
+            candidate_id = str(candidate.get("id") or "")
             values = [
                 candidate.get("name") or "",
                 candidate.get("current_company") or "",
@@ -1062,20 +1557,37 @@ class MainWindow(QMainWindow):
                 candidate.get("city") or "",
                 candidate.get("work_years") or "",
                 candidate.get("education") or "",
+                "是" if int(candidate.get("is_gold_collar") or 0) == 1 else "否",
                 self._card_decision_label(candidate.get("card_decision") or ""),
                 candidate.get("match_tier") or "",
+                self._greeting_status_label(candidate.get("greeting_status") or ""),
                 candidate.get("status") or "",
                 candidate.get("summary_text") or "",
             ]
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(value)
                 if column == 0:
-                    table_item.setData(Qt.UserRole, candidate.get("id"))
-                if column == 6:
+                    table_item.setData(Qt.UserRole, candidate_id)
+                if column in {6, 7, 9}:
                     table_item.setTextAlignment(Qt.AlignCenter)
                 self.candidate_table.setItem(row, column, table_item)
+        selection_model = self.candidate_table.selectionModel()
+        if selection_model is not None:
+            selection_model.clearSelection()
+            for row, candidate in enumerate(candidates):
+                candidate_id = str(candidate.get("id") or "")
+                if candidate_id in selected_ids:
+                    selection_model.select(
+                        self.candidate_table.model().index(row, 0),
+                        QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                    )
+        self.candidate_table.blockSignals(False)
+        selected_after_refresh = self._selected_candidate_ids()
+        self.selected_candidate_id = (
+            selected_after_refresh[0] if selected_after_refresh else None
+        )
         self.candidate_table.resizeColumnsToContents()
-        self.candidate_table.setColumnWidth(9, 260)
+        self.candidate_table.setColumnWidth(11, 260)
 
     def _render_strategy(self) -> None:
         rounds = self.store.list_rounds(self.selected_session_id)
@@ -1087,6 +1599,7 @@ class MainWindow(QMainWindow):
         filters = from_json(last.get("filters_json"), {})
         html = """
         <p><b>第 {round_index} 轮</b> | {status}</p>
+        <p><b>打招呼：</b>{auto_greeting}</p>
         <p><b>寻访基准：</b>v{criteria_version}</p>
         <p><b>关键词：</b>{keywords}</p>
         <p><b>岗位要求：</b>{requirements}</p>
@@ -1100,6 +1613,7 @@ class MainWindow(QMainWindow):
         """.format(
             round_index=self._html(last.get("round_index")),
             status=self._html(last.get("status")),
+            auto_greeting=self._html(self._greeting_policy_text()),
             criteria_version=self._html(criteria.get("version") or ""),
             keywords=self._html((criteria.get("keywords_text") or "").replace("\n", "、")),
             requirements=self._html(criteria.get("requirements_text") or ""),
@@ -1121,6 +1635,12 @@ class MainWindow(QMainWindow):
             ab_count=self._html(last.get("ab_count") or 0),
         )
         self.strategy_view.setHtml(html)
+
+    def _greeting_policy_text(self) -> str:
+        config = self.config_manager.config
+        if config.greeting_template:
+            return "仅人工选择候选人后手动触发；使用自定义话术"
+        return "仅人工选择候选人后手动触发；使用平台默认打招呼"
 
     def _render_candidate_detail(self, candidate_id: str) -> None:
         candidates = self.store.get_candidates_by_ids([candidate_id])
@@ -1162,9 +1682,11 @@ class MainWindow(QMainWindow):
             )
             for source in sources[-8:]
         )
+        is_gold = int(detail.get("is_gold_collar") or 0) == 1
         html = """
         <p><b>{name}</b> / {title}</p>
         <p>{company} | {city} | {work_years} | {education}</p>
+        <p><b>金领：</b>{gold} | <b>打招呼：</b>{greeting_status}</p>
         <p><b>卡片判断：</b>{card_decision}</p>
         <p><b>匹配：</b>{tier} {recommendation}</p>
         <p><b>摘要：</b>{summary}</p>
@@ -1182,6 +1704,12 @@ class MainWindow(QMainWindow):
             city=self._html(candidate.get("city")),
             work_years=self._html(candidate.get("work_years")),
             education=self._html(candidate.get("education")),
+            gold="是" if is_gold else "否",
+            greeting_status=self._html(
+                self._greeting_status_label(detail.get("greeting_status") or "")
+                or detail.get("greeting_error")
+                or "未触发"
+            ),
             card_decision=self._html(
                 self._card_decision_label(candidate.get("card_decision") or "")
             ),
@@ -1203,6 +1731,52 @@ class MainWindow(QMainWindow):
     def _html(value: object) -> str:
         return escape(str(value or ""), quote=True)
 
+    @classmethod
+    def _candidate_profile_url(
+        cls, candidate: Dict[str, object], detail: Dict[str, object]
+    ) -> str:
+        raw_payload = from_json(detail.get("raw_payload_json"), {}) or {}
+        profile_url = cls._find_url(raw_payload)
+        if profile_url:
+            return profile_url
+        return str(candidate.get("profile_url") or "")
+
+    @classmethod
+    def _find_url(cls, value: object) -> str:
+        if isinstance(value, str):
+            if value.startswith(("http://", "https://")):
+                return value
+            nested = from_json(value, None)
+            return cls._find_url(nested) if nested is not None else ""
+        if isinstance(value, dict):
+            for key in ("profile_url", "resume_url", "detail_url", "url", "href"):
+                url = value.get(key)
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+            for child in value.values():
+                url = cls._find_url(child)
+                if url:
+                    return url
+        if isinstance(value, list):
+            for child in value:
+                url = cls._find_url(child)
+                if url:
+                    return url
+        return ""
+
+    @staticmethod
+    def _resume_has_contact_info(resume_text: str) -> bool:
+        text = resume_text or ""
+        return bool(
+            re.search(r"1[3-9]\d{9}", text)
+            or re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+            or re.search(
+                r"(?:微信|VX|WX|WeChat|电话|手机|QQ)[:：\s]*[A-Za-z0-9_\-]{5,}",
+                text,
+                re.I,
+            )
+        )
+
     def _mark_criteria_dirty(self) -> None:
         self._criteria_dirty = True
 
@@ -1214,7 +1788,214 @@ class MainWindow(QMainWindow):
             "noise": "明显噪音",
         }.get(str(value or ""), "信息不足")
 
+    @staticmethod
+    def _greeting_status_label(value: object) -> str:
+        return {
+            "success": "已发送",
+            "already_greeted": "已打过",
+            "skipped": "已跳过",
+            "failed": "失败",
+            "pending": "待处理",
+        }.get(str(value or ""), "")
+
+    # ------------------------------------------------------------------
+    # Project Pool
+    # ------------------------------------------------------------------
+
+    def _start_queue(self) -> None:
+        entries = self.store.list_pool_entries()
+        queued = [e for e in entries if e.get("status") == "queued"]
+        if not queued:
+            QMessageBox.information(self, "项目池", "当前没有排队中的项目。")
+            return
+        self._queue_running = True
+        self.start_queue_btn.setVisible(False)
+        self.stop_queue_btn.setVisible(True)
+        self._advance_queue()
+
+    def _stop_queue(self) -> None:
+        self._queue_running = False
+        self.start_queue_btn.setVisible(True)
+        self.stop_queue_btn.setVisible(False)
+        active = self.store.get_active_pool_session()
+        if active:
+            self.store.update_pool_status(active["session_id"], "queued")
+            self._active_pool_session_id = None
+        self._refresh_pool()
+
+    def _advance_queue(self) -> None:
+        if not self._queue_running:
+            return
+        # Mark any finished active session as completed
+        active = self.store.get_active_pool_session()
+        if active:
+            session = self.store.get_session(active["session_id"]) or {}
+            status = str(session.get("status") or "")
+            if status in {"completed", "failed", "cancelled"}:
+                self.store.update_pool_status(active["session_id"], "completed")
+                active = None
+            elif status in {"running", "waiting_approval", "criteria_draft", "criteria_confirmed", "ready", "paused"}:
+                # Still in progress; do nothing
+                self._active_pool_session_id = active["session_id"]
+                self._refresh_pool()
+                return
+            else:
+                # Unknown or terminal state
+                self.store.update_pool_status(active["session_id"], "completed")
+                active = None
+
+        self._active_pool_session_id = None
+        next_entry = self.store.get_next_queued_session()
+        if not next_entry:
+            self._queue_running = False
+            self.start_queue_btn.setVisible(True)
+            self.stop_queue_btn.setVisible(False)
+            QMessageBox.information(self, "项目池", "所有项目已处理完毕。")
+            self._refresh_pool()
+            return
+
+        session_id = next_entry["session_id"]
+        self.store.update_pool_status(session_id, "active")
+        self._active_pool_session_id = session_id
+        self._refresh_pool()
+
+        session = self.store.get_session(session_id) or {}
+        status = str(session.get("status") or "")
+
+        if status in {"completed", "failed", "cancelled"}:
+            self.store.update_pool_status(session_id, "completed")
+            QTimer.singleShot(500, self._advance_queue)
+            return
+
+        if status == "criteria_draft":
+            draft = self.store.get_latest_criteria_version(session_id, "draft")
+            confirmed = self.store.get_latest_criteria_version(session_id, "confirmed")
+            if confirmed:
+                self.continue_session(session_id)
+            elif draft:
+                self._show_pool_notification(session_id, session.get("title") or "未命名")
+            else:
+                # No criteria yet; trigger generation and wait for event
+                self.selected_session_id = session_id
+                self._queue_criteria_draft(session_id)
+        elif status in {"criteria_confirmed", "ready", "paused"}:
+            self.continue_session(session_id)
+        elif status == "running":
+            # Already running; just let it proceed
+            pass
+        else:
+            # Fallback
+            self.continue_session(session_id)
+
+    def _check_queue_advance(self) -> None:
+        if not self._queue_running:
+            return
+        active_entry = self.store.get_active_pool_session()
+        if not active_entry:
+            QTimer.singleShot(500, self._advance_queue)
+            return
+        session_id = active_entry["session_id"]
+        session = self.store.get_session(session_id) or {}
+        status = str(session.get("status") or "")
+        if status in {"completed", "failed", "cancelled"}:
+            self.store.update_pool_status(session_id, "completed")
+            QTimer.singleShot(800, self._advance_queue)
+
+    def _show_pool_notification(self, session_id: str, title: str) -> None:
+        if not self._queue_running:
+            return
+        dialog = PoolNotificationDialog(title, session_id, self)
+        result = dialog.exec()
+        if result == 100:
+            self.selected_session_id = session_id
+            self._select_session_in_list(session_id)
+            self.refresh_all()
+
+    def _on_pool_reordered(self, *args) -> None:
+        ordered_ids = []
+        for i in range(self.pool_list.count()):
+            item = self.pool_list.item(i)
+            session_id = str(item.data(Qt.UserRole) or "")
+            if session_id:
+                ordered_ids.append(session_id)
+        if ordered_ids:
+            self.store.reorder_pool(ordered_ids)
+        self._refresh_pool()
+
+    def _refresh_pool(self) -> None:
+        entries = self.store.list_pool_entries()
+        current_id = self._active_pool_session_id
+        self.pool_list.blockSignals(True)
+        self.pool_list.clear()
+        for entry in entries:
+            session_id = str(entry.get("session_id") or "")
+            title = str(entry.get("title") or "未命名")
+            status = str(entry.get("status") or "")
+            session_status = str(entry.get("session_status") or "")
+            label = "{} | {}".format(title, self._pool_status_label(status, session_status))
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, session_id)
+            if status == "active":
+                item.setBackground(Qt.GlobalColor.yellow)
+            self.pool_list.addItem(item)
+            if session_id == current_id:
+                self.pool_list.setCurrentItem(item)
+        self.pool_list.blockSignals(False)
+
+    def _on_pool_item_selected(self, current: QListWidgetItem, _previous: QListWidgetItem) -> None:
+        if current is None:
+            return
+        session_id = str(current.data(Qt.UserRole) or "")
+        if session_id:
+            self.selected_session_id = session_id
+            self._select_session_in_list(session_id)
+            self._mark_dirty()
+
+    def _clear_completed_pool(self) -> None:
+        count = self.store.clear_pool_by_status(["completed", "failed"])
+        self._refresh_pool()
+        if count:
+            QMessageBox.information(self, "项目池", "已清理 {} 个已完成/失败的项目。".format(count))
+
+    @staticmethod
+    def _pool_status_label(pool_status: str, session_status: str) -> str:
+        mapping = {
+            "queued": "排队中",
+            "active": "处理中",
+            "completed": "已完成",
+            "failed": "失败",
+        }
+        base = mapping.get(pool_status, pool_status)
+        if pool_status == "active" and session_status:
+            session_map = {
+                "criteria_draft": "待确认基准",
+                "criteria_confirmed": "已确认",
+                "running": "运行中",
+                "waiting_approval": "等待确认",
+                "paused": "已暂停",
+            }
+            extra = session_map.get(session_status, session_status)
+            return "{}（{}）".format(base, extra)
+        return base
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        active_session_ids = [
+            session_id
+            for session_id in list(self.runtime._threads.keys())
+            if self.runtime.is_active(session_id)
+        ]
+        if active_session_ids:
+            reply = QMessageBox.question(
+                self,
+                "退出工作台",
+                "当前仍有任务在运行。是否请求停止任务并退出？",
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            for session_id in active_session_ids:
+                self.runtime.cancel_session(session_id)
+        self.event_bus.unsubscribe(self._queue_runtime_event)
         try:
             self.runtime.liepin_tool.close()
         except Exception:

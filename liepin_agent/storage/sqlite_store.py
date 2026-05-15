@@ -14,6 +14,7 @@ from .repos._candidate_mixin import _CandidateMixin
 from .repos._match_mixin import _MatchMixin
 from .repos._metrics_mixin import _MetricsMixin
 from .repos._event_mixin import _EventMixin
+from .repos._pool_mixin import _PoolMixin
 from .repos._base_mixin import now_text, to_json, from_json
 
 __all__ = ["SQLiteStore", "now_text", "to_json", "from_json"]
@@ -27,6 +28,7 @@ class SQLiteStore(
     _MatchMixin,
     _MetricsMixin,
     _EventMixin,
+    _PoolMixin,
 ):
     """Repository facade around the workbench SQLite database."""
 

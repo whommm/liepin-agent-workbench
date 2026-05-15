@@ -16,14 +16,28 @@ API_ENV_NAMES = {
     "timeout": "LIEPIN_AGENT_TIMEOUT",
 }
 
+BACKEND_API_ENV_NAMES = {
+    "api_base_url": "LIEPIN_AGENT_BACKEND_API_BASE_URL",
+    "api_key": "LIEPIN_AGENT_BACKEND_API_KEY",
+    "model_name": "LIEPIN_AGENT_BACKEND_MODEL_NAME",
+}
+
 
 class AppConfig(BaseModel):
     """应用配置数据类（Pydantic 校验）"""
 
+    # 默认/前端 LLM 配置（Agent Brain：规划、观察、复盘等）
     api_base_url: str = ""
     api_key: str = ""
     api_key_env: str = "LIEPIN_AGENT_API_KEY"
     model_name: str = "deepseek-chat"
+
+    # 后端 LLM 配置（Matcher：候选人匹配等重任务）
+    # 留空时自动 fallback 到默认配置
+    backend_api_base_url: str = ""
+    backend_api_key: str = ""
+    backend_model_name: str = ""
+
     tavily_api_key: str = ""
     timeout: int = Field(default=120, ge=1, le=3600)
     theme: str = "light"
@@ -31,6 +45,7 @@ class AppConfig(BaseModel):
     liepin_browser_headless: bool = False
     liepin_browser_profile_dir: str = "browser_profile/liepin"
     greeting_template: str = ""
+    auto_greeting_enabled: bool = False
     debug_snapshots_enabled: bool = False
 
     @field_validator("timeout", mode="before")
@@ -117,6 +132,14 @@ class ConfigManager:
             except ValueError:
                 pass
 
+        # Backend LLM env overrides
+        backend_url = env_values.get(BACKEND_API_ENV_NAMES["api_base_url"], "")
+        backend_key = env_values.get(BACKEND_API_ENV_NAMES["api_key"], "")
+        backend_model = env_values.get(BACKEND_API_ENV_NAMES["model_name"], "")
+        config.backend_api_base_url = backend_url or config.backend_api_base_url
+        config.backend_api_key = backend_key or config.backend_api_key
+        config.backend_model_name = backend_model or config.backend_model_name
+
         config.api_base_url = os.environ.get(
             API_ENV_NAMES["api_base_url"], config.api_base_url
         )
@@ -133,6 +156,16 @@ class ConfigManager:
             except ValueError:
                 pass
 
+        config.backend_api_base_url = os.environ.get(
+            BACKEND_API_ENV_NAMES["api_base_url"], config.backend_api_base_url
+        )
+        config.backend_api_key = os.environ.get(
+            BACKEND_API_ENV_NAMES["api_key"], config.backend_api_key
+        )
+        config.backend_model_name = os.environ.get(
+            BACKEND_API_ENV_NAMES["model_name"], config.backend_model_name
+        )
+
     def _save_env_config(self) -> None:
         env_values = self._read_env_file()
         env_values[API_ENV_NAMES["api_base_url"]] = self.config.api_base_url or ""
@@ -141,6 +174,9 @@ class ConfigManager:
         )
         env_values[API_ENV_NAMES["model_name"]] = self.config.model_name or ""
         env_values[API_ENV_NAMES["timeout"]] = str(int(self.config.timeout or 120))
+        env_values[BACKEND_API_ENV_NAMES["api_base_url"]] = self.config.backend_api_base_url or ""
+        env_values[BACKEND_API_ENV_NAMES["api_key"]] = self.config.backend_api_key or ""
+        env_values[BACKEND_API_ENV_NAMES["model_name"]] = self.config.backend_model_name or ""
         self._write_env_file(env_values)
 
     def _read_env_file(self) -> dict:
@@ -166,6 +202,9 @@ class ConfigManager:
             self.config.api_key_env or API_ENV_NAMES["api_key"],
             API_ENV_NAMES["model_name"],
             API_ENV_NAMES["timeout"],
+            BACKEND_API_ENV_NAMES["api_base_url"],
+            BACKEND_API_ENV_NAMES["api_key"],
+            BACKEND_API_ENV_NAMES["model_name"],
         ]
         written = set()
         lines = ["# Liepin Agent API configuration"]

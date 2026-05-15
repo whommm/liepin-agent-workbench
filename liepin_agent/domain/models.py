@@ -92,6 +92,7 @@ class CandidateDetail:
     raw_payload: Dict[str, Any] = field(default_factory=dict)
     capture_status: str = "success"
     error_message: str = ""
+    is_gold_collar: bool = False
 
 
 @dataclass
