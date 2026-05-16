@@ -1,13 +1,40 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Local configuration and secrets
+config.json
+.env
+.env.*
+!.env.example
+
+# Runtime data
 *.db
 *.db-shm
 *.db-wal
-config.json
-.env
 logs/
 exports/
 debug_artifacts/
 browser_profile/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

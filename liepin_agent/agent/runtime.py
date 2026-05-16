@@ -74,6 +74,10 @@ class AgentRuntime:
         thread = self._threads.get(session_id)
         return bool(thread and thread.is_alive())
 
+    def active_session_ids(self) -> list[str]:
+        """Return a list of session IDs that currently have live threads."""
+        return [sid for sid, t in self._threads.items() if t.is_alive()]
+
     def cancel_session(self, session_id: str) -> None:
         event = self._cancel_events.get(session_id)
         if event:

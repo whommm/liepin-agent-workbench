@@ -2,32 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 from collections import deque
 from html import escape
 from pathlib import Path
-import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
-    QComboBox,
     QDialog,
-    QFormLayout,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -36,7 +32,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..agent.planner import Planner
 from ..agent.runtime import AgentRuntime
 from ..agent.brain import LLMAgentBrain
 from ..core.config import ConfigManager
@@ -45,319 +40,10 @@ from ..storage.sqlite_store import SQLiteStore, from_json
 from ..tools.exporter import ExportService
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
+from .dialogs import NewSessionDialog, PoolNotificationDialog, SettingsDialog
+from .session_list_item import SessionListItemWidget
+from .styles import MAIN_STYLESHEET
 
-
-class PoolNotificationDialog(QDialog):
-    """Top-most notification dialog for pool queue."""
-
-    def __init__(self, title: str, session_id: str, parent=None):
-        super().__init__(parent)
-        self.session_id = session_id
-        self.setWindowTitle("项目池提醒")
-        self.setWindowFlags(
-            Qt.Dialog | Qt.WindowStaysOnTopHint | Qt.WindowCloseButtonHint
-        )
-        self.resize(400, 160)
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.addWidget(
-            QLabel(
-                '<b style="font-size:15px;">项目《{}》</b>'.format(title)
-            )
-        )
-        info = QLabel("寻访基准（匹配词与岗位要求）已生成，请确认后开始搜索。")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch(1)
-        self.later_btn = QPushButton("稍后")
-        self.confirm_btn = QPushButton("去确认")
-        self.confirm_btn.setDefault(True)
-        self.confirm_btn.setStyleSheet(
-            "background: #2563eb; color: white; font-weight: 700; padding: 6px 16px;"
-        )
-        self.later_btn.clicked.connect(self.reject)
-        self.confirm_btn.clicked.connect(self._on_confirm)
-        btn_layout.addWidget(self.later_btn)
-        btn_layout.addWidget(self.confirm_btn)
-        layout.addLayout(btn_layout)
-
-        if parent:
-            QApplication.alert(parent, 0)
-
-    def _on_confirm(self) -> None:
-        self.done(100)
-
-
-class NewSessionDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("新建寻访任务")
-        self.resize(720, 560)
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-
-        self.title_input = QLineEdit()
-        self.title_input.setPlaceholderText("例如：文创产品经理 / 深圳")
-        form.addRow("任务名称", self.title_input)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["自动", "单步", "监督"])
-        form.addRow("运行模式", self.mode_combo)
-
-        self.max_rounds = QSpinBox()
-        self.max_rounds.setRange(1, 12)
-        self.max_rounds.setValue(10)
-        form.addRow("最大轮次", self.max_rounds)
-
-        self.max_details = QSpinBox()
-        self.max_details.setRange(1, 9999)
-        self.max_details.setValue(999)
-        form.addRow("最大详情抓取", self.max_details)
-
-        self.target_ab = QSpinBox()
-        self.target_ab.setRange(1, 9999)
-        self.target_ab.setValue(999)
-        form.addRow("目标 A/B 数", self.target_ab)
-
-        layout.addLayout(form)
-
-        layout.addWidget(QLabel("JD 文本"))
-        self.jd_input = QTextEdit()
-        self.jd_input.setPlaceholderText(
-            "粘贴岗位描述。Agent 会基于文本生成第一轮搜索假设。"
-        )
-        layout.addWidget(self.jd_input, 1)
-
-        layout.addWidget(QLabel("补充说明"))
-        self.notes_input = QTextEdit()
-        self.notes_input.setMaximumHeight(90)
-        self.notes_input.setPlaceholderText(
-            "客户偏好、排除方向、城市弹性、特殊背景等。"
-        )
-        layout.addWidget(self.notes_input)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        cancel_btn = QPushButton("取消")
-        create_btn = QPushButton("创建")
-        create_btn.setDefault(True)
-        cancel_btn.clicked.connect(self.reject)
-        create_btn.clicked.connect(self._validate_and_accept)
-        buttons.addWidget(cancel_btn)
-        buttons.addWidget(create_btn)
-        layout.addLayout(buttons)
-
-    def _validate_and_accept(self) -> None:
-        if not self.jd_input.toPlainText().strip():
-            QMessageBox.warning(self, "提示", "请先输入 JD 文本")
-            return
-        self.accept()
-
-    def payload(self) -> Dict[str, object]:
-        jd_text = self.jd_input.toPlainText().strip()
-        title = self.title_input.text().strip() or Planner.infer_title(jd_text)
-        return {
-            "title": title,
-            "jd_text": jd_text,
-            "user_notes": self.notes_input.toPlainText().strip(),
-            "mode": self.mode_combo.currentText(),
-            "max_rounds": self.max_rounds.value(),
-            "max_detail_fetches": self.max_details.value(),
-            "target_ab_count": self.target_ab.value(),
-        }
-
-
-class SettingsDialog(QDialog):
-    def __init__(self, config_manager: ConfigManager, parent=None):
-        super().__init__(parent)
-        self.config_manager = config_manager
-        config = config_manager.config
-        self.setWindowTitle("设置")
-        self.resize(640, 520)
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-
-        self.api_base_url = QLineEdit(config.api_base_url)
-        self.api_base_url.setPlaceholderText("https://api.deepseek.com/v1")
-        form.addRow("API Base URL", self.api_base_url)
-
-        self.api_key = QLineEdit(config.api_key)
-        self.api_key.setEchoMode(QLineEdit.Password)
-        self.api_key.setPlaceholderText(
-            "留空则使用环境变量 {}".format(config.api_key_env or "LIEPIN_AGENT_API_KEY")
-        )
-        form.addRow("API Key", self.api_key)
-
-        self.model_name = QLineEdit(config.model_name or "deepseek-chat")
-        form.addRow("模型名称", self.model_name)
-
-        self.timeout = QSpinBox()
-        self.timeout.setRange(10, 600)
-        self.timeout.setValue(int(config.timeout or 120))
-        form.addRow("API 超时秒数", self.timeout)
-
-        # Backend LLM (Matcher)
-        form.addRow(QLabel(""))
-        backend_label = QLabel("后端 LLM 配置（候选人匹配专用，留空则共用上方配置）")
-        backend_label.setStyleSheet("color: #64748b; font-size: 12px;")
-        form.addRow(backend_label)
-
-        self.backend_api_base_url = QLineEdit(config.backend_api_base_url)
-        self.backend_api_base_url.setPlaceholderText("https://api.deepseek.com/v1")
-        form.addRow("后端 API Base URL", self.backend_api_base_url)
-
-        self.backend_api_key = QLineEdit(config.backend_api_key)
-        self.backend_api_key.setEchoMode(QLineEdit.Password)
-        self.backend_api_key.setPlaceholderText("留空则使用上方 API Key")
-        form.addRow("后端 API Key", self.backend_api_key)
-
-        self.backend_model_name = QLineEdit(config.backend_model_name)
-        self.backend_model_name.setPlaceholderText("留空则使用上方模型名称")
-        form.addRow("后端模型名称", self.backend_model_name)
-
-        self.browser_channel = QComboBox()
-        self.browser_channel.addItems(["msedge", "chrome", "chromium"])
-        index = self.browser_channel.findText(config.liepin_browser_channel or "msedge")
-        self.browser_channel.setCurrentIndex(max(0, index))
-        form.addRow("浏览器通道", self.browser_channel)
-
-        self.profile_dir = QLineEdit(
-            config.liepin_browser_profile_dir or "browser_profile/liepin"
-        )
-        form.addRow("猎聘 Profile", self.profile_dir)
-
-        self.greeting_template = QTextEdit(config.greeting_template or "")
-        self.greeting_template.setMaximumHeight(90)
-        self.greeting_template.setPlaceholderText(
-            "留空则只触发平台默认打招呼；填写后，手动打招呼会发送这段消息。"
-        )
-        form.addRow("手动打招呼话术", self.greeting_template)
-
-        layout.addLayout(form)
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        cancel_btn = QPushButton("取消")
-        save_btn = QPushButton("保存")
-        cancel_btn.clicked.connect(self.reject)
-        save_btn.clicked.connect(self._save)
-        buttons.addWidget(cancel_btn)
-        buttons.addWidget(save_btn)
-        layout.addLayout(buttons)
-
-    def _save(self) -> None:
-        self.config_manager.update(
-            api_base_url=self.api_base_url.text().strip(),
-            api_key=self.api_key.text().strip(),
-            model_name=self.model_name.text().strip() or "deepseek-chat",
-            timeout=self.timeout.value(),
-            backend_api_base_url=self.backend_api_base_url.text().strip(),
-            backend_api_key=self.backend_api_key.text().strip(),
-            backend_model_name=self.backend_model_name.text().strip(),
-            liepin_browser_channel=self.browser_channel.currentText(),
-            liepin_browser_profile_dir=self.profile_dir.text().strip()
-            or "browser_profile/liepin",
-            greeting_template=self.greeting_template.toPlainText().strip(),
-        )
-        if not self.config_manager.save_config():
-            QMessageBox.warning(self, "保存失败", "配置文件写入失败")
-            return
-        self.accept()
-
-
-class SessionListItemWidget(QFrame):
-    def __init__(self, session: Dict[str, object], parent_window: "MainWindow"):
-        super().__init__()
-        self.session = session
-        self.parent_window = parent_window
-        self.session_id = str(session["id"])
-        self.setObjectName("SessionItem")
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 7, 8, 7)
-        layout.setSpacing(6)
-
-        title = QLabel(str(session.get("title") or "未命名任务"))
-        title.setObjectName("SessionTitle")
-        title.setWordWrap(True)
-        layout.addWidget(title)
-
-        status = str(session.get("status") or "")
-        status_text = {
-            "criteria_draft": "待确认基准",
-            "criteria_confirmed": "已确认，待开始",
-            "running": "运行中",
-            "waiting_approval": "等待人工确认",
-            "paused": "已暂停",
-            "completed": "已完成",
-            "failed": "失败",
-            "cancelled": "已取消",
-        }.get(status, status)
-        info = QLabel(
-            "{} | 候选人 {} | 详情 {} | A/B {}".format(
-                status_text,
-                session.get("candidate_count") or 0,
-                session.get("detail_count") or 0,
-                session.get("ab_count") or 0,
-            )
-        )
-        info.setObjectName("SessionInfo")
-        layout.addWidget(info)
-
-        buttons = QGridLayout()
-        buttons.setSpacing(5)
-        self.continue_btn = QPushButton("暂停" if status == "running" else "继续")
-        self.stop_btn = QPushButton("终止")
-        self.export_btn = QPushButton("导出")
-        self.delete_btn = QPushButton("删除")
-        for button in [self.continue_btn, self.stop_btn, self.export_btn, self.delete_btn]:
-            button.setFixedHeight(26)
-        buttons.addWidget(self.continue_btn, 0, 0)
-        buttons.addWidget(self.stop_btn, 0, 1)
-        buttons.addWidget(self.export_btn, 1, 0)
-        buttons.addWidget(self.delete_btn, 1, 1)
-        buttons.setColumnStretch(0, 1)
-        buttons.setColumnStretch(1, 1)
-        layout.addLayout(buttons)
-
-        self.command_input = QLineEdit()
-        self.command_input.setPlaceholderText("输入指令，例如：去掉BLDC，只保留无刷电机")
-        self.command_input.setFixedHeight(26)
-        self.send_cmd_btn = QPushButton("发送指令")
-        self.send_cmd_btn.setFixedHeight(26)
-        cmd_layout = QHBoxLayout()
-        cmd_layout.setSpacing(5)
-        cmd_layout.addWidget(self.command_input, 1)
-        cmd_layout.addWidget(self.send_cmd_btn)
-        layout.addLayout(cmd_layout)
-
-        self.send_cmd_btn.clicked.connect(
-            lambda: parent_window.send_user_command(
-                self.session_id, self.command_input.text()
-            )
-        )
-
-        self.continue_btn.clicked.connect(
-            lambda: parent_window.toggle_session_run(self.session_id)
-        )
-        self.stop_btn.clicked.connect(
-            lambda: parent_window.stop_session(self.session_id)
-        )
-        self.export_btn.clicked.connect(
-            lambda: parent_window.export_session(self.session_id)
-        )
-        self.delete_btn.clicked.connect(
-            lambda: parent_window.delete_session(self.session_id)
-        )
-
-        if status in {"completed", "failed", "cancelled"}:
-            self.stop_btn.setEnabled(False)
-            self.send_cmd_btn.setEnabled(False)
 
 
 class MainWindow(QMainWindow):
@@ -380,10 +66,13 @@ class MainWindow(QMainWindow):
         self._queue_running = False
         self._active_pool_session_id: Optional[str] = None
 
+        # Cache for incremental session-list updates
+        self._session_list_ids: List[str] = []
+
         self.setWindowTitle("猎聘寻访 Agent 工作台")
         self._build_ui()
         self._connect_events()
-        self._apply_style()
+        self.setStyleSheet(MAIN_STYLESHEET)
 
         # Runtime events may come from worker threads; poll a tiny queue on the
         # UI thread so Qt widgets are only touched from the main thread.
@@ -446,9 +135,13 @@ class MainWindow(QMainWindow):
 
         self.new_btn = QPushButton("新建")
         self.add_to_pool_btn = QPushButton("添加到池")
+        self.add_to_pool_btn.setObjectName("SecondaryBtn")
         self.open_liepin_btn = QPushButton("打开猎聘")
+        self.open_liepin_btn.setObjectName("SuccessBtn")
         self.close_liepin_btn = QPushButton("关闭浏览器")
+        self.close_liepin_btn.setObjectName("DangerBtn")
         self.settings_btn = QPushButton("设置")
+        self.settings_btn.setObjectName("SecondaryBtn")
         for button in [
             self.new_btn,
             self.add_to_pool_btn,
@@ -477,9 +170,12 @@ class MainWindow(QMainWindow):
         pool_header.addWidget(QLabel("项目池"))
         pool_header.addStretch(1)
         self.start_queue_btn = QPushButton("开始队列")
+        self.start_queue_btn.setObjectName("SuccessBtn")
         self.stop_queue_btn = QPushButton("停止队列")
+        self.stop_queue_btn.setObjectName("DangerBtn")
         self.stop_queue_btn.setVisible(False)
         self.clear_completed_btn = QPushButton("清理")
+        self.clear_completed_btn.setObjectName("SecondaryBtn")
         pool_header.addWidget(self.start_queue_btn)
         pool_header.addWidget(self.stop_queue_btn)
         pool_header.addWidget(self.clear_completed_btn)
@@ -544,6 +240,7 @@ class MainWindow(QMainWindow):
         self.candidate_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.candidate_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.candidate_table.verticalHeader().setVisible(False)
+        self._candidate_table_initialized = False
         table_layout.addWidget(self.candidate_table, 1)
 
         splitter.addWidget(timeline_frame)
@@ -555,6 +252,7 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("Panel")
         layout = QVBoxLayout(frame)
+
         layout.addWidget(QLabel("匹配词与岗位要求"))
         self.criteria_keywords_input = QTextEdit()
         self.criteria_keywords_input.setPlaceholderText("每行一个关键词，例如：LNG、BOG、螺杆压缩机")
@@ -564,30 +262,50 @@ class MainWindow(QMainWindow):
         self.criteria_requirements_input.setPlaceholderText("用一段话描述本岗位最关键的匹配要求")
         self.criteria_requirements_input.setMaximumHeight(120)
         layout.addWidget(self.criteria_requirements_input)
+
         criteria_buttons = QHBoxLayout()
         self.regenerate_criteria_btn = QPushButton("重新生成草案")
+        self.regenerate_criteria_btn.setObjectName("SecondaryBtn")
         self.confirm_criteria_btn = QPushButton("确认寻访基准")
         self.confirm_and_start_btn = QPushButton("确认并开始")
+        self.confirm_and_start_btn.setObjectName("SuccessBtn")
         criteria_buttons.addWidget(self.regenerate_criteria_btn)
         criteria_buttons.addWidget(self.confirm_criteria_btn)
         criteria_buttons.addWidget(self.confirm_and_start_btn)
         layout.addLayout(criteria_buttons)
-        layout.addWidget(QLabel("当前策略"))
+
+        # Tabbed lower area: 策略 / 候选人详情 / 日志
+        self.right_tabs = QTabWidget()
+
+        strategy_widget = QWidget()
+        strategy_layout = QVBoxLayout(strategy_widget)
+        strategy_layout.setContentsMargins(4, 4, 4, 4)
         self.strategy_view = QTextBrowser()
-        self.strategy_view.setMinimumHeight(220)
-        layout.addWidget(self.strategy_view)
+        self.strategy_view.setMinimumHeight(120)
+        strategy_layout.addWidget(self.strategy_view)
+        self.right_tabs.addTab(strategy_widget, "当前策略")
+
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(4, 4, 4, 4)
         detail_header = QHBoxLayout()
-        detail_header.addWidget(QLabel("候选人详情"))
         detail_header.addStretch(1)
         self.manual_greeting_btn = QPushButton("手动打招呼")
         self.manual_greeting_btn.setEnabled(False)
         detail_header.addWidget(self.manual_greeting_btn)
-        layout.addLayout(detail_header)
+        detail_layout.addLayout(detail_header)
         self.detail_view = QTextBrowser()
-        layout.addWidget(self.detail_view, 2)
-        layout.addWidget(QLabel("详细日志"))
+        detail_layout.addWidget(self.detail_view, 1)
+        self.right_tabs.addTab(detail_widget, "候选人详情")
+
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+        log_layout.setContentsMargins(4, 4, 4, 4)
         self.log_view = QTextBrowser()
-        layout.addWidget(self.log_view, 2)
+        log_layout.addWidget(self.log_view, 1)
+        self.right_tabs.addTab(log_widget, "详细日志")
+
+        layout.addWidget(self.right_tabs, 1)
         return frame
 
     def _connect_events(self) -> None:
@@ -611,100 +329,35 @@ class MainWindow(QMainWindow):
         self.event_bus.subscribe(self._queue_runtime_event)
 
     def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget {
-                background: #eef4fb;
-                color: #172033;
-                font-family: "Microsoft YaHei", "Segoe UI";
-                font-size: 13px;
-            }
-            QFrame#TopBar, QFrame#Panel {
-                background: #ffffff;
-                border: 1px solid #d7e2f2;
-                border-radius: 8px;
-            }
-            QLabel#TitleLabel {
-                font-weight: 700;
-                font-size: 16px;
-            }
-            QFrame#SessionItem {
-                background: #f8fbff;
-                border: 1px solid #d7e2f2;
-                border-radius: 6px;
-                margin: 3px;
-            }
-            QLabel#SessionTitle {
-                font-weight: 700;
-                color: #172033;
-            }
-            QLabel#SessionInfo {
-                color: #64748b;
-                font-size: 12px;
-            }
-            QPushButton {
-                background: #2563eb;
-                color: white;
-                border: none;
-                border-radius: 5px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover {
-                background: #1d4ed8;
-            }
-            QListWidget, QTextBrowser, QTextEdit, QTableWidget, QLineEdit, QComboBox, QSpinBox {
-                background: #f8fbff;
-                border: 1px solid #d7e2f2;
-                border-radius: 5px;
-                padding: 4px;
-            }
-            QHeaderView::section {
-                background: #e8f0ff;
-                border: none;
-                padding: 6px;
-                font-weight: 700;
-            }
-            """
+        self.setStyleSheet(MAIN_STYLESHEET)
+
+    def _create_session_from_dialog(self, add_to_pool: bool = False) -> Optional[str]:
+        dialog = NewSessionDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        payload = dialog.payload()
+        session_id = self.store.create_session(
+            title=str(payload["title"]),
+            jd_text=str(payload["jd_text"]),
+            user_notes=str(payload["user_notes"]),
+            mode=str(payload["mode"]),
+            max_rounds=int(payload["max_rounds"]),
+            max_detail_fetches=int(payload["max_detail_fetches"]),
+            target_ab_count=int(payload["target_ab_count"]),
         )
+        if add_to_pool:
+            self.store.add_session_to_pool(session_id)
+        self.selected_session_id = session_id
+        self.refresh_all()
+        self._select_session_in_list(session_id)
+        self._queue_criteria_draft(session_id)
+        return session_id
 
     def create_session(self) -> None:
-        dialog = NewSessionDialog(self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        payload = dialog.payload()
-        session_id = self.store.create_session(
-            title=str(payload["title"]),
-            jd_text=str(payload["jd_text"]),
-            user_notes=str(payload["user_notes"]),
-            mode=str(payload["mode"]),
-            max_rounds=int(payload["max_rounds"]),
-            max_detail_fetches=int(payload["max_detail_fetches"]),
-            target_ab_count=int(payload["target_ab_count"]),
-        )
-        self.selected_session_id = session_id
-        self.refresh_all()
-        self._select_session_in_list(session_id)
-        self._queue_criteria_draft(session_id)
+        self._create_session_from_dialog(add_to_pool=False)
 
     def create_session_and_add_to_pool(self) -> None:
-        dialog = NewSessionDialog(self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-        payload = dialog.payload()
-        session_id = self.store.create_session(
-            title=str(payload["title"]),
-            jd_text=str(payload["jd_text"]),
-            user_notes=str(payload["user_notes"]),
-            mode=str(payload["mode"]),
-            max_rounds=int(payload["max_rounds"]),
-            max_detail_fetches=int(payload["max_detail_fetches"]),
-            target_ab_count=int(payload["target_ab_count"]),
-        )
-        self.store.add_session_to_pool(session_id)
-        self.selected_session_id = session_id
-        self.refresh_all()
-        self._select_session_in_list(session_id)
-        self._queue_criteria_draft(session_id)
+        self._create_session_from_dialog(add_to_pool=True)
 
     def start_selected_session(self) -> None:
         if not self.selected_session_id:
@@ -863,6 +516,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "未找到选中的候选人记录。")
             return
         candidates_by_id = {str(item.get("id") or ""): dict(item) for item in candidates}
+        # Batch-fetch all details to avoid N+1 queries
+        all_details = {
+            cid: (self.store.get_candidate_detail(cid) or {})
+            for cid in candidate_ids
+        }
         targets = []
         skipped = []
         already_greeted = []
@@ -873,7 +531,7 @@ class MainWindow(QMainWindow):
                 skipped.append("候选人记录不存在")
                 continue
             name = str(candidate.get("name") or "候选人")
-            detail = self.store.get_candidate_detail(candidate_id) or {}
+            detail = all_details.get(candidate_id) or {}
             if not detail:
                 skipped.append("{}：尚未抓取详情".format(name))
                 continue
@@ -1058,11 +716,7 @@ class MainWindow(QMainWindow):
         future.add_done_callback(_done)
 
     def close_liepin_browser(self) -> None:
-        active_session_ids = [
-            session_id
-            for session_id in list(self.runtime._threads.keys())
-            if self.runtime.is_active(session_id)
-        ]
+        active_session_ids = self.runtime.active_session_ids()
         if active_session_ids:
             reply = QMessageBox.question(
                 self,
@@ -1089,11 +743,7 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.config_manager, self)
         if dialog.exec() != QDialog.Accepted:
             return
-        active_session_ids = [
-            session_id
-            for session_id in list(self.runtime._threads.keys())
-            if self.runtime.is_active(session_id)
-        ]
+        active_session_ids = self.runtime.active_session_ids()
         if active_session_ids:
             QMessageBox.information(
                 self,
@@ -1110,6 +760,8 @@ class MainWindow(QMainWindow):
     def regenerate_criteria_draft(self) -> None:
         if not self.selected_session_id:
             return
+        self.regenerate_criteria_btn.setEnabled(False)
+        self.regenerate_criteria_btn.setText("生成中...")
         self._queue_criteria_draft(self.selected_session_id)
         self._mark_dirty()
 
@@ -1178,6 +830,8 @@ class MainWindow(QMainWindow):
         future = self.runtime.match_queue.submit(self._generate_criteria_draft, session_id)
 
         def _done(done_future):
+            self.regenerate_criteria_btn.setEnabled(True)
+            self.regenerate_criteria_btn.setText("重新生成草案")
             try:
                 done_future.result()
                 self.event_bus.publish("criteria_ready", {"session_id": session_id})
@@ -1249,6 +903,8 @@ class MainWindow(QMainWindow):
         self.selected_candidate_id = candidate_ids[0]
         self._render_candidate_detail(candidate_ids[0])
         self._update_manual_greeting_button_state()
+        # Auto-switch to detail tab when a candidate is selected
+        self.right_tabs.setCurrentIndex(1)
 
     def _selected_candidate_ids(self) -> list[str]:
         if not hasattr(self, "candidate_table"):
@@ -1285,13 +941,18 @@ class MainWindow(QMainWindow):
             else:
                 candidates = self.store.get_candidates_by_ids(candidate_ids)
                 candidates_by_id = {
-                    str(candidate.get("id") or ""): candidate for candidate in candidates
+                    str(c.get("id") or ""): c for c in candidates
+                }
+                # Batch-fetch all details to avoid N+1 queries
+                all_details = {
+                    cid: (self.store.get_candidate_detail(cid) or {})
+                    for cid in candidate_ids
                 }
                 eligible = 0
                 pending = 0
                 missing = 0
                 for candidate_id in candidate_ids:
-                    detail = self.store.get_candidate_detail(candidate_id) or {}
+                    detail = all_details.get(candidate_id) or {}
                     candidate = candidates_by_id.get(candidate_id) or {}
                     if not detail:
                         missing += 1
@@ -1319,8 +980,6 @@ class MainWindow(QMainWindow):
 
     def _mark_dirty(self) -> None:
         self._dirty = True
-        # Trigger refresh on next event loop iteration instead of waiting for timer
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self._refresh_if_dirty)
 
     def _queue_runtime_event(
@@ -1392,9 +1051,30 @@ class MainWindow(QMainWindow):
 
     def _refresh_sessions(self) -> None:
         sessions = self.store.list_sessions()
+        new_ids = [str(s["id"]) for s in sessions]
+
+        # Fast path: only update widgets in-place when the session list hasn't changed
+        # to avoid destroying/recreating widgets (prevents scroll reset and flicker).
+        if new_ids == self._session_list_ids:
+            sessions_by_id = {str(s["id"]): s for s in sessions}
+            for index in range(self.session_list.count()):
+                item = self.session_list.item(index)
+                if item is None:
+                    continue
+                session_id = str(item.data(Qt.UserRole) or "")
+                session = sessions_by_id.get(session_id)
+                if session is None:
+                    continue
+                new_widget = SessionListItemWidget(session, self)
+                item.setSizeHint(new_widget.sizeHint())
+                self.session_list.setItemWidget(item, new_widget)
+            return
+
+        # Full rebuild when the session list changes (add/remove)
         current_id = self.selected_session_id
         self.session_list.blockSignals(True)
         self.session_list.clear()
+        first_item = None
         for session in sessions:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, session["id"])
@@ -1402,12 +1082,18 @@ class MainWindow(QMainWindow):
             item.setSizeHint(widget.sizeHint())
             self.session_list.addItem(item)
             self.session_list.setItemWidget(item, widget)
+            if first_item is None:
+                first_item = item
             if session["id"] == current_id:
                 self.session_list.setCurrentItem(item)
         self.session_list.blockSignals(False)
-        if not current_id and sessions:
-            self.selected_session_id = sessions[0]["id"]
-            self.session_list.setCurrentRow(0)
+        self._session_list_ids = new_ids
+
+        # Bug fix: when no session was pre-selected, select the first one and
+        # properly update selected_session_id so subsequent operations work correctly.
+        if not current_id and first_item is not None:
+            self.session_list.setCurrentItem(first_item)
+            self.selected_session_id = str(first_item.data(Qt.UserRole) or "")
 
     def _select_session_in_list(self, session_id: str) -> None:
         for index in range(self.session_list.count()):
@@ -1423,6 +1109,7 @@ class MainWindow(QMainWindow):
             self.stage_label.setText("就绪")
             self.timeline.clear()
             self.candidate_table.setRowCount(0)
+            self._candidate_table_initialized = False
             self.strategy_view.clear()
             self.detail_view.clear()
             self.log_view.clear()
@@ -1446,14 +1133,16 @@ class MainWindow(QMainWindow):
             )
         )
         self.stats_label.setText(
-            "轮次 {} | 读卡 {} | 候选人 {} | 详情 {} | A/B {} | A/B/详情 {}".format(
+            "轮次 {} | 读卡 {} | 候选人 {} | 详情 {} | A/B {}".format(
                 len(self.store.list_rounds(self.selected_session_id)),
                 metrics.get("raw_candidate_count") or 0,
                 aggregate.get("candidate_count") or 0,
                 aggregate.get("detail_count") or 0,
                 aggregate.get("ab_count") or 0,
-                metrics.get("ab_per_detail_fetch") or 0,
             )
+        )
+        self.stats_label.setToolTip(
+            "A/B 每详情占比：{}".format(metrics.get("ab_per_detail_fetch") or 0)
         )
         self._render_timeline()
         self._render_criteria_editor()
@@ -1509,8 +1198,6 @@ class MainWindow(QMainWindow):
             payload = event.get("payload") or {}
             payload_text = ""
             if payload:
-                import json
-
                 payload_text = (
                     "<pre style='white-space: pre-wrap; color:#475569'>{}</pre>".format(
                         self._html(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1542,12 +1229,13 @@ class MainWindow(QMainWindow):
         if self.selected_candidate_id:
             selected_ids.add(self.selected_candidate_id)
         candidates = self.store.list_candidates(self.selected_session_id)
-        available_ids = {str(candidate.get("id") or "") for candidate in candidates}
-        selected_ids = {
-            candidate_id for candidate_id in selected_ids if candidate_id in available_ids
-        }
+        available_ids = {str(c.get("id") or "") for c in candidates}
+        selected_ids = {cid for cid in selected_ids if cid in available_ids}
+
         self.candidate_table.blockSignals(True)
-        self.candidate_table.setRowCount(len(candidates))
+        new_count = len(candidates)
+        self.candidate_table.setRowCount(new_count)
+
         for row, candidate in enumerate(candidates):
             candidate_id = str(candidate.get("id") or "")
             values = [
@@ -1565,12 +1253,17 @@ class MainWindow(QMainWindow):
                 candidate.get("summary_text") or "",
             ]
             for column, value in enumerate(values):
-                table_item = QTableWidgetItem(value)
+                str_value = str(value)
+                existing = self.candidate_table.item(row, column)
+                if existing is not None and existing.text() == str_value:
+                    continue  # skip unchanged cells
+                table_item = QTableWidgetItem(str_value)
                 if column == 0:
                     table_item.setData(Qt.UserRole, candidate_id)
                 if column in {6, 7, 9}:
                     table_item.setTextAlignment(Qt.AlignCenter)
                 self.candidate_table.setItem(row, column, table_item)
+
         selection_model = self.candidate_table.selectionModel()
         if selection_model is not None:
             selection_model.clearSelection()
@@ -1582,12 +1275,16 @@ class MainWindow(QMainWindow):
                         QItemSelectionModel.Select | QItemSelectionModel.Rows,
                     )
         self.candidate_table.blockSignals(False)
+
         selected_after_refresh = self._selected_candidate_ids()
         self.selected_candidate_id = (
             selected_after_refresh[0] if selected_after_refresh else None
         )
-        self.candidate_table.resizeColumnsToContents()
-        self.candidate_table.setColumnWidth(11, 260)
+        # Only resize columns on first population to prevent column-width jumps
+        if not self._candidate_table_initialized and new_count > 0:
+            self.candidate_table.resizeColumnsToContents()
+            self.candidate_table.setColumnWidth(11, 260)
+            self._candidate_table_initialized = True
 
     def _render_strategy(self) -> None:
         rounds = self.store.list_rounds(self.selected_session_id)
@@ -1936,7 +1633,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, session_id)
             if status == "active":
-                item.setBackground(Qt.GlobalColor.yellow)
+                item.setForeground(Qt.GlobalColor.darkBlue)
             self.pool_list.addItem(item)
             if session_id == current_id:
                 self.pool_list.setCurrentItem(item)
@@ -1979,11 +1676,7 @@ class MainWindow(QMainWindow):
         return base
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        active_session_ids = [
-            session_id
-            for session_id in list(self.runtime._threads.keys())
-            if self.runtime.is_active(session_id)
-        ]
+        active_session_ids = self.runtime.active_session_ids()
         if active_session_ids:
             reply = QMessageBox.question(
                 self,
