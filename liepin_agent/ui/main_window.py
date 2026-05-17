@@ -388,7 +388,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "需要确认寻访基准",
-                "请先确认右侧的"岗位匹配要求"，确认后 Agent 才会开始搜索。",
+                '请先确认右侧的"岗位匹配要求"，确认后 Agent 才会开始搜索。',
             )
             self._mark_dirty()
             return
@@ -396,7 +396,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "基准有未确认修改",
-                "你修改了"岗位匹配要求"，请先点击"确认寻访基准"。",
+                '你修改了"岗位匹配要求"，请先点击"确认寻访基准"。',
             )
             return
         if self.runtime.is_active(session_id):
