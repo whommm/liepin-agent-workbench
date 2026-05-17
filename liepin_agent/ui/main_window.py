@@ -38,9 +38,10 @@ from ..core.config import ConfigManager
 from ..services.event_bus import EventBus
 from ..storage.sqlite_store import SQLiteStore, from_json
 from ..tools.exporter import ExportService
+from ..tools.excel_greeting import ExcelGreetingService
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
-from .dialogs import NewSessionDialog, PoolNotificationDialog, SettingsDialog
+from .dialogs import BatchGreetingDialog, NewSessionDialog, PoolNotificationDialog, SettingsDialog
 from .session_list_item import SessionListItemWidget
 from .styles import MAIN_STYLESHEET
 
@@ -140,6 +141,8 @@ class MainWindow(QMainWindow):
         self.open_liepin_btn.setObjectName("SuccessBtn")
         self.close_liepin_btn = QPushButton("关闭浏览器")
         self.close_liepin_btn.setObjectName("DangerBtn")
+        self.batch_greeting_btn = QPushButton("Excel 批量打招呼")
+        self.batch_greeting_btn.setObjectName("SuccessBtn")
         self.settings_btn = QPushButton("设置")
         self.settings_btn.setObjectName("SecondaryBtn")
         for button in [
@@ -147,6 +150,7 @@ class MainWindow(QMainWindow):
             self.add_to_pool_btn,
             self.open_liepin_btn,
             self.close_liepin_btn,
+            self.batch_greeting_btn,
             self.settings_btn,
         ]:
             layout.addWidget(button)
@@ -313,6 +317,7 @@ class MainWindow(QMainWindow):
         self.add_to_pool_btn.clicked.connect(self.create_session_and_add_to_pool)
         self.open_liepin_btn.clicked.connect(self.open_liepin_browser)
         self.close_liepin_btn.clicked.connect(self.close_liepin_browser)
+        self.batch_greeting_btn.clicked.connect(self.open_batch_greeting_dialog)
         self.settings_btn.clicked.connect(self.open_settings)
         self.start_queue_btn.clicked.connect(self._start_queue)
         self.stop_queue_btn.clicked.connect(self._stop_queue)
@@ -496,6 +501,86 @@ class MainWindow(QMainWindow):
             )
         QMessageBox.information(self, "导出完成", message)
 
+    def open_batch_greeting_dialog(self) -> None:
+        if self.selected_session_id and self.runtime.is_active(self.selected_session_id):
+            QMessageBox.information(
+                self,
+                "任务运行中",
+                "请先暂停或等待当前任务结束后，再执行 Excel 批量打招呼。",
+            )
+            return
+        dialog = BatchGreetingDialog(self.config_manager, self.workspace_root, self)
+        if self.selected_session_id:
+            session = self.store.get_session(self.selected_session_id) or {}
+            dialog.set_job_defaults(
+                str(session.get("title") or ""),
+                str(session.get("jd_text") or ""),
+            )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        payload = dialog.payload()
+        count = int(payload.get("candidate_count") or 0)
+        names = "、".join((payload.get("candidate_names") or [])[:8])
+        if count > 8:
+            names += " 等"
+        dry_run = bool(payload.get("dry_run"))
+        verify_gold_on_page = bool(payload.get("verify_gold_on_page"))
+        action_label = "预览 dry-run（不会实际发送）" if dry_run else "实际发送打招呼"
+        gold_label = "发送前会重新打开页面复核金领状态" if verify_gold_on_page else "将信任 Excel 金领字段，不做页面复核"
+        reply = QMessageBox.question(
+            self,
+            "确认批量打招呼",
+            "即将处理 Excel 中 A/B + 金领候选人。\n\n模式：{}\n安全复核：{}\n文件：{}\n人数：{}\n候选人：{}\n\n是否继续？".format(
+                action_label,
+                gold_label,
+                payload.get("excel_path") or "",
+                count,
+                names or "-",
+            ),
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._start_excel_batch_greeting(
+            str(payload.get("excel_path") or ""),
+            str(payload.get("message") or ""),
+            dry_run=dry_run,
+            verify_gold_on_page=verify_gold_on_page,
+        )
+
+    def _start_excel_batch_greeting(
+        self,
+        excel_path: str,
+        message: str,
+        dry_run: bool = False,
+        verify_gold_on_page: bool = True,
+    ) -> None:
+        self.batch_greeting_btn.setEnabled(False)
+        self.batch_greeting_btn.setText("预览中..." if dry_run else "打招呼中...")
+        self.stage_label.setText("Excel 批量打招呼预览中" if dry_run else "Excel 批量打招呼进行中")
+
+        def _run():
+            try:
+                service = ExcelGreetingService(self.runtime.liepin_tool)
+                results = service.greet_from_excel(
+                    excel_path,
+                    message_template=message,
+                    dry_run=dry_run,
+                    verify_gold_on_page=verify_gold_on_page,
+                    progress_callback=lambda current, total, name: self.event_bus.publish(
+                        "excel_greeting_progress",
+                        {"current": current, "total": total, "name": name},
+                    ),
+                )
+                summary = ExcelGreetingService.generate_summary(results)
+                self.event_bus.publish(
+                    "excel_greeting_done",
+                    {"summary": summary, "excel_path": excel_path},
+                )
+            except Exception as exc:
+                self.event_bus.publish("excel_greeting_error", {"error": str(exc)})
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def greet_selected_candidate(self) -> None:
         session_id = self.selected_session_id
         candidate_ids = self._selected_candidate_ids()
@@ -515,6 +600,8 @@ class MainWindow(QMainWindow):
         if not candidates:
             QMessageBox.warning(self, "提示", "未找到选中的候选人记录。")
             return
+        session = self.store.get_session(session_id) or {}
+        list_rows = {str(item.get("id") or ""): item for item in self.store.list_candidates(session_id)}
         candidates_by_id = {str(item.get("id") or ""): dict(item) for item in candidates}
         # Batch-fetch all details to avoid N+1 queries
         all_details = {
@@ -547,9 +634,15 @@ class MainWindow(QMainWindow):
                 already_greeted.append(
                     "{}（{}）".format(name, self._greeting_status_label(current_status))
                 )
+                skipped.append("{}：已打过招呼".format(name))
+                continue
             if self._resume_has_contact_info(str(detail.get("resume_text") or "")):
                 contact_present.append(name)
+                skipped.append("{}：简历详情中已出现联系方式".format(name))
+                continue
             candidate["profile_url"] = profile_url
+            candidate["session_title"] = str(session.get("title") or "")
+            candidate.update(self._greeting_context_from_row(list_rows.get(candidate_id) or {}))
             targets.append(
                 {
                     "candidate_id": candidate_id,
@@ -586,16 +679,35 @@ class MainWindow(QMainWindow):
                     len(contact_present), "；".join(contact_present[:4])
                 )
             )
-        if confirm_lines:
-            confirm_lines.append("仍要继续吗？")
-            reply = QMessageBox.question(
-                self,
-                "确认打招呼",
-                "\n".join(confirm_lines),
-            )
-            if reply != QMessageBox.Yes:
-                return
         template = str(self.config_manager.config.greeting_template or "")
+        preview_message = ""
+        if template and targets:
+            preview_message = self.runtime.liepin_tool._render_greeting_template(
+                template, dict(targets[0]["candidate"])
+            )
+        final_confirm_lines = [
+            "将按队列依次为 {} 位候选人打开详情页并手动打招呼。".format(len(targets))
+        ]
+        if template:
+            final_confirm_lines.append("话术预览：{}".format(preview_message or template))
+        else:
+            final_confirm_lines.append("话术：使用平台默认打招呼。")
+        final_confirm_lines.append(
+            "候选人：{}".format(
+                "；".join(
+                    str(item["candidate"].get("name") or "候选人") for item in targets[:6]
+                )
+            )
+        )
+        if confirm_lines:
+            final_confirm_lines.append("\n".join(confirm_lines))
+        reply = QMessageBox.question(
+            self,
+            "确认打招呼",
+            "\n".join(final_confirm_lines),
+        )
+        if reply != QMessageBox.Yes:
+            return
         for target in targets:
             candidate_id = str(target["candidate_id"])
             candidate = dict(target["candidate"])
@@ -627,6 +739,14 @@ class MainWindow(QMainWindow):
         self.manual_greeting_btn.setEnabled(False)
         self.manual_greeting_btn.setToolTip("手动打招呼正在执行。")
         self._mark_dirty()
+
+    @staticmethod
+    def _greeting_context_from_row(row: Dict[str, object]) -> Dict[str, object]:
+        return {
+            "matched_evidence": row.get("matched_evidence") or [],
+            "questions_to_verify": row.get("questions_to_verify") or [],
+            "match_risks": row.get("match_risks") or "",
+        }
 
     def _manual_greeting_done_callback(
         self, session_id: str, candidate_id: str, profile_url: str
@@ -1012,6 +1132,30 @@ class MainWindow(QMainWindow):
                 self._pending_status_text = "手动打招呼完成"
             else:
                 self._pending_status_text = "手动打招呼未完成"
+        elif event_type == "excel_greeting_progress":
+            self._pending_status_text = "Excel 批量打招呼：{}/{} {}".format(
+                payload.get("current") or 0,
+                payload.get("total") or 0,
+                payload.get("name") or "",
+            )
+        elif event_type == "excel_greeting_done":
+            self.batch_greeting_btn.setEnabled(True)
+            self.batch_greeting_btn.setText("Excel 批量打招呼")
+            self._pending_status_text = "Excel 批量打招呼完成"
+            QMessageBox.information(
+                self,
+                "批量打招呼完成",
+                str(payload.get("summary") or "完成")
+                if "dry-run" in str(payload.get("summary") or "")
+                else "{}\n\n结果已回写：{}".format(
+                    payload.get("summary") or "完成", payload.get("excel_path") or ""
+                ),
+            )
+        elif event_type == "excel_greeting_error":
+            self.batch_greeting_btn.setEnabled(True)
+            self.batch_greeting_btn.setText("Excel 批量打招呼")
+            self._pending_status_text = "Excel 批量打招呼失败"
+            QMessageBox.warning(self, "批量打招呼失败", str(payload.get("error") or "未知错误"))
         elif event_type == "criteria_ready":
             session_id = str(payload.get("session_id") or "")
             if self._queue_running and session_id:
@@ -1156,7 +1300,7 @@ class MainWindow(QMainWindow):
         lines = []
         for event in events[-80:]:
             lines.append(
-                "<p><b>{}</b> <span style='color:#64748b'>{}</span><br>{}</p>".format(
+                "<p><b>{}</b> <span style='color:#8a8070'>{}</span><br>{}</p>".format(
                     self._html(event.get("title")),
                     self._html(event.get("created_at")),
                     self._html(event.get("message")).replace("\n", "<br>"),
@@ -1199,13 +1343,13 @@ class MainWindow(QMainWindow):
             payload_text = ""
             if payload:
                 payload_text = (
-                    "<pre style='white-space: pre-wrap; color:#475569'>{}</pre>".format(
+                    "<pre style='white-space: pre-wrap; color:#6a6050'>{}</pre>".format(
                         self._html(json.dumps(payload, ensure_ascii=False, indent=2))
                     )
                 )
             lines.append(
                 "<div style='margin-bottom:10px'>"
-                "<b>{}</b> <span style='color:#64748b'>{} / {}</span><br>"
+                "<b>{}</b> <span style='color:#8a8070'>{} / {}</span><br>"
                 "{}{}"
                 "</div>".format(
                     self._html(event.get("title")),
@@ -1354,7 +1498,7 @@ class MainWindow(QMainWindow):
         sources = self.store.list_candidate_sources(candidate_id)
         evidence = match.get("matched_evidence") or []
         evidence_html = "".join(
-            "<li><b>{}</b>：{} <span style='color:#64748b'>{}</span></li>".format(
+            "<li><b>{}</b>：{} <span style='color:#8a8070'>{}</span></li>".format(
                 self._html(item.get("criterion") or ""),
                 self._html(item.get("evidence") or ""),
                 self._html(item.get("strength") or ""),
