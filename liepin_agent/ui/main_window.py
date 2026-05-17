@@ -257,14 +257,13 @@ class MainWindow(QMainWindow):
         frame.setObjectName("Panel")
         layout = QVBoxLayout(frame)
 
-        layout.addWidget(QLabel("匹配词与岗位要求"))
-        self.criteria_keywords_input = QTextEdit()
-        self.criteria_keywords_input.setPlaceholderText("每行一个关键词，例如：LNG、BOG、螺杆压缩机")
-        self.criteria_keywords_input.setMaximumHeight(90)
-        layout.addWidget(self.criteria_keywords_input)
+        layout.addWidget(QLabel("岗位匹配要求"))
         self.criteria_requirements_input = QTextEdit()
-        self.criteria_requirements_input.setPlaceholderText("用一段话描述本岗位最关键的匹配要求")
-        self.criteria_requirements_input.setMaximumHeight(120)
+        self.criteria_requirements_input.setPlaceholderText(
+            "用一段话描述本岗位最关键的匹配要求，例如：\n"
+            "需要5年以上无刷电机设计经验，熟悉FOC控制算法，有小家电或新能源汽车行业背景优先。"
+        )
+        self.criteria_requirements_input.setMaximumHeight(150)
         layout.addWidget(self.criteria_requirements_input)
 
         criteria_buttons = QHBoxLayout()
@@ -327,7 +326,6 @@ class MainWindow(QMainWindow):
         self.regenerate_criteria_btn.clicked.connect(self.regenerate_criteria_draft)
         self.confirm_criteria_btn.clicked.connect(self.confirm_current_criteria)
         self.confirm_and_start_btn.clicked.connect(self.confirm_criteria_and_start)
-        self.criteria_keywords_input.textChanged.connect(self._mark_criteria_dirty)
         self.criteria_requirements_input.textChanged.connect(self._mark_criteria_dirty)
         self.session_list.currentItemChanged.connect(self._on_session_changed)
         self.candidate_table.itemSelectionChanged.connect(self._on_candidate_selected)
@@ -390,7 +388,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "需要确认寻访基准",
-                "请先确认右侧的“匹配词与岗位要求”，确认后 Agent 才会开始搜索。",
+                "请先确认右侧的"岗位匹配要求"，确认后 Agent 才会开始搜索。",
             )
             self._mark_dirty()
             return
@@ -398,7 +396,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "基准有未确认修改",
-                "你修改了“匹配词与岗位要求”，请先点击“确认寻访基准”。",
+                "你修改了"岗位匹配要求"，请先点击"确认寻访基准"。",
             )
             return
         if self.runtime.is_active(session_id):
@@ -889,11 +887,12 @@ class MainWindow(QMainWindow):
         if not self.selected_session_id:
             return
         criteria = self.store.get_latest_criteria_version(self.selected_session_id)
-        keywords = self.criteria_keywords_input.toPlainText().strip()
         requirements = self.criteria_requirements_input.toPlainText().strip()
-        if not keywords or not requirements:
-            QMessageBox.warning(self, "提示", "请先填写关键词和岗位要求描述。")
+        if not requirements:
+            QMessageBox.warning(self, "提示", "请先填写岗位匹配要求描述。")
             return
+        # keywords_text is kept for compatibility but left empty
+        keywords = ""
         if criteria:
             if str(criteria.get("status") or "") == "confirmed":
                 session = self.store.get_session(self.selected_session_id) or {}
@@ -927,8 +926,8 @@ class MainWindow(QMainWindow):
             None,
             "criteria_confirmed",
             "寻访基准已确认",
-            "后续搜索、抓详情和匹配将基于当前匹配词与岗位要求执行。",
-            {"keywords_text": keywords, "requirements_text": requirements},
+            "后续搜索、抓详情和匹配将基于当前岗位匹配要求执行。",
+            {"requirements_text": requirements},
         )
         self._mark_dirty()
 
@@ -943,7 +942,7 @@ class MainWindow(QMainWindow):
             None,
             "criteria_draft",
             "AI 正在生成寻访基准草案",
-            "系统正在后台生成匹配词与岗位要求，界面可继续操作。",
+            "系统正在后台生成岗位匹配要求，界面可继续操作。",
             {},
         )
         self._mark_dirty()
@@ -961,7 +960,7 @@ class MainWindow(QMainWindow):
                     None,
                     "criteria_draft",
                     "寻访基准草案生成失败",
-                    "可在右侧手动填写匹配词与岗位要求。错误：{}".format(exc),
+                    "可在右侧手动填写岗位匹配要求。错误：{}".format(exc),
                     {},
                 )
                 self.event_bus.publish("criteria_error", {"session_id": session_id})
@@ -998,8 +997,8 @@ class MainWindow(QMainWindow):
             None,
             "criteria_draft",
             "AI 已生成寻访基准草案",
-            "请人工确认或修改匹配词与岗位要求。",
-            {"keywords_text": keywords, "requirements_text": requirements},
+            "请人工确认或修改岗位匹配要求。",
+            {"requirements_text": requirements},
         )
 
     def _on_session_changed(
@@ -1158,12 +1157,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "批量打招呼失败", str(payload.get("error") or "未知错误"))
         elif event_type == "criteria_ready":
             session_id = str(payload.get("session_id") or "")
-            if self._queue_running and session_id:
-                entry = self.store.get_pool_entry(session_id)
-                if entry and entry.get("status") == "active":
-                    self._show_pool_notification(
-                        session_id, entry.get("title") or "未命名"
-                    )
+            if session_id:
+                # Always show notification when criteria is generated
+                session = self.store.get_session(session_id)
+                title = str(session.get("title") or "未命名") if session else "未命名"
+                self._show_criteria_notification(session_id, title)
             self._mark_dirty()
         else:
             self._mark_dirty()
@@ -1319,15 +1317,12 @@ class MainWindow(QMainWindow):
             )
             or {}
         )
-        if self.criteria_keywords_input.hasFocus() or self.criteria_requirements_input.hasFocus():
+        if self.criteria_requirements_input.hasFocus():
             return
-        self.criteria_keywords_input.blockSignals(True)
         self.criteria_requirements_input.blockSignals(True)
-        self.criteria_keywords_input.setPlainText(str(criteria.get("keywords_text") or ""))
         self.criteria_requirements_input.setPlainText(
             str(criteria.get("requirements_text") or "")
         )
-        self.criteria_keywords_input.blockSignals(False)
         self.criteria_requirements_input.blockSignals(False)
         self._criteria_dirty = False
         is_confirmed = str(criteria.get("status") or "") == "confirmed"
@@ -1442,7 +1437,6 @@ class MainWindow(QMainWindow):
         <p><b>第 {round_index} 轮</b> | {status}</p>
         <p><b>打招呼：</b>{auto_greeting}</p>
         <p><b>寻访基准：</b>v{criteria_version}</p>
-        <p><b>关键词：</b>{keywords}</p>
         <p><b>岗位要求：</b>{requirements}</p>
         <p><b>搜索栏：</b>{query}</p>
         <p><b>职位栏：</b>{position}</p>
@@ -1456,7 +1450,6 @@ class MainWindow(QMainWindow):
             status=self._html(last.get("status")),
             auto_greeting=self._html(self._greeting_policy_text()),
             criteria_version=self._html(criteria.get("version") or ""),
-            keywords=self._html((criteria.get("keywords_text") or "").replace("\n", "、")),
             requirements=self._html(criteria.get("requirements_text") or ""),
             query=self._html(last.get("query")),
             position=self._html(last.get("position_filter") or "不限"),
@@ -1741,6 +1734,15 @@ class MainWindow(QMainWindow):
         if status in {"completed", "failed", "cancelled"}:
             self.store.update_pool_status(session_id, "completed")
             QTimer.singleShot(800, self._advance_queue)
+
+    def _show_criteria_notification(self, session_id: str, title: str) -> None:
+        """Show notification dialog when criteria is generated."""
+        dialog = PoolNotificationDialog(title, session_id, self)
+        result = dialog.exec()
+        if result == 100:
+            self.selected_session_id = session_id
+            self._select_session_in_list(session_id)
+            self.refresh_all()
 
     def _show_pool_notification(self, session_id: str, title: str) -> None:
         if not self._queue_running:

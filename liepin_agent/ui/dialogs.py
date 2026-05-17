@@ -51,7 +51,7 @@ class PoolNotificationDialog(QDialog):
         layout.addWidget(
             QLabel('<b style="font-size:15px;">项目《{}》</b>'.format(title))
         )
-        info = QLabel("寻访基准（匹配词与岗位要求）已生成，请确认后开始搜索。")
+        info = QLabel("岗位匹配要求已生成，请确认后开始搜索。")
         info.setWordWrap(True)
         layout.addWidget(info)
 
