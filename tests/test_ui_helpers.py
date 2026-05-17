@@ -86,3 +86,17 @@ def test_candidate_table_supports_multi_selection_for_manual_greeting(tmp_path):
     finally:
         window.close()
         app.processEvents()
+
+
+def test_greeting_context_from_candidate_row():
+    context = MainWindow._greeting_context_from_row(
+        {
+            "matched_evidence": [{"evidence": "负责天然气客户开发"}],
+            "questions_to_verify": ["是否销售过压缩机设备？"],
+            "match_risks": "设备深度待确认",
+        }
+    )
+
+    assert context["matched_evidence"] == [{"evidence": "负责天然气客户开发"}]
+    assert context["questions_to_verify"] == ["是否销售过压缩机设备？"]
+    assert context["match_risks"] == "设备深度待确认"

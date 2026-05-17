@@ -11,19 +11,30 @@ from ..domain.models import MatchResult
 from .llm_client import LLMClient
 
 
-MATCH_SYSTEM_PROMPT = """你是一位资深猎头顾问。你需要基于岗位匹配标准和候选人简历，输出严格 JSON。
+MATCH_SYSTEM_PROMPT = """你是资深猎头顾问，判断候选人与岗位的匹配度。
+
+## 核心原则
+1. 抓重点：匹配条件里的核心技能是硬门槛
+2. 合理推断：
+   - 简历写"电机结构设计" → 可推断会用 CAD/SolidWorks
+   - 简历写"无刷电机驱动开发" → 可推断懂 FOC/SVPWM
+   - 简历写"美的/格力电机研发" → 可推断有小家电背景
+3. 看近期：近 3 年经验权重更高
+4. 不瞎编：推断要有依据，不确定的标注出来
+
+## 档位
+A = 核心技能明确 + 近期相关
+B = 核心技能有但非近期，或行业有偏差但可迁移
+C = 有相关背景但核心技能不明确，需沟通确认
+D = 不相关或明显不符
+
 只输出 JSON，不要 Markdown。字段：
 tier: A/B/C/D
-core_met_count: 数字
-core_total: 数字
-dealbreaker_hit: true/false
-summary: 一句话概括匹配点
-risks: 主要风险
-recommendation: 推进建议
-detail: 结构化中文说明
-matched_evidence: 数组，每项包含 criterion/evidence/strength
-missing_or_unclear: 数组，列出缺口或未知项
-questions_to_verify: 数组，列出电话中应确认的问题
+summary: 一句话：为什么给这个档位
+evidence: 简历中的关键证据
+inferred: 合理推断的技能（如有）
+risks: 风险点
+questions: ["电话要确认的问题"]
 confidence: high/medium/low
 """
 
@@ -90,16 +101,16 @@ class RealMatchService:
 {resume}
 
 请判断候选人与岗位的匹配档位：
-A = 强匹配，建议优先推进
-B = 基本匹配，建议沟通
-C = 有局部相关但风险明显，备选
-D = 不匹配或命中硬伤
+A = 核心技能明确 + 近期相关
+B = 核心技能有但非近期，或行业有偏差但可迁移
+C = 有相关背景但核心技能不明确，需沟通确认
+D = 不相关或明显不符
 
 要求：
-1. 判断必须围绕岗位匹配标准中的关键词和岗位要求描述。
-2. matched_evidence 尽量引用简历原文证据。
-3. 不确定的信息放入 missing_or_unclear 或 questions_to_verify，不要脑补。
-4. A/B/C/D 只是标签，核心是证据、缺口、风险和待确认问题。
+1. 判断必须围绕岗位匹配标准中的核心要求。
+2. evidence 尽量引用简历原文证据。
+3. 合理推断要有依据，不确定的放入 questions。
+4. A/B/C/D 只是标签，核心是证据、推断、风险和待确认问题。
 """.format(
             criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
             resume=resume_text or "",

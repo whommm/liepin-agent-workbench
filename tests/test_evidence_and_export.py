@@ -141,6 +141,7 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     assert "候选人" in workbook.sheetnames
     assert "寻访基准" in workbook.sheetnames
     assert "效率总结" in workbook.sheetnames
+    assert "运行诊断" in workbook.sheetnames
     overview_headers = [cell.value for cell in workbook["推荐总览"][1]]
     assert "结论" in overview_headers
     assert "候选人档案" in overview_headers
@@ -162,6 +163,9 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     assert workbook["候选人"].cell(row=2, column=gold_column).value == "是"
     assert workbook["候选人"].cell(row=2, column=greeting_column).value == "已发送"
     assert workbook["寻访基准"]["B2"].value == "天然气\nLNG"
+    diagnostics_values = [cell.value for cell in workbook["运行诊断"]["A"]]
+    assert "待回写匹配数" in diagnostics_values
+    assert "卡片判断" in diagnostics_values
     workbook.close()
     report_files = sorted(exporter.last_candidate_reports_dir.glob("*.docx"))
     assert len(report_files) == 3

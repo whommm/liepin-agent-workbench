@@ -167,6 +167,7 @@ class ExportService:
         self._write_candidate_sheet(workbook.create_sheet("候选人"), candidates)
         self._write_criteria_sheet(workbook, session_id)
         self._write_metrics_sheet(workbook, session_id)
+        self._write_diagnostics_sheet(workbook, session_id)
         workbook.save(path)
         workbook.close()
         return path
@@ -758,6 +759,51 @@ class ExportService:
             )
         sheet.column_dimensions["A"].width = 28
         sheet.column_dimensions["B"].width = 56
+
+    def _write_diagnostics_sheet(self, workbook: Workbook, session_id: str) -> None:
+        sheet = workbook.create_sheet("运行诊断")
+        summary = self.store.session_diagnostic_summary(session_id)
+        sheet.append(["诊断项", "值"])
+        for flag in summary.get("diagnostic_flags") or []:
+            sheet.append(["建议", flag])
+        sheet.append(["待回写匹配数", summary.get("pending_match_count") or 0])
+        sheet.append(["错误事件数", summary.get("error_count") or 0])
+        sheet.append([])
+        sheet.append(["轮次状态", "数量"])
+        for key, value in (summary.get("round_status_counts") or {}).items():
+            sheet.append([key, value])
+        sheet.append([])
+        sheet.append(["卡片判断", "数量"])
+        for key, value in (summary.get("card_decision_counts") or {}).items():
+            sheet.append([key, value])
+        sheet.append([])
+        sheet.append(["详情状态", "数量"])
+        for key, value in (summary.get("detail_status_counts") or {}).items():
+            sheet.append([key, value])
+        sheet.append([])
+        sheet.append(["匹配状态", "数量"])
+        for key, value in (summary.get("match_status_counts") or {}).items():
+            sheet.append([key, value])
+        sheet.append([])
+        sheet.append(["匹配档位", "数量"])
+        for key, value in (summary.get("tier_counts") or {}).items():
+            sheet.append([key or "未定档", value])
+        sheet.append([])
+        sheet.append(["最近错误", "消息", "时间"])
+        for item in summary.get("recent_errors") or []:
+            sheet.append(
+                [
+                    item.get("title") or "",
+                    item.get("message") or "",
+                    item.get("created_at") or "",
+                ]
+            )
+        self._style_sheet(
+            sheet,
+            ["诊断项", "值", "时间"],
+            long_headers={"值", "消息"},
+            tab_color="DC2626",
+        )
 
     @staticmethod
     def _safe_filename(value: str) -> str:

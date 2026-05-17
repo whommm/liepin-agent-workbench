@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from playwright.sync_api import Error, Page
@@ -60,7 +60,11 @@ class _ExecutorMixin:
                 self._execute_search(page, keyword.strip())
             if filters:
                 self._apply_filters_on_page(page, filters)
-            return self.extract_candidates_from_page(page)
+            candidates = self.extract_candidates_from_page(page)
+            page_meta = self._extract_page_meta(page)
+            for c in candidates:
+                c.page_meta = page_meta
+            return candidates
 
         return self._with_debug_snapshot(
             "search_keyword_{}".format(keyword.strip()),
@@ -327,6 +331,39 @@ class _ExecutorMixin:
                 continue
         return hits >= 1
 
+
+    @staticmethod
+    def _extract_page_meta(page: Page) -> Dict[str, Any]:
+        """Extract real result-page metadata (total results, pagination, etc.)."""
+        try:
+            return page.evaluate(
+                r"""
+                () => {
+                    const result = { total_results: null, current_page: 1, has_next_page: false, has_prev_page: false, total_results_text: "" };
+                    const bodyText = document.body.innerText || "";
+                    const match = bodyText.match(/共\s*(\d+)\s*条|找到\s*(\d+)\s*人|(\d+)\s*条结果/);
+                    if (match) {
+                        result.total_results_text = match[0];
+                        result.total_results = parseInt(match[1] || match[2] || match[3], 10);
+                    }
+                    const pagination = document.querySelector('.ant-pagination, .pagination, [class*="pagination"]');
+                    if (pagination) {
+                        const activeItem = pagination.querySelector('.ant-pagination-item-active, .active, .current');
+                        if (activeItem) {
+                            const text = (activeItem.innerText || activeItem.textContent || '').trim();
+                            result.current_page = parseInt(text, 10) || 1;
+                        }
+                        const nextBtn = pagination.querySelector('.ant-pagination-next, [title="下一页"], .next-page');
+                        result.has_next_page = !!nextBtn && !nextBtn.classList.contains('ant-pagination-disabled');
+                        const prevBtn = pagination.querySelector('.ant-pagination-prev, [title="上一页"], .prev-page');
+                        result.has_prev_page = !!prevBtn && !prevBtn.classList.contains('ant-pagination-disabled');
+                    }
+                    return result;
+                }
+                """
+            )
+        except Exception:
+            return {}
 
     @staticmethod
     def _page_looks_empty(page: Page) -> bool:

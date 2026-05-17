@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections import defaultdict
 from typing import Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from ..core.config import ConfigManager
 from ..core.liepin_browser import LiepinBrowserManager
@@ -114,7 +117,7 @@ class RealLiepinTool:
         )
 
     def greet_candidate(
-        self, candidate: Dict[str, object], message_template: str = ""
+        self, candidate: Dict[str, object], message_template: str = "", request_resume: bool = False
     ) -> Dict[str, str]:
         """Send a Liepin greeting from a candidate detail page.
 
@@ -124,20 +127,31 @@ class RealLiepinTool:
         profile_url = str(candidate.get("profile_url") or "")
         if not profile_url:
             return {"status": "failed", "message": "", "error": "缺少简历链接"}
+        message = self._render_greeting_template(message_template, candidate)
 
         def _run(page):
-            detail_page = self.search_service.open_candidate_detail(
-                page,
-                LiepinSearchCandidate(
-                    name=str(candidate.get("name") or ""),
-                    current_title=str(candidate.get("current_title") or ""),
-                    current_company=str(candidate.get("current_company") or ""),
-                    profile_url=profile_url,
-                    result_index=int(candidate.get("result_index") or -1),
-                ),
+            summary = LiepinSearchCandidate(
+                name=str(candidate.get("name") or ""),
+                current_title=str(candidate.get("current_title") or ""),
+                current_company=str(candidate.get("current_company") or ""),
+                profile_url=profile_url,
+                result_index=int(candidate.get("result_index") or -1),
             )
+            detail_page = self._open_greeting_detail_page(page, summary)
             try:
-                if not self._is_gold_collar_detail_page(detail_page):
+                logger.warning(
+                    "manual_greeting: opened detail name=%s url=%s",
+                    summary.name or candidate.get("id") or "候选人",
+                    (getattr(detail_page, "url", "") or profile_url)[:160],
+                )
+                self._wait_for_greeting_page_ready(detail_page)
+                if not candidate.get("skip_gold_check") and not self._is_gold_collar_detail_page(detail_page, wait_seconds=6.0):
+                    logger.warning(
+                        "manual_greeting: skipped non-gold name=%s url=%s body=%s",
+                        summary.name or candidate.get("id") or "候选人",
+                        (getattr(detail_page, "url", "") or profile_url)[:160],
+                        self._safe_body_text(detail_page)[:200].replace("\n", " "),
+                    )
                     return {
                         "status": "skipped",
                         "message": "非金领候选人，跳过打招呼",
@@ -145,6 +159,10 @@ class RealLiepinTool:
                     }
                 body_text = self._safe_body_text(detail_page)
                 if any(marker in body_text for marker in self.ALREADY_GREETED_MARKERS):
+                    logger.warning(
+                        "manual_greeting: already greeted name=%s",
+                        summary.name or candidate.get("id") or "候选人",
+                    )
                     return {
                         "status": "already_greeted",
                         "message": "已打过招呼",
@@ -152,18 +170,41 @@ class RealLiepinTool:
                     }
                 if not self._click_greeting_button(detail_page):
                     if self._has_continue_chat_button(detail_page):
+                        logger.warning(
+                            "manual_greeting: continue chat button found name=%s",
+                            summary.name or candidate.get("id") or "候选人",
+                        )
                         return {
                             "status": "already_greeted",
                             "message": "已打过招呼",
                             "error": "",
                         }
+                    logger.warning(
+                        "manual_greeting: greeting button not found name=%s body=%s",
+                        summary.name or candidate.get("id") or "候选人",
+                        body_text[:200].replace("\n", " "),
+                    )
                     return {"status": "failed", "message": "", "error": "未找到沟通按钮"}
-                if self._handle_greeting_dialog(detail_page, message_template):
+                if self._handle_greeting_dialog(detail_page, message):
+                    request_resume_status = ""
+                    if request_resume:
+                        request_resume_status = self._request_resume(detail_page)
+                    logger.warning(
+                        "manual_greeting: success name=%s custom_message=%s request_resume=%s",
+                        summary.name or candidate.get("id") or "候选人",
+                        bool(message),
+                        request_resume_status,
+                    )
                     return {
                         "status": "success",
-                        "message": message_template or "已发送打招呼",
+                        "message": message or "已发送打招呼",
                         "error": "",
+                        "request_resume_status": request_resume_status,
                     }
+                logger.warning(
+                    "manual_greeting: dialog handling failed name=%s",
+                    summary.name or candidate.get("id") or "候选人",
+                )
                 return {"status": "failed", "message": "", "error": "打招呼弹窗处理失败"}
             finally:
                 self._close_any_dialog(detail_page)
@@ -175,15 +216,99 @@ class RealLiepinTool:
         'button:has-text("立即沟通")',
         'button:has-text("打招呼")',
         'button:has-text("在线沟通")',
+        '.chat-btn',
+        'button.chat-btn',
+        '[role="button"]:has-text("立即沟通")',
+        '[role="button"]:has-text("打招呼")',
+        'a:has-text("立即沟通")',
+        'a:has-text("打招呼")',
     ]
     ALREADY_GREETED_MARKERS = ["已沟通", "已打招呼", "继续沟通", "继续聊聊"]
 
-    @staticmethod
-    def _is_gold_collar_detail_page(page) -> bool:
+    def _open_greeting_detail_page(self, page, summary: LiepinSearchCandidate):
         try:
-            return page.locator(".elite-tag-gold").count() > 0
+            return self.search_service.open_candidate_detail(page, summary)
+        except Exception:
+            if not self._navigate_to_profile(page, summary.profile_url):
+                raise
+            summary.profile_url = page.url or summary.profile_url
+            return page
+
+    @staticmethod
+    def _wait_for_greeting_page_ready(page, timeout_ms: int = 15000) -> None:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+        deadline = time.time() + max(1, timeout_ms / 1000)
+        ready_selectors = (
+            ".name-box",
+            ".elite-tag-gold",
+            'button:has-text("立即沟通")',
+            'button:has-text("打招呼")',
+            'button:has-text("继续沟通")',
+            '.chat-btn',
+            'button.chat-btn',
+            '[role="button"]:has-text("立即沟通")',
+            '[role="button"]:has-text("打招呼")',
+            'a:has-text("立即沟通")',
+        )
+        while time.time() < deadline:
+            for selector in ready_selectors:
+                try:
+                    locator = page.locator(selector)
+                    if locator.count() > 0 and locator.first.is_visible(timeout=500):
+                        return
+                except Exception:
+                    continue
+            time.sleep(0.25)
+
+    @staticmethod
+    def _navigate_to_profile(page, url: str) -> bool:
+        profile_url = RealLiepinTool._ensure_absolute_url(url)
+        if not profile_url:
+            return False
+        for wait_until, timeout in (
+            ("domcontentloaded", 10000),
+            ("commit", 8000),
+        ):
+            try:
+                page.goto(profile_url, wait_until=wait_until, timeout=timeout)
+                time.sleep(1.5)
+                if RealLiepinTool._looks_like_detail_url(page.url or profile_url):
+                    return True
+            except Exception:
+                pass
+        try:
+            safe_url = profile_url.replace("'", "\\'")
+            page.evaluate("window.location.href = '{}'".format(safe_url))
+            time.sleep(2.5)
+            return RealLiepinTool._looks_like_detail_url(page.url or profile_url)
         except Exception:
             return False
+
+    @staticmethod
+    def _is_gold_collar_detail_page(page, wait_seconds: float = 0.0) -> bool:
+        deadline = time.time() + max(0.0, wait_seconds)
+        while True:
+            for selector in (
+                ".name-box .elite-tag-gold",
+                ".elite-tag-gold",
+                '[class*="elite-tag-gold"]',
+                '.name-box [class*="gold"]',
+                '[class*="gold"]:has-text("金领")',
+            ):
+                try:
+                    if page.locator(selector).count() > 0:
+                        return True
+                except Exception:
+                    continue
+            body_text = RealLiepinTool._safe_body_text(page)
+            if "金领人才" in body_text or "金领简历" in body_text:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.25)
 
     @staticmethod
     def _safe_body_text(page) -> str:
@@ -201,6 +326,7 @@ class RealLiepinTool:
                 locator = page.locator(selector)
                 if locator.count() > 0 and locator.first.is_visible(timeout=2000):
                     locator.first.click()
+                    logger.warning("manual_greeting: clicked greeting button selector=%s", selector)
                     return True
             except Exception:
                 continue
@@ -211,6 +337,8 @@ class RealLiepinTool:
         for selector in (
             'button:has-text("继续沟通")',
             'button:has-text("继续聊聊")',
+            '.chat-btn',
+            'button.chat-btn',
             'a:has-text("继续沟通")',
             '[role="button"]:has-text("继续沟通")',
         ):
@@ -224,16 +352,65 @@ class RealLiepinTool:
 
     def _handle_greeting_dialog(self, page, message_template: str) -> bool:
         time.sleep(1.5)
+        clicked_no_job = False
         try:
             no_job_btn = page.locator('button:has-text("不选择职位开聊")')
             if no_job_btn.count() > 0 and no_job_btn.first.is_visible(timeout=2000):
                 no_job_btn.first.click()
+                clicked_no_job = True
                 time.sleep(1.5)
         except Exception:
             pass
+        if not clicked_no_job:
+            self._select_job_if_needed(page)
         if message_template:
             return self._send_chat_message(page, message_template)
         return True
+
+    @staticmethod
+    def _select_job_if_needed(page) -> bool:
+        for selector in (
+            '.ant-select:has-text("选择职位")',
+            '[class*="select"]:has-text("选择职位")',
+            'input[placeholder*="选择职位"]',
+        ):
+            try:
+                dropdown = page.locator(selector)
+                if dropdown.count() <= 0 or not dropdown.first.is_visible(timeout=1000):
+                    continue
+                dropdown.first.click()
+                time.sleep(0.8)
+                options = page.locator('.ant-select-item, [role="option"]')
+                if options.count() > 0:
+                    options.first.click()
+                    time.sleep(0.8)
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _request_resume(page) -> str:
+        """在已打开的聊天窗口中点击"索要简历"并确认。"""
+        try:
+            resume_btn = page.locator('span.im-ui-action-button.action-item.action-resume')
+            if resume_btn.count() <= 0 or not resume_btn.first.is_visible(timeout=2000):
+                logger.warning("request_resume: resume button not found")
+                return "未找到索要简历按钮"
+            resume_btn.first.click()
+            time.sleep(1.5)
+
+            confirm_btn = page.locator('.ant-im-modal-confirm-btns button.ant-im-btn-primary')
+            if confirm_btn.count() <= 0 or not confirm_btn.first.is_visible(timeout=2000):
+                logger.warning("request_resume: confirm button not found")
+                return "未找到确认按钮"
+            confirm_btn.first.click()
+            time.sleep(1.5)
+            logger.warning("request_resume: success")
+            return "已发送索要简历"
+        except Exception as exc:
+            logger.warning("request_resume: failed %s", exc)
+            return "索要简历失败: {}".format(exc)
 
     @staticmethod
     def _send_chat_message(page, message: str) -> bool:
@@ -254,6 +431,8 @@ class RealLiepinTool:
                     chat_input.fill(message)
                     time.sleep(0.5)
                     for send_selector in (
+                        'button.im-ui-basic-send-btn',
+                        '.im-ui-chat-input button:has-text("发送")',
                         'button:has-text("发送")',
                         'button[type="submit"]',
                         '[role="button"]:has-text("发送")',
@@ -279,6 +458,29 @@ class RealLiepinTool:
     @staticmethod
     def _close_any_dialog(page) -> None:
         try:
+            page.evaluate(
+                """
+                () => {
+                    const selectors = [
+                        'dialog', '[role="dialog"]', '.ant-modal', '.modal',
+                        '[class*="modal"]', '[class*="dialog"]', '.chat-dialog',
+                        '.im-dialog', '.message-dialog'
+                    ];
+                    selectors.forEach((selector) => {
+                        document.querySelectorAll(selector).forEach((el) => {
+                            el.style.display = 'none';
+                        });
+                    });
+                    document.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: 'Escape', keyCode: 27, bubbles: true
+                    }));
+                }
+                """
+            )
+            time.sleep(0.2)
+        except Exception:
+            pass
+        try:
             page.keyboard.press("Escape")
             time.sleep(0.2)
             page.keyboard.press("Escape")
@@ -302,6 +504,68 @@ class RealLiepinTool:
                 continue
 
     @staticmethod
+    def _render_greeting_template(template: str, candidate: Dict[str, object]) -> str:
+        text = str(template or "").strip()
+        if not text:
+            return ""
+        values = defaultdict(str)
+        evidence = candidate.get("matched_evidence") or []
+        if isinstance(evidence, list):
+            evidence_text = "；".join(
+                str(item.get("evidence") or item.get("criterion") or "")
+                for item in evidence
+                if isinstance(item, dict)
+            )
+        else:
+            evidence_text = str(evidence or "")
+        questions = candidate.get("questions_to_verify") or []
+        if isinstance(questions, list):
+            risk_to_verify = "；".join(str(item) for item in questions if item)
+        else:
+            risk_to_verify = str(questions or "")
+        values.update(
+            {
+                "name": str(candidate.get("name") or ""),
+                "current_company": str(candidate.get("current_company") or ""),
+                "current_title": str(candidate.get("current_title") or ""),
+                "job_title": str(candidate.get("job_title") or candidate.get("session_title") or ""),
+                "matched_evidence": evidence_text,
+                "risk_to_verify": risk_to_verify or str(candidate.get("match_risks") or ""),
+            }
+        )
+        try:
+            return text.format_map(values)
+        except Exception:
+            return text
+
+    @staticmethod
+    def _looks_like_detail_url(url: str) -> bool:
+        normalized = (url or "").lower()
+        return "showresumedetail" in normalized or "/resume/" in normalized
+
+    @staticmethod
+    def _ensure_absolute_url(url: str) -> str:
+        value = str(url or "").strip()
+        if not value:
+            return ""
+        if value.startswith("/") and not value.startswith("//"):
+            value = "https://h.liepin.com" + value
+        elif value.startswith("//"):
+            value = "https:" + value
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        host = (parsed.hostname or "").lower()
+        if host != "liepin.com" and not host.endswith(".liepin.com"):
+            return ""
+        if not RealLiepinTool._looks_like_detail_url(urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))):
+            return ""
+        return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+
+    @staticmethod
     def _to_candidate_summary(
         candidate: LiepinSearchCandidate, index: int
     ) -> CandidateSummary:
@@ -315,9 +579,11 @@ class RealLiepinTool:
             work_years=candidate.work_years or "",
             education=candidate.education or "",
             summary_text=candidate.summary or "",
+            raw_text=candidate.raw_text or candidate.summary or "",
             result_index=candidate.result_index
             if candidate.result_index >= 0
             else index,
+            page_meta=candidate.page_meta or {},
         )
 
     @staticmethod
@@ -332,6 +598,19 @@ class RealLiepinTool:
         education = filters.get("education") or filters.get("教育经历")
         if education:
             mapped["教育经历"] = education
+        age = filters.get("age") or filters.get("年龄")
+        if age:
+            age_str = str(age).strip()
+            # 如果是区间格式（如 25-35），按原样传递
+            if re.search(r"\d+\s*(?:-|~|至|到|,|，)\s*\d+", age_str):
+                mapped["年龄"] = age_str
+            else:
+                # 提取单个数字作为上限，自动加 3 岁缓冲
+                match = re.search(r"(\d+)", age_str)
+                if match:
+                    mapped["年龄"] = {"max": int(match.group(1)) + 3}
+                else:
+                    mapped["年龄"] = age_str
         active_days = filters.get("active_days") or filters.get("活跃度")
         if active_days:
             if isinstance(active_days, int):

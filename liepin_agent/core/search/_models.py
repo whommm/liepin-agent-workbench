@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class LiepinSearchError(Exception):
@@ -31,7 +31,9 @@ class LiepinSearchCandidate:
     education: str = ""
     profile_url: str = ""
     summary: str = ""
+    raw_text: str = ""
     result_index: int = -1
+    page_meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

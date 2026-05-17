@@ -77,6 +77,7 @@ class _ExtractionMixin:
                 work_years=work_years,
                 education=education,
                 summary="\n".join(cleaned[:12]),
+                raw_text=text,
                 profile_url=profile_url,
                 result_index=len(candidates),
             )
@@ -300,6 +301,7 @@ class _ExtractionMixin:
                     work_years=work_years,
                     education=education,
                     summary="\n".join(cleaned[:12]),
+                    raw_text="\n".join(lines),
                     profile_url=row.get("href") or "",
                     result_index=len(candidates),
                 )

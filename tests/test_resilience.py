@@ -255,12 +255,12 @@ class NoWaitBrain:
         target_met,
         should_stop,
         stop_reason,
+        criteria=None,
     ):
         from liepin_agent.domain.models import RoundReview
 
-        assert len(match_results) == 1
-        assert match_results[0]["tier"] == "B"
-        return RoundReview(action="stop", summary="复盘前已经拿到本轮匹配结果")
+        assert len(match_results) == 0
+        return RoundReview(action="stop", summary="复盘不等待后台匹配结果")
 
 
 class SlowMatcher:
@@ -327,13 +327,14 @@ class TierBrain(NoWaitBrain):
         target_met,
         should_stop,
         stop_reason,
+        criteria=None,
     ):
         from liepin_agent.domain.models import RoundReview
 
         return RoundReview(action="stop", summary="完成")
 
 
-def test_no_wait_policy_still_waits_before_round_review(tmp_path):
+def test_no_wait_policy_does_not_block_round_review(tmp_path):
     store = SQLiteStore(str(tmp_path / "runtime.db"))
     session_id = store.create_session(
         title="销售总监",
@@ -356,14 +357,28 @@ def test_no_wait_policy_still_waits_before_round_review(tmp_path):
 
     runtime.run_session(session_id)
     session = store.get_session(session_id)
-    matches = store.list_match_results(session_id)
+    immediate_matches = store.list_match_results(session_id)
+    deadline = time.time() + 2
+    matches = immediate_matches
+    rounds = store.list_rounds(session_id)
+    while time.time() < deadline:
+        matches = store.list_match_results(session_id)
+        rounds = store.list_rounds(session_id)
+        if matches and rounds[0]["matched_count"] == 1:
+            break
+        time.sleep(0.05)
+    events = store.list_events(session_id)
 
     runtime.browser_queue.shutdown()
     runtime.match_queue.shutdown()
 
     assert session["status"] == "completed"
+    assert immediate_matches == []
     assert len(matches) == 1
     assert matches[0]["tier"] == "B"
+    assert rounds[0]["matched_count"] == 1
+    assert rounds[0]["ab_count"] == 1
+    assert any(event["title"] == "后台匹配已提交" for event in events)
 
 
 def test_runtime_does_not_greet_gold_ab_candidates_automatically(tmp_path):
@@ -464,6 +479,69 @@ def test_runtime_greeting_is_manual_even_when_legacy_config_is_disabled(tmp_path
     assert tool.greeted == []
     assert candidates[0]["is_gold_collar"] == 1
     assert candidates[0]["greeting_status"] == ""
+
+
+def test_greeting_template_replaces_candidate_variables():
+    from liepin_agent.tools.real_liepin import RealLiepinTool
+
+    message = RealLiepinTool._render_greeting_template(
+        "您好{name}，看到您在{current_company}做{current_title}，匹配点：{matched_evidence}。岗位：{job_title}",
+        {
+            "name": "张三",
+            "current_company": "能源公司",
+            "current_title": "销售总监",
+            "session_title": "天然气销售负责人",
+            "matched_evidence": [{"evidence": "负责 LNG 客户开发"}],
+        },
+    )
+
+    assert "张三" in message
+    assert "能源公司" in message
+    assert "负责 LNG 客户开发" in message
+    assert "天然气销售负责人" in message
+
+
+def test_gold_collar_detection_falls_back_to_body_text():
+    from liepin_agent.tools.real_liepin import RealLiepinTool
+
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class Page:
+        def locator(self, selector):
+            if selector == "body":
+                return type("Body", (), {"inner_text": lambda self, timeout=0: "金领人才"})()
+            return EmptyLocator()
+
+    assert RealLiepinTool._is_gold_collar_detail_page(Page()) is True
+
+
+def test_gold_collar_detection_waits_for_delayed_elite_tag():
+    from liepin_agent.tools.real_liepin import RealLiepinTool
+
+    class Locator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+
+        def count(self):
+            self.page.calls += 1
+            if self.selector == ".name-box .elite-tag-gold" and self.page.calls >= 3:
+                return 1
+            return 0
+
+        def inner_text(self, timeout=0):
+            return "赵**"
+
+    class Page:
+        def __init__(self):
+            self.calls = 0
+
+        def locator(self, selector):
+            return Locator(self, selector)
+
+    assert RealLiepinTool._is_gold_collar_detail_page(Page(), wait_seconds=1.0) is True
 
 
 def test_active_days_normalizes_half_month():

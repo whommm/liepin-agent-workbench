@@ -49,6 +49,7 @@ class CandidateSummary:
     work_years: str = ""
     education: str = ""
     summary_text: str = ""
+    raw_text: str = ""
     result_index: int = 0
     pre_score: int = 0
     pre_score_reasons: List[str] = field(default_factory=list)
@@ -57,6 +58,7 @@ class CandidateSummary:
     card_signals: List[str] = field(default_factory=list)
     card_risks: List[str] = field(default_factory=list)
     card_reason: str = ""
+    page_meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -73,6 +75,7 @@ class CandidateSummary:
             "work_years": self.work_years,
             "education": self.education,
             "summary_text": self.summary_text,
+            "raw_text": self.raw_text,
             "result_index": self.result_index,
             "pre_score": self.pre_score,
             "pre_score_reasons": list(self.pre_score_reasons or []),
@@ -81,6 +84,7 @@ class CandidateSummary:
             "card_signals": list(self.card_signals or []),
             "card_risks": list(self.card_risks or []),
             "card_reason": self.card_reason,
+            "page_meta": dict(self.page_meta or {}),
         }
 
 

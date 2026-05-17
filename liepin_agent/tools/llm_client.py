@@ -38,6 +38,30 @@ class LLMClient:
     def chat(self, prompt: str, system_message: str = "") -> str:
         return self._execute_with_retry(self._chat_once, prompt, system_message)
 
+    def test_connection(self) -> dict:
+        started = time.monotonic()
+        try:
+            content = self.chat(
+                "请只回复 ok，用于连接测试。",
+                system_message="你是连接测试助手。",
+            )
+        except LLMClientError as exc:
+            return {
+                "ok": False,
+                "error": str(exc),
+                "model": self.model_name,
+                "api_base_url": self.api_base_url,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+            }
+        return {
+            "ok": True,
+            "error": "",
+            "model": self.model_name,
+            "api_base_url": self.api_base_url,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "sample": content[:80],
+        }
+
     @property
     def configured(self) -> bool:
         return bool(self.api_base_url and self.api_key and self.model_name)
@@ -107,4 +131,3 @@ class LLMClient:
         if isinstance(exc, LLMClientError):
             return exc
         return LLMClientError("未知错误: {}".format(exc))
-

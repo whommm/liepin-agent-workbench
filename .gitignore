@@ -38,3 +38,8 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# AI/MCP tools local data
+.claude/
+.playwright-mcp/
+opencode.json

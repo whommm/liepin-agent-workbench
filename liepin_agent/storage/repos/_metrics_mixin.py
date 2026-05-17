@@ -164,3 +164,148 @@ class _MetricsMixin:
         return result
 
 
+    def session_diagnostic_summary(self, session_id: str) -> Dict[str, Any]:
+        metrics = self.session_efficiency_metrics(session_id)
+        hypothesis = self.search_hypothesis_metrics(session_id)
+        with self.connect() as connection:
+            round_rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS n
+                FROM search_rounds
+                WHERE session_id = ?
+                GROUP BY status
+                """,
+                (session_id,),
+            ).fetchall()
+            card_rows = connection.execute(
+                """
+                SELECT COALESCE(card_decision, '') AS card_decision, COUNT(*) AS n
+                FROM candidate_summaries
+                WHERE session_id = ?
+                GROUP BY card_decision
+                """,
+                (session_id,),
+            ).fetchall()
+            detail_rows = connection.execute(
+                """
+                SELECT COALESCE(d.capture_status, '') AS capture_status, COUNT(*) AS n
+                FROM candidate_details d
+                JOIN candidate_summaries c ON c.id = d.candidate_id
+                WHERE c.session_id = ?
+                GROUP BY d.capture_status
+                """,
+                (session_id,),
+            ).fetchall()
+            match_rows = connection.execute(
+                """
+                SELECT COALESCE(status, '') AS status, COUNT(*) AS n
+                FROM match_results
+                WHERE session_id = ?
+                GROUP BY status
+                """,
+                (session_id,),
+            ).fetchall()
+            tier_rows = connection.execute(
+                """
+                SELECT UPPER(COALESCE(tier, '')) AS tier, COUNT(*) AS n
+                FROM match_results
+                WHERE session_id = ?
+                GROUP BY UPPER(COALESCE(tier, ''))
+                """,
+                (session_id,),
+            ).fetchall()
+            pending_match = connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM candidate_summaries c
+                JOIN candidate_details d ON d.candidate_id = c.id
+                LEFT JOIN match_results m ON m.candidate_id = c.id AND m.session_id = c.session_id
+                WHERE c.session_id = ?
+                  AND d.capture_status = 'success'
+                  AND m.id IS NULL
+                """,
+                (session_id,),
+            ).fetchone()
+            error_rows = connection.execute(
+                """
+                SELECT title, message, created_at
+                FROM agent_events
+                WHERE session_id = ? AND event_type = 'error'
+                ORDER BY created_at DESC
+                LIMIT 10
+                """,
+                (session_id,),
+            ).fetchall()
+        round_status_counts = self._count_rows(round_rows, "status")
+        card_decision_counts = self._count_rows(card_rows, "card_decision")
+        detail_status_counts = self._count_rows(detail_rows, "capture_status")
+        match_status_counts = self._count_rows(match_rows, "status")
+        tier_counts = self._count_rows(tier_rows, "tier")
+        pending_match_count = int(pending_match["n"] if pending_match else 0)
+        noise_count = int(card_decision_counts.get("noise") or 0)
+        unique_count = int(metrics.get("unique_candidate_count") or 0)
+        raw_count = int(metrics.get("raw_candidate_count") or 0)
+        detail_count = int(metrics.get("detail_fetch_count") or 0)
+        matched_count = int(metrics.get("matched_count") or 0)
+        ab_count = int(metrics.get("ab_count") or 0)
+        return {
+            "metrics": metrics,
+            "round_status_counts": round_status_counts,
+            "card_decision_counts": card_decision_counts,
+            "detail_status_counts": detail_status_counts,
+            "match_status_counts": match_status_counts,
+            "tier_counts": tier_counts,
+            "pending_match_count": pending_match_count,
+            "error_count": len(error_rows),
+            "recent_errors": [dict(row) for row in error_rows],
+            "search_hypothesis_metrics": hypothesis,
+            "diagnostic_flags": self._diagnostic_flags(
+                raw_count=raw_count,
+                unique_count=unique_count,
+                detail_count=detail_count,
+                matched_count=matched_count,
+                ab_count=ab_count,
+                noise_count=noise_count,
+                pending_match_count=pending_match_count,
+                error_count=len(error_rows),
+            ),
+        }
+
+    @staticmethod
+    def _count_rows(rows: Iterable[Any], key: str) -> Dict[str, int]:
+        result: Dict[str, int] = {}
+        for row in rows:
+            result[str(row[key] or "")] = int(row["n"] or 0)
+        return result
+
+    @staticmethod
+    def _diagnostic_flags(
+        raw_count: int,
+        unique_count: int,
+        detail_count: int,
+        matched_count: int,
+        ab_count: int,
+        noise_count: int,
+        pending_match_count: int,
+        error_count: int,
+    ) -> List[str]:
+        flags: List[str] = []
+        if raw_count == 0:
+            flags.append("未读取到候选人卡片，需检查关键词、登录态或页面结构。")
+        if unique_count and noise_count / unique_count >= 0.5:
+            flags.append("噪音候选人占比偏高，建议收紧职位栏、行业词或负向词。")
+        if detail_count and matched_count < detail_count:
+            flags.append("存在已抓详情但未完成匹配的候选人，后台匹配可能仍在进行或已失败。")
+        if pending_match_count:
+            flags.append("有 {} 位候选人等待匹配结果回写。".format(pending_match_count))
+        if detail_count and ab_count == 0:
+            flags.append("已抓详情但暂无 A/B 候选人，建议复盘搜索假设。")
+        if raw_count and unique_count and unique_count / raw_count <= 0.5:
+            flags.append("重复候选人占比较高，建议切换搜索假设或扩大关键词差异。")
+        if error_count:
+            flags.append("存在运行错误事件，建议查看诊断日志和页面快照。")
+        if not flags:
+            flags.append("未发现明显阻塞项，可继续按当前策略推进。")
+        return flags
+
+

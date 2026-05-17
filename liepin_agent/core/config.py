@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -115,6 +115,82 @@ class ConfigManager:
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
 
+    def llm_connection_specs(self) -> Dict[str, Dict[str, object]]:
+        """Return resolved Agent Brain and Matcher LLM connection specs."""
+        default_spec = {
+            "api_base_url": self.config.api_base_url,
+            "api_key": self.config.api_key,
+            "model_name": self.config.model_name or "deepseek-chat",
+            "timeout": int(self.config.timeout or 120),
+            "source": self.config_source_summary("default"),
+        }
+        backend_spec = {
+            "api_base_url": self.config.backend_api_base_url or self.config.api_base_url,
+            "api_key": self.config.backend_api_key or self.config.api_key,
+            "model_name": self.config.backend_model_name
+            or self.config.model_name
+            or "deepseek-chat",
+            "timeout": int(self.config.timeout or 120),
+            "source": self.config_source_summary("backend"),
+        }
+        return {"default": default_spec, "backend": backend_spec}
+
+    def config_source_summary(self, profile: str = "default") -> Dict[str, str]:
+        env_values = self._read_env_file()
+        if profile == "backend":
+            return {
+                "api_base_url": self._value_source(
+                    BACKEND_API_ENV_NAMES["api_base_url"],
+                    env_values,
+                    bool(self.config.backend_api_base_url),
+                    fallback="default",
+                ),
+                "api_key": self._value_source(
+                    BACKEND_API_ENV_NAMES["api_key"],
+                    env_values,
+                    bool(self.config.backend_api_key),
+                    fallback="default",
+                ),
+                "model_name": self._value_source(
+                    BACKEND_API_ENV_NAMES["model_name"],
+                    env_values,
+                    bool(self.config.backend_model_name),
+                    fallback="default",
+                ),
+            }
+        return {
+            "api_base_url": self._value_source(
+                API_ENV_NAMES["api_base_url"], env_values, bool(self.config.api_base_url)
+            ),
+            "api_key": self._value_source(
+                self.config.api_key_env or API_ENV_NAMES["api_key"],
+                env_values,
+                bool(self.config.api_key),
+            ),
+            "model_name": self._value_source(
+                API_ENV_NAMES["model_name"], env_values, bool(self.config.model_name)
+            ),
+            "timeout": self._value_source(
+                API_ENV_NAMES["timeout"], env_values, bool(self.config.timeout)
+            ),
+        }
+
+    def test_llm_connection(self, profile: str = "default") -> Dict[str, object]:
+        from ..tools.llm_client import LLMClient
+
+        specs = self.llm_connection_specs()
+        spec = specs["backend" if profile == "backend" else "default"]
+        client = LLMClient(
+            str(spec.get("api_base_url") or ""),
+            str(spec.get("api_key") or ""),
+            str(spec.get("model_name") or ""),
+            int(spec.get("timeout") or 120),
+        )
+        result = client.test_connection()
+        result["profile"] = "backend" if profile == "backend" else "default"
+        result["source"] = spec.get("source") or {}
+        return result
+
     def _apply_env_config(self, config: AppConfig) -> None:
         """Load API settings from project .env, then let OS env override them."""
         env_values = self._read_env_file()
@@ -165,6 +241,21 @@ class ConfigManager:
         config.backend_model_name = os.environ.get(
             BACKEND_API_ENV_NAMES["model_name"], config.backend_model_name
         )
+
+    @staticmethod
+    def _value_source(
+        env_name: str,
+        env_values: dict,
+        has_config_value: bool,
+        fallback: str = "default",
+    ) -> str:
+        if os.environ.get(env_name, ""):
+            return "os_env:{}".format(env_name)
+        if env_values.get(env_name, ""):
+            return ".env:{}".format(env_name)
+        if has_config_value:
+            return "config.json"
+        return fallback
 
     def _save_env_config(self) -> None:
         env_values = self._read_env_file()

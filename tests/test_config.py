@@ -46,3 +46,22 @@ def test_os_env_overrides_project_env(tmp_path, monkeypatch):
     reloaded = ConfigManager(str(config_path))
 
     assert reloaded.config.api_key == "env-secret"
+
+
+def test_llm_connection_specs_resolve_backend_fallback(tmp_path):
+    config_path = tmp_path / "config.json"
+    manager = ConfigManager(str(config_path))
+    manager.update(
+        api_base_url="https://api.example.com/v1",
+        api_key="secret-key",
+        model_name="agent-model",
+        backend_model_name="matcher-model",
+    )
+
+    specs = manager.llm_connection_specs()
+
+    assert specs["default"]["model_name"] == "agent-model"
+    assert specs["backend"]["api_base_url"] == "https://api.example.com/v1"
+    assert specs["backend"]["api_key"] == "secret-key"
+    assert specs["backend"]["model_name"] == "matcher-model"
+    assert specs["backend"]["source"]["api_base_url"] == "default"

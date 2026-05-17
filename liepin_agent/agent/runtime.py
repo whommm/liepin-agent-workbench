@@ -359,8 +359,9 @@ class AgentRuntime:
                     "正在调用模型分析本轮搜索质量、噪音和是否抓详情。",
                     {"candidate_count": len(candidates)},
                 )
+                page_meta = candidates[0].page_meta if candidates else {}
                 observation = self.brain.observe_round(
-                    candidates=candidates, plan=plan, criteria=criteria
+                    candidates=candidates, plan=plan, criteria=criteria, page_meta=page_meta
                 )
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 if (
@@ -779,6 +780,7 @@ class AgentRuntime:
                 confidence="low",
             )
             self.store.save_match_result(result)
+            self._refresh_round_match_metrics(session_id, round_id)
             self._event(
                 session_id,
                 round_id,
@@ -792,6 +794,7 @@ class AgentRuntime:
         if not self._session_allows_background_write(session_id):
             raise RuntimeError("任务已取消，跳过后台匹配写入")
         self.store.save_match_result(result)
+        self._refresh_round_match_metrics(session_id, round_id)
         self._event(
             session_id,
             round_id,
@@ -819,14 +822,23 @@ class AgentRuntime:
         mode = str((policy or {}).get("mode") or "no_wait")
         if not futures:
             return
-        timeout_seconds = int(
-            policy.get("timeout_seconds")
-            or (600 if mode in ("wait_all", "no_wait") else 180)
-        )
-        # The matching workers are concurrent, but round review must see the
-        # actual resume-match results. "no_wait" used to bypass this barrier and
-        # made the AI review reason over an empty/partial result set.
-        min_results = len(futures)
+        if mode == "no_wait":
+            self._event(
+                session_id,
+                round_id,
+                AgentEventType.MATCH_RESULT.value,
+                "后台匹配已提交",
+                "本轮匹配将在后台继续完成，不阻塞后续搜索和复盘。",
+                {"policy": mode, "queued_count": len(futures)},
+            )
+            return
+        timeout_seconds = int(policy.get("timeout_seconds") or 600)
+        if mode == "wait_min_results":
+            min_results = int(policy.get("min_results") or 1)
+            min_results = max(1, min(min_results, len(futures)))
+        else:
+            mode = "wait_all"
+            min_results = len(futures)
         deadline = time.time() + max(1, timeout_seconds)
         while time.time() < deadline:
             if cancel_event.is_set():
@@ -839,6 +851,23 @@ class AgentRuntime:
             if completed >= min_results or completed >= len(futures):
                 break
             time.sleep(0.2)
+        completed = sum(1 for item in futures if item.done())
+        self._event(
+            session_id,
+            round_id,
+            AgentEventType.MATCH_RESULT.value,
+            "匹配等待完成",
+            "等待策略 {} 已完成 {}/{} 个匹配任务。".format(
+                mode, completed, len(futures)
+            ),
+            {
+                "policy": mode,
+                "completed_count": completed,
+                "queued_count": len(futures),
+                "min_results": min_results,
+                "timeout_seconds": timeout_seconds,
+            },
+        )
         for future in futures:
             if not future.done():
                 continue
@@ -855,6 +884,19 @@ class AgentRuntime:
                     str(exc),
                     {},
                 )
+
+    def _refresh_round_match_metrics(self, session_id: str, round_id: str) -> None:
+        match_results = self.store.list_match_results(session_id, round_id)
+        ab_count = sum(
+            1
+            for item in match_results
+            if str(item.get("tier") or "").upper() in ("A", "B")
+        )
+        self.store.update_round(
+            round_id,
+            matched_count=len(match_results),
+            ab_count=ab_count,
+        )
 
     def _session_status(self, session_id: str) -> str:
         session = self.store.get_session(session_id) or {}

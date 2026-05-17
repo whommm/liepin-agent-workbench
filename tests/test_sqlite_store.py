@@ -1,6 +1,6 @@
 from liepin_agent.storage.sqlite_store import SQLiteStore
 from liepin_agent.domain.states import SessionStatus
-from liepin_agent.domain.models import CandidateSummary, SearchPlan
+from liepin_agent.domain.models import CandidateDetail, CandidateSummary, SearchPlan
 
 
 def test_create_and_list_session(tmp_path):
@@ -86,3 +86,40 @@ def test_criteria_version_and_candidate_sources(tmp_path):
 
     assert len(sources) == 1
     assert sources[0]["search_hypothesis_type"] == "core_background"
+
+
+def test_session_diagnostic_summary_flags_pending_match(tmp_path):
+    store = SQLiteStore(str(tmp_path / "workbench.db"))
+    session_id = store.create_session("诊断测试", "天然气销售")
+    criteria_id = store.create_criteria_version(
+        session_id,
+        "天然气\n销售",
+        "候选人需要有天然气行业销售经验。",
+        created_by="human",
+    )
+    store.confirm_criteria_version(criteria_id)
+    plan = SearchPlan(query="天然气 销售", position_filter="销售")
+    round_id = store.create_round(session_id, 1, plan, criteria_id)
+    candidate = CandidateSummary(
+        session_id=session_id,
+        round_id=round_id,
+        profile_url="https://example.com/a",
+        name="张三",
+        current_title="销售总监",
+        current_company="设备公司",
+        card_decision="noise",
+    )
+    candidate_id = store.save_candidate_summary(candidate)
+    store.save_candidate_detail(
+        CandidateDetail(
+            candidate_id=candidate_id,
+            resume_text="天然气销售简历",
+            capture_status="success",
+        )
+    )
+
+    summary = store.session_diagnostic_summary(session_id)
+
+    assert summary["pending_match_count"] == 1
+    assert summary["card_decision_counts"]["noise"] == 1
+    assert any("等待匹配结果回写" in item for item in summary["diagnostic_flags"])
