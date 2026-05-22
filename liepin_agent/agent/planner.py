@@ -11,7 +11,8 @@ from ..domain.models import SearchPlan
 CITY_NAMES = ["北京", "上海", "深圳", "广州", "杭州", "成都", "苏州", "南京", "武汉", "东莞", "惠州"]
 # POSITION_HINTS ordered by specificity (more specific first) to reduce false positives.
 POSITION_HINTS = [
-    "电机", "算法", "结构", "研发", "设计", "运营", "销售", "市场", "财务", "人力", "产品"
+    "电机", "算法", "结构", "研发", "设计", "运营", "销售", "市场", "财务", "人力", "产品",
+    "车间主任", "生产经理", "生产厂长", "制造经理", "生产主管", "工艺", "质量", "设备",
 ]
 DOMAIN_TERMS = [
     "文创",
@@ -89,9 +90,8 @@ class Planner:
             "city": self.extract_city_scope(text),
             "active_days": 7,
         }
-        work_years = self.extract_work_years(text)
-        if work_years:
-            filters["work_years"] = work_years
+        # 工作年限和学历不自动填入搜索筛选，避免过滤掉潜在候选人，
+        # 由后续匹配模型根据简历内容判断。
         education = self.extract_education(text)
         if education:
             filters["education"] = education
@@ -160,8 +160,9 @@ class Planner:
         # Try to extract position from title patterns
         import re
         for pattern in [
-            r'(?:岗位|职位|招聘)[：:\s]*([\u4e00-\u9fa5]{2,8})',
-            r'^([\u4e00-\u9fa5]{2,8})(?:经理|工程师|总监|主管|专员|顾问|销售|开发)',
+            r'(?:岗位|职位|招聘)[：:\s]*([\u4e00-\u9fa5]{2,10})',
+            r'(?:招聘|拟聘|岗位)[\s:：]+([\u4e00-\u9fa5]{2,10})(?:\d+|$)',
+            r'^([\u4e00-\u9fa5]{2,8})(?:经理|工程师|总监|主管|专员|顾问|销售|开发|主任|厂长)',
         ]:
             match = re.search(pattern, text)
             if match:

@@ -39,20 +39,23 @@ class AppConfig(BaseModel):
     backend_model_name: str = ""
 
     tavily_api_key: str = ""
-    timeout: int = Field(default=120, ge=1, le=3600)
+    timeout: int = Field(default=300, ge=1, le=3600)
     theme: str = "light"
     liepin_browser_channel: str = "msedge"
     liepin_browser_headless: bool = False
     liepin_browser_profile_dir: str = "browser_profile/liepin"
     greeting_template: str = ""
     auto_greeting_enabled: bool = False
+    greet_gold_only: bool = False
+    llm_provider: str = "openai"
+    backend_llm_provider: str = "openai"
     debug_snapshots_enabled: bool = False
 
     @field_validator("timeout", mode="before")
     @classmethod
     def _coerce_timeout(cls, v):
         if v is None or v == "":
-            return 120
+            return 300
         return int(v)
 
 
@@ -122,6 +125,7 @@ class ConfigManager:
             "api_key": self.config.api_key,
             "model_name": self.config.model_name or "deepseek-chat",
             "timeout": int(self.config.timeout or 120),
+            "provider": self.config.llm_provider or "openai",
             "source": self.config_source_summary("default"),
         }
         backend_spec = {
@@ -131,6 +135,7 @@ class ConfigManager:
             or self.config.model_name
             or "deepseek-chat",
             "timeout": int(self.config.timeout or 120),
+            "provider": self.config.backend_llm_provider or "openai",
             "source": self.config_source_summary("backend"),
         }
         return {"default": default_spec, "backend": backend_spec}
@@ -185,6 +190,7 @@ class ConfigManager:
             str(spec.get("api_key") or ""),
             str(spec.get("model_name") or ""),
             int(spec.get("timeout") or 120),
+            provider=str(spec.get("provider") or "openai"),
         )
         result = client.test_connection()
         result["profile"] = "backend" if profile == "backend" else "default"

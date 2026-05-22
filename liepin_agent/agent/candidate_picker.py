@@ -24,18 +24,19 @@ class CandidatePicker:
                 reason=observation.reason,
             )
 
+        # 大幅提高抽取上限，不再让死规则限制 LLM 的抓取决策
         if round_type == RoundType.SAMPLE_DETAIL.value:
-            limit = min(4, remaining_detail_budget)
-            policy = {"mode": "wait_min_results", "min_results": min(2, limit), "timeout_seconds": 90}
-            strategy = {"high_confidence": 1, "diversity": 2, "uncertain": 1}
+            limit = min(10, remaining_detail_budget)
+            policy = {"mode": "wait_min_results", "min_results": min(3, limit), "timeout_seconds": 300}
+            strategy = {"high_confidence": 4, "diversity": 3, "uncertain": 3}
         elif round_type == RoundType.VALIDATE_DETAIL.value:
-            limit = min(8, remaining_detail_budget)
-            policy = {"mode": "wait_min_results", "min_results": min(5, limit), "timeout_seconds": 180}
-            strategy = {"high_confidence": 5, "diversity": 2, "uncertain": 1}
+            limit = min(20, remaining_detail_budget)
+            policy = {"mode": "wait_min_results", "min_results": min(8, limit), "timeout_seconds": 300}
+            strategy = {"high_confidence": 12, "diversity": 4, "uncertain": 4}
         else:
-            limit = min(15, remaining_detail_budget)
+            limit = min(40, remaining_detail_budget)
             policy = {"mode": "no_wait"}
-            strategy = {"high_confidence": 12, "diversity": 2, "uncertain": 1}
+            strategy = {"high_confidence": 30, "diversity": 6, "uncertain": 4}
 
         picked = self._pick_candidates(candidates, limit)
         return FetchDecision(

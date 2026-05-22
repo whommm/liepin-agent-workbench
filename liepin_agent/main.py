@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
+
+
+def _setup_logging() -> None:
+    """Configure root logger so debug output is visible in console."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(threadName)s] %(levelname)s %(name)s - %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
 
 
 def _setup_windows_app_id() -> None:
@@ -18,6 +29,7 @@ def _setup_windows_app_id() -> None:
 
 
 def main() -> int:
+    _setup_logging()
     # Set app ID before creating QApplication (Windows taskbar icon fix)
     if sys.platform == "win32":
         _setup_windows_app_id()

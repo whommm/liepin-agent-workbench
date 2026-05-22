@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -265,6 +266,12 @@ class MainWindow(QMainWindow):
         )
         self.criteria_requirements_input.setMaximumHeight(150)
         layout.addWidget(self.criteria_requirements_input)
+
+        layout.addWidget(QLabel("寻访方向（AI 对岗位的理解，可直接编辑修正）"))
+        self.search_direction_input = QLineEdit()
+        self.search_direction_input.setPlaceholderText("AI 生成草案后显示对岗位的理解方向")
+        self.search_direction_input.setEnabled(False)
+        layout.addWidget(self.search_direction_input)
 
         criteria_buttons = QHBoxLayout()
         self.regenerate_criteria_btn = QPushButton("重新生成草案")
@@ -523,14 +530,20 @@ class MainWindow(QMainWindow):
             names += " 等"
         dry_run = bool(payload.get("dry_run"))
         verify_gold_on_page = bool(payload.get("verify_gold_on_page"))
+        request_resume = bool(payload.get("request_resume"))
+        gold_only = bool(payload.get("gold_only"))
         action_label = "预览 dry-run（不会实际发送）" if dry_run else "实际发送打招呼"
         gold_label = "发送前会重新打开页面复核金领状态" if verify_gold_on_page else "将信任 Excel 金领字段，不做页面复核"
+        resume_label = "同时索要简历" if request_resume else "不索要简历"
+        scope_label = "A/B + 金领" if gold_only else "A/B（全部）"
         reply = QMessageBox.question(
             self,
             "确认批量打招呼",
-            "即将处理 Excel 中 A/B + 金领候选人。\n\n模式：{}\n安全复核：{}\n文件：{}\n人数：{}\n候选人：{}\n\n是否继续？".format(
+            "即将处理 Excel 中 {} 候选人。\n\n模式：{}\n安全复核：{}\n索要简历：{}\n文件：{}\n人数：{}\n候选人：{}\n\n是否继续？".format(
+                scope_label,
                 action_label,
                 gold_label,
+                resume_label,
                 payload.get("excel_path") or "",
                 count,
                 names or "-",
@@ -543,6 +556,8 @@ class MainWindow(QMainWindow):
             str(payload.get("message") or ""),
             dry_run=dry_run,
             verify_gold_on_page=verify_gold_on_page,
+            request_resume=request_resume,
+            gold_only=gold_only,
         )
 
     def _start_excel_batch_greeting(
@@ -551,6 +566,8 @@ class MainWindow(QMainWindow):
         message: str,
         dry_run: bool = False,
         verify_gold_on_page: bool = True,
+        request_resume: bool = False,
+        gold_only: bool = True,
     ) -> None:
         self.batch_greeting_btn.setEnabled(False)
         self.batch_greeting_btn.setText("预览中..." if dry_run else "打招呼中...")
@@ -564,6 +581,8 @@ class MainWindow(QMainWindow):
                     message_template=message,
                     dry_run=dry_run,
                     verify_gold_on_page=verify_gold_on_page,
+                    request_resume=request_resume,
+                    gold_only=gold_only,
                     progress_callback=lambda current, total, name: self.event_bus.publish(
                         "excel_greeting_progress",
                         {"current": current, "total": total, "name": name},
@@ -638,6 +657,11 @@ class MainWindow(QMainWindow):
                 contact_present.append(name)
                 skipped.append("{}：简历详情中已出现联系方式".format(name))
                 continue
+            if self.config_manager.config.greet_gold_only:
+                is_gold = int(detail.get("is_gold_collar") or 0) == 1
+                if not is_gold:
+                    skipped.append("{}：非金领候选人".format(name))
+                    continue
             candidate["profile_url"] = profile_url
             candidate["session_title"] = str(session.get("title") or "")
             candidate.update(self._greeting_context_from_row(list_rows.get(candidate_id) or {}))
@@ -891,17 +915,27 @@ class MainWindow(QMainWindow):
         if not requirements:
             QMessageBox.warning(self, "提示", "请先填写岗位匹配要求描述。")
             return
+        # 获取用户编辑后的寻访方向
+        selected_direction = self.search_direction_input.text().strip()
+        # 继承并更新 ai_raw_response
+        ai_raw = {}
+        if criteria and criteria.get("ai_raw_response"):
+            raw = criteria["ai_raw_response"]
+            ai_raw = raw if isinstance(raw, dict) else {}
+        if selected_direction:
+            ai_raw["selected_direction"] = selected_direction
         # keywords_text is kept for compatibility but left empty
         keywords = ""
+        session = self.store.get_session(self.selected_session_id) or {}
         if criteria:
             if str(criteria.get("status") or "") == "confirmed":
-                session = self.store.get_session(self.selected_session_id) or {}
                 criteria_id = self.store.create_criteria_version(
                     self.selected_session_id,
                     keywords,
                     requirements,
                     source_jd_text=str(session.get("jd_text") or ""),
                     source_user_notes=str(session.get("user_notes") or ""),
+                    ai_raw_response=ai_raw,
                     created_by="human",
                 )
                 self.store.confirm_criteria_version(criteria_id)
@@ -909,15 +943,26 @@ class MainWindow(QMainWindow):
                 self.store.update_criteria_version(
                     str(criteria["id"]), keywords, requirements, status="draft"
                 )
+                # 同步更新 ai_raw_response_json
+                try:
+                    from ..storage.sqlite_store import SQLiteStore
+                    if isinstance(self.store, SQLiteStore):
+                        with self.store.connect() as conn:
+                            conn.execute(
+                                "UPDATE match_criteria_versions SET ai_raw_response_json = ? WHERE id = ?",
+                                (json.dumps(ai_raw, ensure_ascii=False), str(criteria["id"])),
+                            )
+                except Exception:
+                    pass
                 self.store.confirm_criteria_version(str(criteria["id"]))
         else:
-            session = self.store.get_session(self.selected_session_id) or {}
             criteria_id = self.store.create_criteria_version(
                 self.selected_session_id,
                 keywords,
                 requirements,
                 source_jd_text=str(session.get("jd_text") or ""),
                 source_user_notes=str(session.get("user_notes") or ""),
+                ai_raw_response=ai_raw,
                 created_by="human",
             )
             self.store.confirm_criteria_version(criteria_id)
@@ -927,7 +972,7 @@ class MainWindow(QMainWindow):
             "criteria_confirmed",
             "寻访基准已确认",
             "后续搜索、抓详情和匹配将基于当前岗位匹配要求执行。",
-            {"requirements_text": requirements},
+            {"requirements_text": requirements, "selected_direction": selected_direction},
         )
         self._mark_dirty()
 
@@ -1329,6 +1374,16 @@ class MainWindow(QMainWindow):
         self.confirm_criteria_btn.setText(
             "已确认" if is_confirmed else "确认寻访基准"
         )
+        # 填充寻访方向输入框
+        ai_raw = criteria.get("ai_raw_response") or {}
+        if isinstance(ai_raw, dict):
+            direction = str(ai_raw.get("search_direction") or "").strip()
+            if not direction:
+                direction = str(ai_raw.get("selected_direction") or "").strip()
+        else:
+            direction = ""
+        self.search_direction_input.setText(direction)
+        self.search_direction_input.setEnabled(bool(direction))
 
     def _render_logs(self) -> None:
         events = self.store.list_events(self.selected_session_id)

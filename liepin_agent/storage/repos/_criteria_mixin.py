@@ -223,16 +223,20 @@ class _CriteriaMixin:
         version = self.get_latest_criteria_version(session_id, "confirmed")
         if version:
             keywords = self._keywords_from_text(version.get("keywords_text") or "")
+            ai_raw = version.get("ai_raw_response") or {}
+            if not isinstance(ai_raw, dict):
+                ai_raw = {}
             return {
                 "criteria_version_id": version.get("id") or "",
                 "version": version.get("version") or 0,
                 "keywords_text": version.get("keywords_text") or "",
                 "requirements_text": version.get("requirements_text") or "",
                 "core_terms": keywords,
-                "negative_terms": [],
-                "hard_requirements": [],
-                "city_scope": [],
-                "position_filter": "",
+                "negative_terms": ai_raw.get("negative_terms") or [],
+                "hard_requirements": ai_raw.get("hard_requirements") or [],
+                "city_scope": ai_raw.get("city_scope") or [],
+                "position_filter": str(ai_raw.get("position_filter") or "").strip(),
+                "selected_direction": str(ai_raw.get("selected_direction") or "").strip(),
             }
         with self.connect() as connection:
             row = connection.execute(

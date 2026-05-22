@@ -43,7 +43,8 @@ class GreetingTextGenerationService:
                 config.api_base_url,
                 config.api_key,
                 config.model_name or "deepseek-chat",
-                timeout=min(int(config.timeout or 120), 120),
+                timeout=min(int(config.timeout or 60), 60),
+                provider=config.llm_provider or "openai",
             )
         )
 
@@ -73,15 +74,28 @@ class GreetingTextGenerationService:
         count: int = 5,
     ) -> List[str]:
         styles = ["general", "highlight", "career", "company", "balance"]
+        selected = styles[: max(1, min(count, len(styles)))]
         results: List[str] = []
-        for style in styles[: max(1, min(count, len(styles)))]:
-            text = self.generate(job_title, city, job_description, salary_range, style)
-            if text and text not in results:
-                results.append(text)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=min(len(selected), 3)) as executor:
+            futures = {
+                executor.submit(
+                    self.generate, job_title, city, job_description, salary_range, style
+                ): style
+                for style in selected
+            }
+            for future in as_completed(futures):
+                try:
+                    text = future.result()
+                    if text and text not in results:
+                        results.append(text)
+                except Exception as exc:
+                    logger.warning("generate_batch style=%s failed: %s", futures[future], exc)
+
+        fallback = self._fallback_generate(job_title, city, job_description)
         while len(results) < count:
-            fallback = self._fallback_generate(job_title, city, job_description)
-            if fallback in results:
-                break
             results.append(fallback)
         return results[:count]
 

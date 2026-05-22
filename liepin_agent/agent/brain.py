@@ -125,11 +125,14 @@ class RuleBasedAgentBrain:
 
 
 class LLMAgentBrain:
-    """LLM-backed Agent brain for real sourcing decisions."""
+    """LLM-backed Agent brain for real sourcing decisions.
+
+    LLM 调用失败时直接抛异常，不再静默 fallback 到规则引擎，
+    避免用户被低质量 fallback 结果误导。
+    """
 
     def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client
-        self.fallback = RuleBasedAgentBrain()
 
     @classmethod
     def from_config(
@@ -143,6 +146,7 @@ class LLMAgentBrain:
                 api_key=config.api_key,
                 model_name=config.model_name,
                 timeout=config.timeout,
+                provider=config.llm_provider or "openai",
             )
         )
 
@@ -150,12 +154,15 @@ class LLMAgentBrain:
         prompt = """请从 JD 中提取匹配条件，输出简洁 JSON：
 {{
   "core_requirement": "一句话核心要求，如：小家电无刷电机领域，必须有无刷电机经验，CAD优先",
-  "position_filter": "职位栏收口词，1-2个词"
+  "position_filter": "猎聘职位栏收口词，1-2个词。必须从JD中的真实岗位名称提取，如：车间主任、生产经理、产品经理、算法工程师。不要编造，不要写'产品' unless JD确实是产品岗",
+  "search_direction": "一句话描述AI对本岗位寻访方向的理解，不是搜索关键词，是策略方向，用户可编辑修正"
 }}
 
 要求：
 1. 只提取寻访真正需要的关键技能、行业、业务或场景背景，不要把 JD 里所有词都搬出来。
 2. core_requirement 要短、清楚，聚焦硬门槛。
+3. position_filter 务必准确：它是猎聘网站左侧职位栏的过滤条件，写错了会直接过滤掉目标候选人。
+4. search_directions 是对岗位的理解方向，每方向一句话，给出不同切入角度（如收紧/放宽/跨行业）。
 
 【JD】
 {jd}
@@ -163,16 +170,13 @@ class LLMAgentBrain:
 【补充说明】
 {notes}
 """.format(jd=jd_text or "", notes=user_notes or "")
-        data = self._chat_json(
-            prompt, self.fallback.build_criteria(jd_text, user_notes)
-        )
+        data = self._chat_json(prompt)
         return {
-            "position_filter": str(data.get("position_filter") or "产品"),
+            "position_filter": str(data.get("position_filter") or "").strip(),
             "core_requirement": str(data.get("core_requirement") or "").strip(),
-            "requirements_text": str(data.get("core_requirement") or "").strip()
-            or self.fallback.build_criteria(jd_text, user_notes).get(
-                "requirements_text", ""
-            ),
+            "requirements_text": str(data.get("core_requirement") or "").strip(),
+            "keywords_text": str(data.get("core_requirement") or "").strip(),
+            "search_direction": str(data.get("search_direction") or "").strip(),
         }
 
     def initial_plan(
@@ -180,11 +184,11 @@ class LLMAgentBrain:
     ) -> SearchPlan:
         prompt = """请为猎聘找人生成第一轮搜索计划，输出 JSON：
 {{
-  "query": "搜索栏关键词，2-3个短词，用空格分隔（AND逻辑）。优先放项目/产品词 + 技术词，避免单泛词",
-  "position_filter": "职位栏收口词",
+  "query": "搜索栏关键词，2-3个短词，用空格分隔（AND逻辑）。优先放项目/产品词 + 技术词，避免单泛词。如果上轮搜索零产出，本轮query必须减少到2个词，放宽条件",
+  "position_filter": "职位栏收口词。必须与匹配条件中的position_filter保持一致，不要擅自更改",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "work_years": "", "education": "", "age": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "age": ""}},
   "intent": "本轮搜索目的",
   "expected_signal": ["期待在候选人卡片中看到的具体信号，至少3条"],
   "risk": "本轮可能噪音及规避方式",
@@ -198,8 +202,10 @@ class LLMAgentBrain:
 3. 第一轮不要设定城市筛选（filters.city 留空 []）。
 4. 活跃度默认 30 天内活跃，不要设太窄。
 5. 年龄：如果 JD 写了年龄上限（如"40岁以内"），填 filters.age = "40"（系统会自动加 3 岁缓冲）。不写则留空。
-6. 如需排除噪音，可在 query 中用减号（如 `产品经理 -助理`）。
-7. expected_signal 必须具体、可观察。
+6. **工作年限不要填入 filters**，猎聘上的年限信息不准确，由后续匹配模型判断。只有 age 可以填。
+7. 如需排除噪音，可在 query 中用减号（如 `产品经理 -助理`）。
+8. expected_signal 必须具体、可观察。
+9. 如果匹配条件中包含 **selected_direction**（用户确认的寻访方向），必须严格按该方向生成搜索计划，不要偏离。
 
 【JD】
 {jd}
@@ -214,10 +220,7 @@ class LLMAgentBrain:
             notes=user_notes or "",
             criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
         )
-        fallback_plan = self.fallback.initial_plan(
-            jd_text, user_notes, criteria
-        ).to_dict()
-        return self._plan_from_data(self._chat_json(prompt, fallback_plan), criteria)
+        return self._plan_from_data(self._chat_json(prompt), criteria)
 
     def observe_round(
         self,
@@ -226,9 +229,10 @@ class LLMAgentBrain:
         criteria: Dict[str, object],
         page_meta: Dict[str, object] | None = None,
     ) -> Observation:
+        # 不再按系统预评分截断，全部候选人交给 LLM 做智能观察
         cards = [
             self._candidate_card(item)
-            for item in sorted(candidates, key=lambda c: -c.pre_score)[:40]
+            for item in (candidates or [])
         ]
         prompt = """请观察本轮猎聘搜索结果池，输出 JSON：
 {{
@@ -245,9 +249,9 @@ class LLMAgentBrain:
 ## 质量分级标准
 - **empty**：搜索结果为空或仅0-2人。→ 关键词过窄或条件冲突。
 - **low**：结果数≥8但卡片无有效信号，或 relevant_count=0。→ 建议 skip_detail。
-- **uncertain**：有少量潜在信号（2-4个 relevant），但不确定是真实匹配还是标题党。→ 建议 sample_detail（2-4人）。
-- **medium**：有多个有效信号（≥5个 relevant），卡片层面出现目标行业/技能/公司。→ 建议 validate_detail（5-10人）。
-- **high**：大量强信号（≥10个 strong），目标人才密集。→ 建议 harvest_detail（最多15人）。
+- **uncertain**：有少量潜在信号，但不确定是真实匹配还是标题党。→ 建议 sample_detail（可抓 6-10 人）。
+- **medium**：有多个有效信号，卡片层面出现目标行业/技能/公司。→ 建议 validate_detail（可抓 12-20 人）。
+- **high**：大量强信号，目标人才密集。→ 建议 harvest_detail（可抓 20-40 人，充分利用预算）。
 
 ### 噪音类型识别（常见）
 1. 岗位错配、职级错配、行业错配
@@ -276,10 +280,7 @@ class LLMAgentBrain:
             page_meta=json.dumps(page_meta or {}, ensure_ascii=False, indent=2),
             cards=json.dumps(cards, ensure_ascii=False, indent=2),
         )
-        fallback_observation = self.fallback.observe_round(
-            plan, candidates, criteria, page_meta
-        ).to_dict()
-        data = self._chat_json(prompt, fallback_observation)
+        data = self._chat_json(prompt)
         round_type = str(
             data.get("recommended_round_type") or RoundType.SAMPLE_DETAIL.value
         )
@@ -302,9 +303,10 @@ class LLMAgentBrain:
         candidates: List[CandidateSummary],
         remaining_detail_budget: int,
     ) -> FetchDecision:
+        # 不再按系统预评分截断，全部候选人交给 LLM 决定抓取策略
         cards = [
             self._candidate_card(item)
-            for item in sorted(candidates, key=lambda c: -c.pre_score)[:50]
+            for item in (candidates or [])
         ]
         valid_ids = {item.id for item in candidates}
         prompt = """请决定本轮是否抓取候选人详情，输出 JSON：
@@ -322,15 +324,15 @@ class LLMAgentBrain:
 
 ### 各轮次抓取上限
 - **skip_detail**：明显低质轮、空结果轮、或预算耗尽时不抓。
-- **sample_detail（探测轮）**：抓 2-4 个。目的是快速验证搜索假设是否成立。必须混合：1个最高置信 + 1个多样性（不同公司/背景） + 1-2个不确定样本。
-- **validate_detail（验证轮）**：抓 5-10 个。目的是在 medium 质量池中验证真实匹配度。优先抓卡片信号最明确的，同时保留 1-2 个边缘样本防止漏判。
-- **harvest_detail（收割轮）**：抓 8-15 个。目的是在高密度池中批量获取匹配结果。可以放宽抽样范围，优先抓未被抓过的新面孔。
+- **sample_detail（探测轮）**：抓 6-10 个。目的是快速验证搜索假设是否成立。必须混合：高置信 + 多样性（不同公司/背景） + 不确定样本。不要只抓表面最匹配的。
+- **validate_detail（验证轮）**：抓 12-20 个。目的是在 medium 质量池中验证真实匹配度。优先抓卡片信号最明确的，同时保留边缘样本防止漏判。宁可多抓也不要漏抓。
+- **harvest_detail（收割轮）**：抓 20-40 个。目的是在高密度池中批量获取匹配结果。大幅放宽抽样范围，优先抓未被抓过的新面孔。用户明确不在乎成本，请充分利用预算。
 
 ### 抽样原则
-1. **不要只抓 Top N 预评分**。预评分基于关键词匹配，可能漏掉"跨行业可迁移"或"简历写法不同但实质匹配"的候选人。
-2. **高置信样本**：card_decision="fetch" 且 card_signals≥2 的候选人。
-3. **多样性样本**：来自不同公司、不同职级段、不同业务线的候选人，避免同一公司抓多人。
-4. **不确定样本**：card_decision="maybe" 但有一项独特亮点（如目标公司背景、罕见项目经验）的候选人。
+1. **系统预评分已禁用，不要参考 pre_score / card_decision**。这些字段是旧规则程序的残留，可能严重误杀人才。请完全基于候选人卡片的实际内容进行判断。
+2. **高置信样本**：当前职位、公司、摘要中明显体现目标技能/行业/背景的候选人。
+3. **多样性样本**：来自不同公司、不同职级段、不同业务线的候选人，避免同一公司抓多人。特别关注"跨行业可迁移"人才。
+4. **不确定样本**：有一项独特亮点（如目标公司背景、罕见项目经验、特殊行业交叉背景）的候选人，即使表面匹配度不高也建议抓取验证。宁可错抓不要漏抓。
 5. **candidate_ids 必须来自候选人卡片列表**，不能编造。
 
 ### match_wait_policy 选择
@@ -352,20 +354,17 @@ class LLMAgentBrain:
             observation=json.dumps(observation.to_dict(), ensure_ascii=False, indent=2),
             cards=json.dumps(cards, ensure_ascii=False, indent=2),
         )
-        fallback_decision = self.fallback.decide_fetch(
-            observation, candidates, remaining_detail_budget
-        ).to_dict()
-        data = self._chat_json(prompt, fallback_decision)
+        data = self._chat_json(prompt)
         action = str(data.get("action") or "skip_detail")
         candidate_ids = [
             item
             for item in self._string_list(data.get("candidate_ids"))
             if item in valid_ids
         ]
+        # 不再硬上限 15，完全信任 LLM 的抓取决策（用户明确不在乎成本）
         fetch_limit = min(
             int(data.get("fetch_limit") or len(candidate_ids)),
             remaining_detail_budget,
-            15,
         )
         candidate_ids = candidate_ids[:fetch_limit]
         if not candidate_ids:
@@ -382,7 +381,7 @@ class LLMAgentBrain:
             policy = {
                 "mode": "wait_min_results",
                 "min_results": min(5, len(candidate_ids)),
-                "timeout_seconds": 180,
+                "timeout_seconds": 300,
             }
         return FetchDecision(
             action=action,
@@ -413,8 +412,8 @@ class LLMAgentBrain:
   "action": "continue/stop",
   "summary": "复盘结论：本轮产出评估、噪音归因、策略调整方向",
   "next_plan": {{
-    "query": "下一轮搜索栏关键词",
-    "position_filter": "职位栏",
+    "query": "下一轮搜索栏关键词。注意：如果本轮零产出，query必须减到2个词，去掉最窄的那个限定词",
+    "position_filter": "职位栏。必须与【匹配条件】中的position_filter保持完全一致，严禁改成其他词（如把生产管理岗改成'产品'）",
     "scope": "全部经历/目前职位/过往职位",
     "match_mode": "all/any",
     "filters": {{}},
@@ -433,6 +432,10 @@ class LLMAgentBrain:
 }}
 
 ## 复盘要求
+### 0. 重要区分
+- 【本轮匹配结果】仅反映本轮抓取后的匹配产出。如果本轮 match_results 为空，可能是因为匹配尚未完成或超时，**不要据此推断"连续多轮零产出"**。
+- 历史各轮的搜索效果请参考【已用 query】列表，不要混淆"本轮效果"与"历史累积效果"。
+
 ### 1. 停止条件（如果 should_stop 为 true，必须 action=stop）
 - 已达到目标 A/B 数量
 - 连续多轮低产出且无明显改进空间
@@ -457,7 +460,8 @@ class LLMAgentBrain:
 - 当 core_background 和 target_company 都耗尽时，优先尝试 transferable_scene
 
 ### 4. next_plan 字段要求
-- query：2-3 个词 AND 组合，空格分隔，明确是收紧/放宽/换维度
+- query：2-3 个词 AND 组合，空格分隔，明确是收紧/放宽/换维度。**如果本轮搜索零产出，下一轮query必须减少到2个词，优先去掉最细分/最罕见的那个词**
+- filters：只保留 city / active_days / education / age，**严禁填充 work_years**
 - scope：target_company 优先用"目前/过往公司"；transferable_scene 用"全部经历"
 - expected_signal：具体、可观察
 
@@ -466,10 +470,12 @@ class LLMAgentBrain:
 【target_met】{target_met}
 【上一轮计划】
 {plan}
-【已用 query】
+【已用 query】（历史搜索记录，按轮次顺序）
 {used_queries}
-【匹配结果】
+
+【本轮匹配结果】（仅含本轮详情抓取后已完成匹配的候选人，不代表历史各轮产出）
 {matches}
+
 【噪音】
 {noise}
 【JD】
@@ -488,18 +494,7 @@ class LLMAgentBrain:
             jd=jd_text or "",
             criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
         )
-        fallback_review = self.fallback.review_round(
-            previous_plan=previous_plan,
-            jd_text=jd_text,
-            used_queries=used_queries,
-            match_results=match_results,
-            noise_patterns=noise_patterns,
-            target_met=target_met,
-            should_stop=should_stop,
-            stop_reason=stop_reason,
-            criteria=criteria,
-        ).to_dict()
-        data = self._chat_json(prompt, fallback_review)
+        data = self._chat_json(prompt)
         action = "stop" if should_stop else str(data.get("action") or "continue")
         if should_stop:
             return RoundReview(
@@ -565,20 +560,14 @@ class LLMAgentBrain:
             current_plan=json.dumps(current_plan.to_dict(), ensure_ascii=False, indent=2),
             criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
         )
-        fallback_plan = current_plan.to_dict()
-        data = self._chat_json(prompt, fallback_plan)
+        data = self._chat_json(prompt)
         if isinstance(data, dict) and data.get("query"):
             return self._plan_from_data(data, criteria)
         return current_plan
 
-    def _chat_json(
-        self, prompt: str, fallback: Optional[Dict[str, object]] = None
-    ) -> Dict[str, object]:
-        try:
-            raw = self.llm_client.chat(prompt, system_message=AGENT_SYSTEM_PROMPT)
-            return self._parse_json(raw)
-        except Exception:
-            return dict(fallback or {})
+    def _chat_json(self, prompt: str) -> Dict[str, object]:
+        raw = self.llm_client.chat(prompt, system_message=AGENT_SYSTEM_PROMPT)
+        return self._parse_json(raw)
 
     @staticmethod
     def _parse_json(raw: str) -> Dict[str, object]:
@@ -607,7 +596,7 @@ class LLMAgentBrain:
         return SearchPlan(
             query=str(data.get("query") or "").strip(),
             position_filter=str(
-                data.get("position_filter") or criteria.get("position_filter") or "产品"
+                data.get("position_filter") or criteria.get("position_filter") or ""
             ),
             scope=str(data.get("scope") or "全部经历"),
             match_mode=str(data.get("match_mode") or "all"),

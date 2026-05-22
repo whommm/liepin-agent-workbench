@@ -16,18 +16,10 @@ class Observer:
     ) -> Observation:
         candidate_list = list(candidates or [])
         raw_count = len(candidate_list)
-        relevant = [
-            item
-            for item in candidate_list
-            if item.card_decision == "fetch" or item.pre_score >= 65
-        ]
-        strong = [
-            item
-            for item in candidate_list
-            if item.card_decision == "fetch" and len(item.card_signals or []) >= 2
-        ]
-        if not strong:
-            strong = [item for item in candidate_list if item.pre_score >= 78]
+        # 系统预打分已禁用，不再用 card_decision/pre_score 做规则筛选
+        # 全部交给 LLM 做智能观察，此处仅做宽松的基数统计
+        relevant = candidate_list
+        strong = candidate_list
         noise_patterns = self._detect_noise(candidate_list)
         positive_signals = self._detect_positive_signals(candidate_list, expected_terms)
 

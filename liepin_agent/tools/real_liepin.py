@@ -280,8 +280,7 @@ class RealLiepinTool:
             except Exception:
                 pass
         try:
-            safe_url = profile_url.replace("'", "\\'")
-            page.evaluate("window.location.href = '{}'".format(safe_url))
+            page.evaluate("(url) => { window.location.href = url; }", profile_url)
             time.sleep(2.5)
             return RealLiepinTool._looks_like_detail_url(page.url or profile_url)
         except Exception:
@@ -325,8 +324,9 @@ class RealLiepinTool:
             try:
                 locator = page.locator(selector)
                 if locator.count() > 0 and locator.first.is_visible(timeout=2000):
-                    locator.first.click()
+                    locator.first.click(force=True)
                     logger.warning("manual_greeting: clicked greeting button selector=%s", selector)
+                    time.sleep(1.0)
                     return True
             except Exception:
                 continue
@@ -393,18 +393,48 @@ class RealLiepinTool:
     def _request_resume(page) -> str:
         """在已打开的聊天窗口中点击"索要简历"并确认。"""
         try:
-            resume_btn = page.locator('span.im-ui-action-button.action-item.action-resume')
-            if resume_btn.count() <= 0 or not resume_btn.first.is_visible(timeout=2000):
+            clicked = False
+            for selector in (
+                'span.im-ui-action-button.action-item.action-resume',
+                '[class*="action-resume"]',
+                'button:has-text("索要简历")',
+                'span:has-text("索要简历")',
+                '[class*="resume"]:has-text("索要")',
+                'button:has-text("要简历")',
+            ):
+                try:
+                    resume_btn = page.locator(selector)
+                    if resume_btn.count() > 0 and resume_btn.first.is_visible(timeout=2000):
+                        resume_btn.first.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
                 logger.warning("request_resume: resume button not found")
                 return "未找到索要简历按钮"
-            resume_btn.first.click()
             time.sleep(1.5)
 
-            confirm_btn = page.locator('.ant-im-modal-confirm-btns button.ant-im-btn-primary')
-            if confirm_btn.count() <= 0 or not confirm_btn.first.is_visible(timeout=2000):
+            confirm_clicked = False
+            for selector in (
+                '.ant-im-modal-confirm-btns button.ant-im-btn-primary',
+                '.ant-modal-confirm-btns button.ant-btn-primary',
+                '.ant-modal button.ant-btn-primary',
+                'button:has-text("确认")',
+                'button:has-text("确定")',
+                '.ant-btn-primary',
+            ):
+                try:
+                    confirm_btn = page.locator(selector)
+                    if confirm_btn.count() > 0 and confirm_btn.first.is_visible(timeout=2000):
+                        confirm_btn.first.click()
+                        confirm_clicked = True
+                        break
+                except Exception:
+                    continue
+            if not confirm_clicked:
                 logger.warning("request_resume: confirm button not found")
                 return "未找到确认按钮"
-            confirm_btn.first.click()
             time.sleep(1.5)
             logger.warning("request_resume: success")
             return "已发送索要简历"
@@ -414,6 +444,9 @@ class RealLiepinTool:
 
     @staticmethod
     def _send_chat_message(page, message: str) -> bool:
+        """在聊天弹窗中填写并发送消息，返回是否成功。"""
+        if not message:
+            return True
         for selector in (
             'textarea[placeholder*="请输入文字"]',
             'input[placeholder*="请输入文字"]',
@@ -421,6 +454,7 @@ class RealLiepinTool:
             '[role="textbox"]',
             'dialog textarea',
             'dialog input[type="text"]',
+            '.im-ui-chat-input [contenteditable="true"]',
         ):
             try:
                 locator = page.locator(selector)
@@ -428,14 +462,22 @@ class RealLiepinTool:
                     chat_input = locator.nth(index)
                     if not chat_input.is_visible(timeout=1000):
                         continue
-                    chat_input.fill(message)
-                    time.sleep(0.5)
+                    # contenteditable 用 type 更能触发 input 事件，激活发送按钮
+                    if 'contenteditable' in selector:
+                        chat_input.click()
+                        time.sleep(0.2)
+                        chat_input.type(message, delay=10)
+                    else:
+                        chat_input.fill(message)
+                    time.sleep(0.8)
                     for send_selector in (
                         'button.im-ui-basic-send-btn',
                         '.im-ui-chat-input button:has-text("发送")',
                         'button:has-text("发送")',
                         'button[type="submit"]',
                         '[role="button"]:has-text("发送")',
+                        '.im-ui-send-btn',
+                        'button:has-text("发送消息")',
                     ):
                         try:
                             send_btn = page.locator(send_selector).first
@@ -445,9 +487,17 @@ class RealLiepinTool:
                                 return True
                         except Exception:
                             continue
+                    # 回退：按 Enter 发送，但验证输入框是否被清空，避免只是换行
                     try:
                         chat_input.press("Enter")
                         time.sleep(1)
+                        try:
+                            remaining = chat_input.input_value(timeout=500)
+                        except Exception:
+                            remaining = chat_input.inner_text(timeout=500) or ""
+                        if message.strip() in str(remaining).strip():
+                            # 消息还在，说明 Enter 没有触发发送（可能只是换行）
+                            return False
                         return True
                     except Exception:
                         return False
@@ -457,18 +507,25 @@ class RealLiepinTool:
 
     @staticmethod
     def _close_any_dialog(page) -> None:
+        """关闭弹窗，但避免隐藏聊天主界面等正常交互元素。"""
         try:
             page.evaluate(
                 """
                 () => {
+                    // 只针对明确的弹窗层，避免误杀聊天窗口（可能含 dialog 类名）
                     const selectors = [
-                        'dialog', '[role="dialog"]', '.ant-modal', '.modal',
-                        '[class*="modal"]', '[class*="dialog"]', '.chat-dialog',
-                        '.im-dialog', '.message-dialog'
+                        'dialog', '[role="dialog"]', '.ant-modal', '.ant-modal-wrap',
+                        '.ant-modal-mask', '.modal-overlay', '.modal-backdrop'
                     ];
                     selectors.forEach((selector) => {
                         document.querySelectorAll(selector).forEach((el) => {
-                            el.style.display = 'none';
+                            const style = window.getComputedStyle(el);
+                            // 只隐藏 fixed/absolute 定位的覆盖层，避免隐藏正常文档流元素
+                            if (style.position === 'fixed' || style.position === 'absolute') {
+                                el.style.display = 'none';
+                            } else if (el.tagName.toLowerCase() === 'dialog' || el.getAttribute('role') === 'dialog') {
+                                el.style.display = 'none';
+                            }
                         });
                     });
                     document.dispatchEvent(new KeyboardEvent('keydown', {

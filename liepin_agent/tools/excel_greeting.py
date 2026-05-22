@@ -39,7 +39,7 @@ class ExcelGreetingService:
         self.liepin_tool = liepin_tool
 
     @classmethod
-    def load_greetable_candidates(cls, excel_path: str | Path) -> List[ExcelGreetingCandidate]:
+    def load_greetable_candidates(cls, excel_path: str | Path, gold_only: bool = True) -> List[ExcelGreetingCandidate]:
         workbook = load_workbook(excel_path)
         try:
             sheet = workbook["候选人"] if "候选人" in workbook.sheetnames else workbook.active
@@ -53,7 +53,7 @@ class ExcelGreetingService:
                 tier = cls._cell_text(sheet, row_index, headers, "匹配档位").upper()
                 if tier not in {"A", "B"}:
                     continue
-                if not cls._is_yes(cls._cell_text(sheet, row_index, headers, "金领")):
+                if gold_only and not cls._is_yes(cls._cell_text(sheet, row_index, headers, "金领")):
                     continue
                 greeting_status = cls._cell_text(sheet, row_index, headers, "打招呼状态")
                 if greeting_status in {"已发送", "已打过", "success", "already_greeted"}:
@@ -92,9 +92,11 @@ class ExcelGreetingService:
         dry_run: bool = False,
         verify_gold_on_page: bool = True,
         request_resume: bool = False,
+        gold_only: bool = True,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> List[Dict[str, object]]:
-        candidates = self.load_greetable_candidates(excel_path)
+        candidates = self.load_greetable_candidates(excel_path, gold_only=gold_only)
+        candidates.sort(key=lambda c: (c.tier != "A", c.row_index))
         results: List[Dict[str, object]] = []
         total = len(candidates)
         for index, candidate in enumerate(candidates, start=1):
@@ -133,7 +135,13 @@ class ExcelGreetingService:
             message = str(response.get("message") or "")
             error = str(response.get("error") or "")
             request_resume_status = str(response.get("request_resume_status") or "")
-            self.write_greeting_result(excel_path, candidate.row_index, status, message, error, request_resume_status)
+            try:
+                self.write_greeting_result(excel_path, candidate.row_index, status, message, error, request_resume_status)
+            except PermissionError as exc:
+                logger.warning("write_greeting_result permission denied: %s", exc)
+                error = "{}（Excel写入失败：文件可能被占用，请关闭Excel后重试）".format(error) if error else "Excel写入失败：文件可能被占用，请关闭Excel后重试"
+            except Exception as exc:
+                logger.warning("write_greeting_result failed: %s", exc)
             results.append(
                 {
                     "row_index": candidate.row_index,
@@ -144,6 +152,11 @@ class ExcelGreetingService:
                     "request_resume_status": request_resume_status,
                 }
             )
+        # 批量处理结束后统一再写一遍，补救中间因文件占用而失败的写入
+        try:
+            self._write_batch_results(excel_path, results)
+        except Exception as exc:
+            logger.warning("batch write results failed: %s", exc)
         return results
 
     @classmethod
@@ -156,28 +169,85 @@ class ExcelGreetingService:
         error: str = "",
         request_resume_status: str = "",
     ) -> None:
-        workbook = load_workbook(excel_path)
-        try:
-            sheet = workbook["候选人"] if "候选人" in workbook.sheetnames else workbook.active
-            headers = cls._header_map(sheet)
-            cls._ensure_header(sheet, headers, "打招呼状态")
-            cls._ensure_header(sheet, headers, "打招呼消息")
-            cls._ensure_header(sheet, headers, "打招呼错误")
-            cls._ensure_header(sheet, headers, "索要简历状态")
-            labels = {
-                "success": cls.STATUS_SUCCESS,
-                "already_greeted": cls.STATUS_ALREADY,
-                "skipped": cls.STATUS_SKIPPED,
-                "failed": cls.STATUS_FAILED,
-                "dry_run": cls.STATUS_DRY_RUN,
-            }
-            sheet.cell(row=row_index, column=headers["打招呼状态"]).value = labels.get(status, status)
-            sheet.cell(row=row_index, column=headers["打招呼消息"]).value = message or ""
-            sheet.cell(row=row_index, column=headers["打招呼错误"]).value = error or ""
-            sheet.cell(row=row_index, column=headers["索要简历状态"]).value = request_resume_status or ""
-            workbook.save(excel_path)
-        finally:
-            workbook.close()
+        import time as _time
+        last_exc = None
+        for attempt in range(3):
+            try:
+                workbook = load_workbook(excel_path)
+                try:
+                    sheet = workbook["候选人"] if "候选人" in workbook.sheetnames else workbook.active
+                    headers = cls._header_map(sheet)
+                    cls._ensure_header(sheet, headers, "打招呼状态")
+                    cls._ensure_header(sheet, headers, "打招呼消息")
+                    cls._ensure_header(sheet, headers, "打招呼错误")
+                    cls._ensure_header(sheet, headers, "索要简历状态")
+                    labels = {
+                        "success": cls.STATUS_SUCCESS,
+                        "already_greeted": cls.STATUS_ALREADY,
+                        "skipped": cls.STATUS_SKIPPED,
+                        "failed": cls.STATUS_FAILED,
+                        "dry_run": cls.STATUS_DRY_RUN,
+                    }
+                    sheet.cell(row=row_index, column=headers["打招呼状态"]).value = labels.get(status, status)
+                    sheet.cell(row=row_index, column=headers["打招呼消息"]).value = message or ""
+                    sheet.cell(row=row_index, column=headers["打招呼错误"]).value = error or ""
+                    sheet.cell(row=row_index, column=headers["索要简历状态"]).value = request_resume_status or ""
+                    workbook.save(excel_path)
+                finally:
+                    workbook.close()
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                if attempt < 2:
+                    _time.sleep(1.5)
+                continue
+            except Exception as exc:
+                raise
+        raise last_exc
+
+    @classmethod
+    def _write_batch_results(cls, excel_path: str | Path, results: List[Dict[str, object]]) -> None:
+        """将一批结果统一写入 Excel，用于补救中间因文件占用而失败的单条写入。"""
+        import time as _time
+        for attempt in range(3):
+            try:
+                workbook = load_workbook(excel_path)
+                try:
+                    sheet = workbook["候选人"] if "候选人" in workbook.sheetnames else workbook.active
+                    headers = cls._header_map(sheet)
+                    cls._ensure_header(sheet, headers, "打招呼状态")
+                    cls._ensure_header(sheet, headers, "打招呼消息")
+                    cls._ensure_header(sheet, headers, "打招呼错误")
+                    cls._ensure_header(sheet, headers, "索要简历状态")
+                    labels = {
+                        "success": cls.STATUS_SUCCESS,
+                        "already_greeted": cls.STATUS_ALREADY,
+                        "skipped": cls.STATUS_SKIPPED,
+                        "failed": cls.STATUS_FAILED,
+                        "dry_run": cls.STATUS_DRY_RUN,
+                    }
+                    for item in results:
+                        row_index = int(item.get("row_index") or 0)
+                        if row_index <= 0:
+                            continue
+                        status = str(item.get("status") or "failed")
+                        message = str(item.get("message") or "")
+                        error = str(item.get("error") or "")
+                        request_resume_status = str(item.get("request_resume_status") or "")
+                        sheet.cell(row=row_index, column=headers["打招呼状态"]).value = labels.get(status, status)
+                        sheet.cell(row=row_index, column=headers["打招呼消息"]).value = message or ""
+                        sheet.cell(row=row_index, column=headers["打招呼错误"]).value = error or ""
+                        sheet.cell(row=row_index, column=headers["索要简历状态"]).value = request_resume_status or ""
+                    workbook.save(excel_path)
+                finally:
+                    workbook.close()
+                return
+            except PermissionError:
+                if attempt < 2:
+                    _time.sleep(1.5)
+                continue
+            except Exception:
+                raise
 
     @staticmethod
     def generate_summary(results: List[Dict[str, object]]) -> str:

@@ -169,7 +169,7 @@ class BatchGreetingDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(
-            QLabel("导入候选人 Excel，仅处理匹配档位 A/B、金领=是、未打过招呼、有猎聘简历链接的候选人。")
+            QLabel("导入候选人 Excel，仅处理匹配档位 A/B、未打过招呼、有猎聘简历链接的候选人。")
         )
 
         file_row = QHBoxLayout()
@@ -188,11 +188,18 @@ class BatchGreetingDialog(QDialog):
 
         self.dry_run_check = QCheckBox("仅预览 dry-run，不实际发送打招呼")
         self.dry_run_check.setChecked(True)
+        self.gold_only_check = QCheckBox("仅处理金领候选人")
+        self.gold_only_check.setChecked(config_manager.config.greet_gold_only)
+        self.gold_only_check.setToolTip("开启后只向 Excel 中标记为金领的候选人打招呼；关闭则全部 A/B 档候选人都处理。")
         self.verify_gold_check = QCheckBox("发送前重新打开页面复核金领状态")
         self.verify_gold_check.setChecked(True)
         self.verify_gold_check.setToolTip("建议保持开启，避免 Excel 被编辑或数据过期后误发。")
+        self.request_resume_check = QCheckBox('同时索要简历（发送招呼后自动点击"索要简历"）')
+        self.request_resume_check.setChecked(True)
         layout.addWidget(self.dry_run_check)
+        layout.addWidget(self.gold_only_check)
         layout.addWidget(self.verify_gold_check)
+        layout.addWidget(self.request_resume_check)
 
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
@@ -216,11 +223,7 @@ class BatchGreetingDialog(QDialog):
         generate_row = QHBoxLayout()
         self.generate_btn = QPushButton("生成打招呼文本")
         self.generate_btn.clicked.connect(self._generate_one)
-        self.generate_batch_btn = QPushButton("生成 5 个版本")
-        self.generate_batch_btn.setObjectName("SecondaryBtn")
-        self.generate_batch_btn.clicked.connect(self._generate_batch)
         generate_row.addWidget(self.generate_btn)
-        generate_row.addWidget(self.generate_batch_btn)
         generate_row.addStretch(1)
         layout.addLayout(generate_row)
 
@@ -264,7 +267,9 @@ class BatchGreetingDialog(QDialog):
 
     def _load_preview(self, path: str) -> None:
         try:
-            self._candidates = ExcelGreetingService.load_greetable_candidates(path)
+            self._candidates = ExcelGreetingService.load_greetable_candidates(
+                path, gold_only=self.gold_only_check.isChecked()
+            )
         except Exception as exc:
             self._candidates = []
             QMessageBox.warning(self, "读取失败", str(exc))
@@ -272,9 +277,18 @@ class BatchGreetingDialog(QDialog):
         names = "、".join(item.name for item in self._candidates[:10])
         if len(self._candidates) > 10:
             names += " 等"
+        gold_text = "金领 + " if self.gold_only_check.isChecked() else ""
+        tier_counts = {}
+        for item in self._candidates:
+            tier_counts[item.tier] = tier_counts.get(item.tier, 0) + 1
+        a_count = tier_counts.get("A", 0)
+        b_count = tier_counts.get("B", 0)
         self.summary_label.setText(
-            "可处理候选人：{} 位（筛选：A/B + 金领 + 未打过 + 猎聘详情链接）。".format(
-                len(self._candidates)
+            "可处理候选人：{} 位（A 档 {} 人 / B 档 {} 人；筛选：A/B + {}未打过 + 猎聘详情链接）。".format(
+                len(self._candidates),
+                a_count,
+                b_count,
+                gold_text,
             )
         )
         self.preview.setPlainText(names or "没有符合条件的候选人。")
@@ -288,11 +302,9 @@ class BatchGreetingDialog(QDialog):
     def _generate_one(self) -> None:
         self._start_generation(count=1)
 
-    def _generate_batch(self) -> None:
-        self._start_generation(count=5)
-
     def _start_generation(self, count: int) -> None:
         self._set_generating(True)
+        self._generation_cancelled = False
         job_title = self.job_title.text().strip() or "目标岗位"
         city = self.city.text().strip() or "该城市"
         jd_text = self.jd_text.toPlainText().strip()
@@ -307,11 +319,23 @@ class BatchGreetingDialog(QDialog):
                     jd_text=jd_text,
                     salary=salary,
                 )
-                self._generation_signals.done.emit(count, texts)
+                if not getattr(self, "_generation_cancelled", False):
+                    self._generation_signals.done.emit(count, texts)
             except Exception as exc:
-                self._generation_signals.failed.emit(str(exc))
+                if not getattr(self, "_generation_cancelled", False):
+                    self._generation_signals.failed.emit(str(exc))
 
-        threading.Thread(target=_run, daemon=True).start()
+        self._generation_thread = threading.Thread(target=_run, daemon=True)
+
+        def _timeout():
+            self._generation_cancelled = True
+            self._generation_signals.failed.emit(
+                "生成超时（90秒），请检查网络或 API 配置。"
+            )
+
+        self._generation_timer = threading.Timer(90.0, _timeout)
+        self._generation_timer.start()
+        self._generation_thread.start()
 
     def _generate_texts(
         self,
@@ -342,6 +366,8 @@ class BatchGreetingDialog(QDialog):
         )
 
     def _on_generation_done(self, count: int, texts: List[str]) -> None:
+        if hasattr(self, "_generation_timer"):
+            self._generation_timer.cancel()
         self._set_generating(False)
         self.variant_combo.blockSignals(True)
         self.variant_combo.clear()
@@ -356,15 +382,15 @@ class BatchGreetingDialog(QDialog):
         self.generate_status.setText("已生成 {} 个版本。".format(len(texts)))
 
     def _on_generation_failed(self, error: str) -> None:
+        if hasattr(self, "_generation_timer"):
+            self._generation_timer.cancel()
         self._set_generating(False)
         self.generate_status.setText("生成失败。")
         QMessageBox.warning(self, "生成失败", error or "未知错误")
 
     def _set_generating(self, generating: bool) -> None:
         self.generate_btn.setEnabled(not generating)
-        self.generate_batch_btn.setEnabled(not generating)
         self.generate_btn.setText("生成中..." if generating else "生成打招呼文本")
-        self.generate_batch_btn.setText("生成中..." if generating else "生成 5 个版本")
         self.generate_status.setText("正在生成打招呼文本，请稍候..." if generating else "生成完成。")
 
     def _select_variant(self, index: int) -> None:
@@ -380,7 +406,8 @@ class BatchGreetingDialog(QDialog):
         if not self._candidates:
             self._load_preview(path)
         if not self._candidates:
-            QMessageBox.warning(self, "提示", "没有符合 A/B + 金领 条件的候选人。")
+            filter_text = "A/B + 金领" if self.gold_only_check.isChecked() else "A/B"
+            QMessageBox.warning(self, "提示", "没有符合 {} 条件的候选人。".format(filter_text))
             return
         if not self.dry_run_check.isChecked() and not self.verify_gold_check.isChecked():
             reply = QMessageBox.warning(
@@ -404,6 +431,8 @@ class BatchGreetingDialog(QDialog):
             "candidate_names": [item.name for item in self._candidates],
             "dry_run": self.dry_run_check.isChecked(),
             "verify_gold_on_page": self.verify_gold_check.isChecked(),
+            "request_resume": self.request_resume_check.isChecked(),
+            "gold_only": self.gold_only_check.isChecked(),
         }
 
 
@@ -434,6 +463,12 @@ class SettingsDialog(QDialog):
         self.model_name = QLineEdit(config.model_name or "deepseek-chat")
         form.addRow("模型名称", self.model_name)
 
+        self.llm_provider = QComboBox()
+        self.llm_provider.addItems(["openai", "anthropic"])
+        index = self.llm_provider.findText(config.llm_provider or "openai")
+        self.llm_provider.setCurrentIndex(max(0, index))
+        form.addRow("API 格式", self.llm_provider)
+
         self.timeout = QSpinBox()
         self.timeout.setRange(10, 600)
         self.timeout.setValue(int(config.timeout or 120))
@@ -460,6 +495,12 @@ class SettingsDialog(QDialog):
         self.backend_model_name.setPlaceholderText("留空则使用上方模型名称")
         form.addRow("后端模型名称", self.backend_model_name)
 
+        self.backend_llm_provider = QComboBox()
+        self.backend_llm_provider.addItems(["openai", "anthropic"])
+        index = self.backend_llm_provider.findText(config.backend_llm_provider or "openai")
+        self.backend_llm_provider.setCurrentIndex(max(0, index))
+        form.addRow("后端 API 格式", self.backend_llm_provider)
+
         self.browser_channel = QComboBox()
         self.browser_channel.addItems(["msedge", "chrome", "chromium"])
         index = self.browser_channel.findText(
@@ -479,6 +520,10 @@ class SettingsDialog(QDialog):
             "留空则只触发平台默认打招呼；填写后，手动打招呼会发送这段消息。"
         )
         form.addRow("手动打招呼话术", self.greeting_template)
+
+        self.greet_gold_only = QCheckBox("仅对金领候选人打招呼（手动/Excel 批量均生效）")
+        self.greet_gold_only.setChecked(config.greet_gold_only)
+        form.addRow(self.greet_gold_only)
 
         layout.addLayout(form)
 
@@ -514,6 +559,9 @@ class SettingsDialog(QDialog):
             liepin_browser_profile_dir=self.profile_dir.text().strip()
             or "browser_profile/liepin",
             greeting_template=self.greeting_template.toPlainText().strip(),
+            llm_provider=self.llm_provider.currentText(),
+            backend_llm_provider=self.backend_llm_provider.currentText(),
+            greet_gold_only=self.greet_gold_only.isChecked(),
         )
 
     def _test_connection(self, profile: str) -> None:

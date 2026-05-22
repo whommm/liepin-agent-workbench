@@ -57,6 +57,7 @@ class RealMatchService:
                 api_key=backend_key,
                 model_name=backend_model,
                 timeout=config.timeout,
+                provider=config.backend_llm_provider or "openai",
             )
         )
 

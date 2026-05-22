@@ -1,0 +1,20 @@
+        prompt = """请从 JD 中提取“匹配词与岗位要求”草案，输出 JSON：
+{{
+  "keywords_text": "每行一个关键词，5-12个",
+  "requirements_text": "一段简洁岗位要求描述",
+  "position_filter": "职位栏收口词"
+}}
+
+要求：
+1. 只提取寻访真正需要的关键技能、行业、业务、产品、客户或场景背景。
+2. 不输出评分权重。
+3. 不拆复杂硬性/软性结构。
+4. 不要把 JD 里的所有词都搬出来。
+5. requirements_text 要短、清楚、方便人类编辑确认。
+
+【JD】
+{jd}
+
+【补充说明】
+{notes}
+""".format(jd=jd_text or "", notes=user_notes or "")

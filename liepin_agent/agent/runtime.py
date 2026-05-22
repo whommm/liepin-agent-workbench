@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from concurrent.futures import Future
@@ -24,6 +25,9 @@ from ..storage.sqlite_store import SQLiteStore
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
 from .brain import LLMAgentBrain
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRuntime:
@@ -726,6 +730,29 @@ class AgentRuntime:
             self.store.update_candidate_status(
                 candidate_id, CandidateStatus.MATCH_QUEUED.value
             )
+            # 匹配并发控制：未完成的匹配任务不超过10个，超出的放进下一批次
+            active_count = sum(1 for f in futures if not f.done())
+            if active_count >= 10:
+                logger.info(
+                    "_fetch_and_match_candidates: throttling match submission, "
+                    "active=%s, total_queued=%s, waiting for slot",
+                    active_count,
+                    len(futures),
+                )
+                self._event(
+                    session_id,
+                    round_id,
+                    AgentEventType.MATCH_RESULT.value,
+                    "匹配批次控制",
+                    "当前有 {} 个匹配任务在进行中，等待空位后再提交下一批。".format(
+                        active_count
+                    ),
+                    {"active_matches": active_count, "total_queued": len(futures)},
+                )
+            while active_count >= 10:
+                self._respect_control_flags(session_id, cancel_event, pause_event)
+                time.sleep(0.3)
+                active_count = sum(1 for f in futures if not f.done())
             future = self.match_queue.submit(
                 self._match_and_persist,
                 session_id,
@@ -750,10 +777,20 @@ class AgentRuntime:
         cancel_event: Optional[threading.Event] = None,
         pause_event: Optional[threading.Event] = None,
     ) -> MatchResult:
+        logger.info(
+            "_match_and_persist START: session=%s round=%s candidate=%s thread=%s",
+            session_id,
+            round_id,
+            candidate_id,
+            threading.current_thread().name,
+        )
         if not self._session_allows_background_write(session_id):
+            logger.warning("_match_and_persist: session %s cancelled, aborting", session_id)
             raise RuntimeError("任务已取消，跳过后台匹配写入")
         self.store.update_candidate_status(candidate_id, CandidateStatus.MATCHING.value)
+        match_started = time.monotonic()
         try:
+            logger.info("_match_and_persist: calling match_candidate for %s", candidate_id)
             result = self.matcher.match_candidate(
                 session_id=session_id,
                 round_id=round_id,
@@ -761,7 +798,19 @@ class AgentRuntime:
                 resume_text=resume_text,
                 criteria=criteria,
             )
+            logger.info(
+                "_match_and_persist: match_candidate OK for %s in %.1fs tier=%s",
+                candidate_id,
+                time.monotonic() - match_started,
+                result.tier,
+            )
         except Exception as exc:
+            logger.exception(
+                "_match_and_persist: match_candidate FAILED for %s after %.1fs: %s",
+                candidate_id,
+                time.monotonic() - match_started,
+                exc,
+            )
             if not self._session_allows_background_write(session_id):
                 raise
             result = MatchResult(
@@ -779,6 +828,7 @@ class AgentRuntime:
                 questions_to_verify=["请人工复核该候选人与岗位要求的匹配度"],
                 confidence="low",
             )
+            logger.info("_match_and_persist: saving failed match result for %s", candidate_id)
             self.store.save_match_result(result)
             self._refresh_round_match_metrics(session_id, round_id)
             self._event(
@@ -790,9 +840,12 @@ class AgentRuntime:
                 {"candidate_id": candidate_id},
             )
             self._notify(session_id)
+            logger.info("_match_and_persist DONE (failed): %s", candidate_id)
             return result
         if not self._session_allows_background_write(session_id):
+            logger.warning("_match_and_persist: session %s cancelled after match, aborting save", session_id)
             raise RuntimeError("任务已取消，跳过后台匹配写入")
+        logger.info("_match_and_persist: saving match result for %s tier=%s", candidate_id, result.tier)
         self.store.save_match_result(result)
         self._refresh_round_match_metrics(session_id, round_id)
         self._event(
@@ -808,6 +861,7 @@ class AgentRuntime:
             },
         )
         self._notify(session_id)
+        logger.info("_match_and_persist DONE (success): %s", candidate_id)
         return result
 
     def _wait_for_policy(
@@ -821,8 +875,10 @@ class AgentRuntime:
     ) -> None:
         mode = str((policy or {}).get("mode") or "no_wait")
         if not futures:
+            logger.info("_wait_for_policy: no futures to wait for")
             return
         if mode == "no_wait":
+            logger.info("_wait_for_policy: mode=no_wait, %s futures queued", len(futures))
             self._event(
                 session_id,
                 round_id,
@@ -839,9 +895,21 @@ class AgentRuntime:
         else:
             mode = "wait_all"
             min_results = len(futures)
+        logger.info(
+            "_wait_for_policy: mode=%s min_results=%s timeout=%ss futures=%s",
+            mode,
+            min_results,
+            timeout_seconds,
+            len(futures),
+        )
         deadline = time.time() + max(1, timeout_seconds)
+        report_interval = 5.0
+        last_report = time.time()
+        loop_count = 0
         while time.time() < deadline:
+            loop_count += 1
             if cancel_event.is_set():
+                logger.warning("_wait_for_policy: cancel_event set, cancelling futures")
                 for future in futures:
                     if not future.done():
                         future.cancel()
@@ -849,9 +917,25 @@ class AgentRuntime:
             self._respect_control_flags(session_id, cancel_event, pause_event)
             completed = sum(1 for item in futures if item.done())
             if completed >= min_results or completed >= len(futures):
+                logger.info("_wait_for_policy: target reached %s/%s", completed, len(futures))
                 break
+            if time.time() - last_report >= report_interval:
+                logger.info(
+                    "_wait_for_policy: waiting %s/%s done (%.0fs left, %s loops)",
+                    completed,
+                    len(futures),
+                    deadline - time.time(),
+                    loop_count,
+                )
+                last_report = time.time()
             time.sleep(0.2)
         completed = sum(1 for item in futures if item.done())
+        logger.info(
+            "_wait_for_policy: finished %s/%s completed after %s loops",
+            completed,
+            len(futures),
+            loop_count,
+        )
         self._event(
             session_id,
             round_id,
