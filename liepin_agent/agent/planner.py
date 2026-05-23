@@ -8,45 +8,48 @@ from typing import Dict, List
 from ..domain.models import SearchPlan
 
 
-CITY_NAMES = ["北京", "上海", "深圳", "广州", "杭州", "成都", "苏州", "南京", "武汉", "东莞", "惠州"]
-# POSITION_HINTS ordered by specificity (more specific first) to reduce false positives.
-POSITION_HINTS = [
-    "电机", "算法", "结构", "研发", "设计", "运营", "销售", "市场", "财务", "人力", "产品",
-    "车间主任", "生产经理", "生产厂长", "制造经理", "生产主管", "工艺", "质量", "设备",
-]
-DOMAIN_TERMS = [
-    "文创",
-    "潮玩",
-    "IP衍生品",
-    "玩具",
-    "3D打印",
-    "供应链",
-    "量产",
-    "推荐系统",
-    "搜索排序",
-    "算法",
-    "大模型",
-    "结构设计",
-    "照明",
-    "灯具",
-    "跨境",
-    "SaaS",
-    "增长",
-    "商业化",
-    "无刷电机",
-    "电机",
-    "轨道交通",
-    "天然气",
-    "小家电",
-    "水泵",
-    "压缩机",
-    "制冷",
-    "LNG",
-    "BOG",
-    "销售总监",
-    "销售经理",
-    "研发经理",
-]
+import json
+from pathlib import Path
+
+
+def _load_terms():
+    """Load planner term lists from JSON so users can edit them without touching code."""
+    default = {
+        "city_names": [
+            "北京", "上海", "深圳", "广州", "杭州", "成都", "苏州", "南京", "武汉",
+            "东莞", "惠州", "西安", "长沙", "重庆", "天津", "宁波", "青岛", "厦门",
+            "无锡", "佛山", "福州", "济南", "合肥", "昆明", "郑州", "大连",
+        ],
+        "position_hints": [
+            "电机", "算法", "结构", "研发", "设计", "运营", "销售", "市场", "财务", "人力", "产品",
+            "车间主任", "生产经理", "生产厂长", "制造经理", "生产主管", "工艺", "质量", "设备",
+        ],
+        "domain_terms": [
+            "文创", "潮玩", "IP衍生品", "玩具", "3D打印", "供应链", "量产",
+            "推荐系统", "搜索排序", "算法", "大模型", "结构设计", "照明", "灯具",
+            "跨境", "SaaS", "增长", "商业化", "无刷电机", "电机", "轨道交通",
+            "天然气", "小家电", "水泵", "压缩机", "制冷", "LNG", "BOG",
+            "销售总监", "销售经理", "研发经理",
+        ],
+    }
+    try:
+        path = Path(__file__).with_name("config") / "planner_terms.json"
+        if not path.exists():
+            path = Path(__file__).parent.parent / "config" / "planner_terms.json"
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return (
+                data.get("city_names") or default["city_names"],
+                data.get("position_hints") or default["position_hints"],
+                data.get("domain_terms") or default["domain_terms"],
+            )
+    except Exception:
+        pass
+    return default["city_names"], default["position_hints"], default["domain_terms"]
+
+
+CITY_NAMES, POSITION_HINTS, DOMAIN_TERMS = _load_terms()
 
 
 class Planner:
@@ -88,7 +91,7 @@ class Planner:
             query = position_filter or "产品"
         filters = {
             "city": self.extract_city_scope(text),
-            "active_days": 7,
+            "active_days": 30,
         }
         # 工作年限和学历不自动填入搜索筛选，避免过滤掉潜在候选人，
         # 由后续匹配模型根据简历内容判断。

@@ -1,0 +1,92 @@
+{
+  "_comment": "猎聘页面 CSS Selector 配置。页面改版时只需改这里，不用动代码。",
+  "greeting_button": [
+    "button:has-text(\"立即沟通\")",
+    "button:has-text(\"打招呼\")",
+    "button:has-text(\"在线沟通\")",
+    ".chat-btn",
+    "button.chat-btn",
+    "[role=\"button\"]:has-text(\"立即沟通\")",
+    "[role=\"button\"]:has-text(\"打招呼\")",
+    "a:has-text(\"立即沟通\")",
+    "a:has-text(\"打招呼\")"
+  ],
+  "continue_chat_button": [
+    "button:has-text(\"继续沟通\")",
+    "button:has-text(\"继续聊聊\")",
+    ".chat-btn",
+    "button.chat-btn",
+    "a:has-text(\"继续沟通\")",
+    "[role=\"button\"]:has-text(\"继续沟通\")"
+  ],
+  "gold_collar": [
+    ".name-box .elite-tag-gold",
+    ".elite-tag-gold",
+    "[class*=\"elite-tag-gold\"]",
+    ".name-box [class*=\"gold\"]",
+    "[class*=\"gold\"]:has-text(\"金领\")"
+  ],
+  "page_ready": [
+    ".name-box",
+    ".elite-tag-gold",
+    "button:has-text(\"立即沟通\")",
+    "button:has-text(\"打招呼\")",
+    "button:has-text(\"继续沟通\")",
+    ".chat-btn",
+    "button.chat-btn",
+    "[role=\"button\"]:has-text(\"立即沟通\")",
+    "[role=\"button\"]:has-text(\"打招呼\")",
+    "a:has-text(\"立即沟通\")"
+  ],
+  "chat_input": [
+    "textarea[placeholder*=\"请输入文字\"]",
+    "input[placeholder*=\"请输入文字\"]",
+    "[contenteditable=\"true\"]",
+    "[role=\"textbox\"]",
+    "dialog textarea",
+    "dialog input[type=\"text\"]",
+    ".im-ui-chat-input [contenteditable=\"true\"]"
+  ],
+  "send_button": [
+    "button.im-ui-basic-send-btn",
+    ".im-ui-chat-input button:has-text(\"发送\")",
+    "button:has-text(\"发送\")",
+    "button[type=\"submit\"]",
+    "[role=\"button\"]:has-text(\"发送\")",
+    ".im-ui-send-btn",
+    "button:has-text(\"发送消息\")"
+  ],
+  "request_resume": [
+    "span.im-ui-action-button.action-item.action-resume",
+    "[class*=\"action-resume\"]",
+    "button:has-text(\"索要简历\")",
+    "span:has-text(\"索要简历\")",
+    "[class*=\"resume\"]:has-text(\"索要\")",
+    "button:has-text(\"要简历\")"
+  ],
+  "confirm_button": [
+    ".ant-im-modal-confirm-btns button.ant-im-btn-primary",
+    ".ant-modal-confirm-btns button.ant-btn-primary",
+    ".ant-modal button.ant-btn-primary",
+    "button:has-text(\"确认\")",
+    "button:has-text(\"确定\")",
+    ".ant-btn-primary"
+  ],
+  "close_dialog": [
+    "button[class*=\"close\"]",
+    "button[aria-label=\"Close\"]",
+    ".ant-modal-close",
+    "[class*='close-btn']",
+    "button:has-text(\"关闭\")",
+    "button:has-text(\"取消\")"
+  ],
+  "select_job_dropdown": [
+    ".ant-select:has-text(\"选择职位\")",
+    "[class*=\"select\"]:has-text(\"选择职位\")",
+    "input[placeholder*=\"选择职位\"]"
+  ],
+  "select_job_option": [
+    ".ant-select-item",
+    "[role=\"option\"]"
+  ]
+}

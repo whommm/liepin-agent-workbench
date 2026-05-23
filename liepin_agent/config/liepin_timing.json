@@ -1,0 +1,11 @@
+{
+  "_comment": "猎聘浏览器自动化延时配置。网络慢时适当增大，网络快时适当减小。",
+  "detail_page_wait": 0.6,
+  "greeting_page_wait": 1.5,
+  "js_navigation_wait": 2.5,
+  "poll_interval": 0.25,
+  "click_settle": 1.0,
+  "dialog_settle": 0.8,
+  "short_settle": 0.2,
+  "typing_delay": 0.2
+}

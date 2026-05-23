@@ -29,8 +29,6 @@ class TimeoutError(LLMClientError):
 
 
 class LLMClient:
-    MAX_RETRIES = 2
-
     def __init__(
         self,
         api_base_url: str,
@@ -38,12 +36,18 @@ class LLMClient:
         model_name: str,
         timeout: int = 300,
         provider: str = "openai",
+        max_retries: int = 2,
+        max_tokens: int = 4096,
+        temperature: float = 0.2,
     ):
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.model_name = model_name or "deepseek-chat"
         self.timeout = int(timeout or 300)
         self.provider = (provider or "openai").lower()
+        self.max_retries = max(0, int(max_retries))
+        self.max_tokens = max(1, int(max_tokens))
+        self.temperature = float(temperature)
         self._client: Optional[OpenAI] = None
         self._anthropic_client = None
 
@@ -169,13 +173,13 @@ class LLMClient:
         client = self._get_anthropic_client()
         kwargs = {
             "model": self.model_name,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
             "messages": [{"role": "user", "content": prompt}],
         }
         if system_message:
             kwargs["system"] = system_message
         if not self._is_reasoning_model:
-            kwargs["temperature"] = 0.2
+            kwargs["temperature"] = self.temperature
         logger.debug("_chat_once_anthropic: calling create with model=%s", self.model_name)
         started = time.monotonic()
         response = client.messages.create(**kwargs)
@@ -191,7 +195,7 @@ class LLMClient:
 
     def _execute_with_retry(self, func, *args, **kwargs):
         last_error = None
-        for attempt in range(self.MAX_RETRIES + 1):
+        for attempt in range(self.max_retries + 1):
             logger.debug(
                 "_execute_with_retry: attempt=%s/%s func=%s",
                 attempt + 1,

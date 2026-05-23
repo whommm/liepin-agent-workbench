@@ -1,0 +1,9 @@
+请根据以下岗位信息，生成一段猎头打招呼文本：
+
+岗位名称：{job_title}
+工作城市：{city}
+岗位描述：{job_description}
+{salary_line}
+生成要求：{style_hint}
+
+请生成：

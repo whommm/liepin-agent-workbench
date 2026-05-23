@@ -50,7 +50,11 @@ class AgentRuntime:
         self.store = store
         self.event_bus = event_bus or EventBus()
         self.browser_queue = browser_queue or BrowserQueue()
-        self.match_queue = match_queue or MatchQueue(max_workers=3)
+        self.match_queue = match_queue or MatchQueue(
+            max_workers=getattr(self.store, "config", None)
+            and getattr(self.store.config, "match_queue_workers", 3)
+            or 3
+        )
         self.liepin_tool = liepin_tool or RealLiepinTool()
         self.matcher = matcher or RealMatchService.from_config()
         self.brain = agent_brain or LLMAgentBrain.from_config()
@@ -209,6 +213,7 @@ class AgentRuntime:
             max_detail_fetches = int(session.get("max_detail_fetches") or 999)
             target_ab_count = int(session.get("target_ab_count") or 999)
             max_runtime_minutes = int(session.get("max_runtime_minutes") or 0)
+            low_yield_threshold = 2
             run_mode = str(session.get("mode") or "自动")
 
             start_round_index = len(existing_rounds) + 1
@@ -244,6 +249,7 @@ class AgentRuntime:
                     consecutive_low_yield_rounds=consecutive_low_yield_rounds,
                     elapsed_minutes=(time.monotonic() - started_monotonic) / 60,
                     max_runtime_minutes=max_runtime_minutes,
+                    low_yield_threshold=low_yield_threshold,
                 )
                 if stop.should_stop:
                     self._event(
@@ -481,6 +487,7 @@ class AgentRuntime:
                     consecutive_low_yield_rounds=consecutive_low_yield_rounds,
                     elapsed_minutes=(time.monotonic() - started_monotonic) / 60,
                     max_runtime_minutes=max_runtime_minutes,
+                    low_yield_threshold=low_yield_threshold,
                 )
                 self._event(
                     session_id,
@@ -730,9 +737,10 @@ class AgentRuntime:
             self.store.update_candidate_status(
                 candidate_id, CandidateStatus.MATCH_QUEUED.value
             )
-            # 匹配并发控制：未完成的匹配任务不超过10个，超出的放进下一批次
+            # 匹配并发控制：未完成的匹配任务不超过阈值，超出的放进下一批次
+            concurrency_limit = 10
             active_count = sum(1 for f in futures if not f.done())
-            if active_count >= 10:
+            if active_count >= concurrency_limit:
                 logger.info(
                     "_fetch_and_match_candidates: throttling match submission, "
                     "active=%s, total_queued=%s, waiting for slot",
@@ -749,7 +757,7 @@ class AgentRuntime:
                     ),
                     {"active_matches": active_count, "total_queued": len(futures)},
                 )
-            while active_count >= 10:
+            while active_count >= concurrency_limit:
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 time.sleep(0.3)
                 active_count = sum(1 for f in futures if not f.done())

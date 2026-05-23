@@ -72,7 +72,7 @@ class ExcelGreetingService:
                         name=cls._cell_text(sheet, row_index, headers, "姓名") or "候选人",
                         profile_url=profile_url,
                         tier=tier,
-                        is_gold_collar=True,
+                        is_gold_collar=cls._is_yes(cls._cell_text(sheet, row_index, headers, "金领")),
                         greeting_status=greeting_status,
                         contact_text=contact_text,
                         current_company=cls._cell_text(sheet, row_index, headers, "公司"),
@@ -122,7 +122,7 @@ class ExcelGreetingService:
                 "profile_url": candidate.profile_url,
                 "current_company": candidate.current_company,
                 "current_title": candidate.current_title,
-                "is_gold_collar": True,
+                "is_gold_collar": candidate.is_gold_collar,
                 "skip_gold_check": not verify_gold_on_page,
             }
             try:

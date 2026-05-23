@@ -7,6 +7,7 @@ import re
 from typing import List
 
 from ..core.config import ConfigManager
+from ..prompts.loader import get_prompt_loader
 from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
@@ -17,22 +18,10 @@ class GreetingTextGenerationService:
         "您好，我是猎头顾问，目前有个base{city}的{job_title}机会，"
         "{job_summary}，薪资可谈，方便的话能发一份您的简历看看吗？"
     )
-    SYSTEM_PROMPT = """你是一个资深猎头顾问，擅长撰写简洁专业的候选人打招呼消息。
-
-要求：
-1. 开头固定格式："您好，我是猎头顾问，目前有个base{city}的{job_title}机会，"
-2. 中间用1-2句话简洁介绍岗位核心亮点，不要罗列职责
-3. 薪资统一写"薪资可谈"，不要出现具体数字或范围
-4. 结尾固定："方便的话能发一份您的简历看看吗？"
-5. 总字数控制在60-100字
-6. 语气专业、友好、有吸引力，像真人猎头写的
-7. 不要出现公司名称，除非用户特别说明
-8. 不要出现"根据您的简历"等个性化表述，因为这是首次联系
-
-只输出打招呼文本，不要解释，不要加引号。"""
 
     def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client
+        self._prompt_loader = get_prompt_loader()
 
     @classmethod
     def from_config(cls, config_manager: ConfigManager | None = None):
@@ -59,7 +48,9 @@ class GreetingTextGenerationService:
         city = self._extract_prefecture_city(city)
         prompt = self._build_prompt(job_title, city, job_description, salary_range, style)
         try:
-            raw_text = self.llm_client.chat(prompt, system_message=self.SYSTEM_PROMPT)
+            raw_text = self.llm_client.chat(
+                prompt, system_message=self._prompt_loader.get("greeting_system_prompt")
+            )
             return self._post_process(raw_text, job_title, city)
         except Exception as exc:
             logger.warning("greeting text generation fallback: %s", exc)
@@ -99,8 +90,8 @@ class GreetingTextGenerationService:
             results.append(fallback)
         return results[:count]
 
-    @staticmethod
     def _build_prompt(
+        self,
         job_title: str,
         city: str,
         job_description: str,
@@ -114,22 +105,17 @@ class GreetingTextGenerationService:
             "company": "突出公司优势和团队氛围",
             "balance": "强调工作生活平衡和福利待遇",
         }
-        prompt = """请根据以下岗位信息，生成一段猎头打招呼文本：
-
-岗位名称：{job_title}
-工作城市：{city}
-岗位描述：{job_description}
-""".format(
+        salary_line = ""
+        if salary_range:
+            salary_line = "薪资范围：{}（注意：输出时请替换为薪资可谈）\n".format(salary_range)
+        return self._prompt_loader.get(
+            "greeting_user_prompt",
             job_title=job_title or "目标岗位",
             city=city or "该城市",
             job_description=(job_description or "")[:500],
+            salary_line=salary_line,
+            style_hint=style_hints.get(style, style_hints["general"]),
         )
-        if salary_range:
-            prompt += "薪资范围：{}（注意：输出时请替换为薪资可谈）\n".format(salary_range)
-        prompt += "\n生成要求：{}\n\n请生成：".format(
-            style_hints.get(style, style_hints["general"])
-        )
-        return prompt
 
     def _post_process(self, text: str, job_title: str, city: str) -> str:
         text = (text or "").strip().strip('"\'')

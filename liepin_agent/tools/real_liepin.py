@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -18,6 +20,22 @@ from ..domain.models import CandidateDetail, CandidateSummary, SearchPlan
 logger = logging.getLogger(__name__)
 
 
+def _load_json_config(name: str) -> Dict[str, object]:
+    """Load a JSON config file from liepin_agent/config/ with built-in fallback."""
+    paths = [
+        Path(__file__).with_name("config") / name,
+        Path(__file__).parent.parent / "config" / name,
+    ]
+    for path in paths:
+        if path.exists():
+            try:
+                with path.open("r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                continue
+    return {}
+
+
 class RealLiepinTool:
     """Adapter that exposes real Liepin browser automation to AgentRuntime."""
 
@@ -26,6 +44,7 @@ class RealLiepinTool:
         self.browser_manager = LiepinBrowserManager(self.config_manager)
         self.search_service = LiepinSearchService(self.browser_manager)
         self.resume_extractor = LiepinResumeExtractor()
+        self._load_page_configs()
 
     def open_browser(self):
         self.browser_manager.launch()
@@ -93,7 +112,7 @@ class RealLiepinTool:
         def _extract(page):
             detail_page = self.search_service.open_candidate_detail(page, summary)
             try:
-                time.sleep(0.6)
+                time.sleep(self.timing_detail_page_wait)
                 extracted = self.resume_extractor.extract_candidate(detail_page, summary)
                 is_gold_collar = self._is_gold_collar_detail_page(detail_page)
                 return extracted, is_gold_collar
@@ -154,7 +173,7 @@ class RealLiepinTool:
                     )
                     return {
                         "status": "skipped",
-                        "message": "非金领候选人，跳过打招呼",
+                        "message": self.STATUS_SKIPPED_TEXT,
                         "error": "",
                     }
                 body_text = self._safe_body_text(detail_page)
@@ -165,7 +184,7 @@ class RealLiepinTool:
                     )
                     return {
                         "status": "already_greeted",
-                        "message": "已打过招呼",
+                        "message": self.STATUS_ALREADY_TEXT,
                         "error": "",
                     }
                 if not self._click_greeting_button(detail_page):
@@ -176,7 +195,7 @@ class RealLiepinTool:
                         )
                         return {
                             "status": "already_greeted",
-                            "message": "已打过招呼",
+                            "message": self.STATUS_ALREADY_TEXT,
                             "error": "",
                         }
                     logger.warning(
@@ -184,7 +203,7 @@ class RealLiepinTool:
                         summary.name or candidate.get("id") or "候选人",
                         body_text[:200].replace("\n", " "),
                     )
-                    return {"status": "failed", "message": "", "error": "未找到沟通按钮"}
+                    return {"status": "failed", "message": "", "error": self.ERROR_NO_BUTTON_TEXT}
                 if self._handle_greeting_dialog(detail_page, message):
                     request_resume_status = ""
                     if request_resume:
@@ -205,25 +224,100 @@ class RealLiepinTool:
                     "manual_greeting: dialog handling failed name=%s",
                     summary.name or candidate.get("id") or "候选人",
                 )
-                return {"status": "failed", "message": "", "error": "打招呼弹窗处理失败"}
+                return {"status": "failed", "message": "", "error": self.ERROR_DIALOG_TEXT}
             finally:
                 self._close_any_dialog(detail_page)
                 self.search_service.close_detail_page(detail_page, page)
 
         return self.browser_manager.run_with_page(_run)
 
-    GREETING_BUTTON_SELECTORS = [
-        'button:has-text("立即沟通")',
-        'button:has-text("打招呼")',
-        'button:has-text("在线沟通")',
-        '.chat-btn',
-        'button.chat-btn',
-        '[role="button"]:has-text("立即沟通")',
-        '[role="button"]:has-text("打招呼")',
-        'a:has-text("立即沟通")',
-        'a:has-text("打招呼")',
-    ]
-    ALREADY_GREETED_MARKERS = ["已沟通", "已打招呼", "继续沟通", "继续聊聊"]
+    def _load_page_configs(self) -> None:
+        """Load selectors and text markers from JSON so users can adapt to page changes."""
+        selectors = _load_json_config("liepin_selectors.json")
+        markers = _load_json_config("liepin_markers.json")
+
+        self.GREETING_BUTTON_SELECTORS = selectors.get("greeting_button", [
+            'button:has-text("立即沟通")', 'button:has-text("打招呼")',
+            'button:has-text("在线沟通")', '.chat-btn', 'button.chat-btn',
+            '[role="button"]:has-text("立即沟通")', '[role="button"]:has-text("打招呼")',
+            'a:has-text("立即沟通")', 'a:has-text("打招呼")',
+        ])
+        self.CONTINUE_CHAT_SELECTORS = selectors.get("continue_chat_button", [
+            'button:has-text("继续沟通")', 'button:has-text("继续聊聊")',
+            '.chat-btn', 'button.chat-btn', 'a:has-text("继续沟通")',
+            '[role="button"]:has-text("继续沟通")',
+        ])
+        self.GOLD_COLLAR_SELECTORS = selectors.get("gold_collar", [
+            ".name-box .elite-tag-gold", ".elite-tag-gold",
+            '[class*="elite-tag-gold"]', '.name-box [class*="gold"]',
+            '[class*="gold"]:has-text("金领")',
+        ])
+        self.PAGE_READY_SELECTORS = selectors.get("page_ready", [
+            ".name-box", ".elite-tag-gold",
+            'button:has-text("立即沟通")', 'button:has-text("打招呼")',
+            'button:has-text("继续沟通")', '.chat-btn', 'button.chat-btn',
+            '[role="button"]:has-text("立即沟通")', '[role="button"]:has-text("打招呼")',
+            'a:has-text("立即沟通")',
+        ])
+        self.CHAT_INPUT_SELECTORS = selectors.get("chat_input", [
+            'textarea[placeholder*="请输入文字"]', 'input[placeholder*="请输入文字"]',
+            '[contenteditable="true"]', '[role="textbox"]',
+            'dialog textarea', 'dialog input[type="text"]',
+            '.im-ui-chat-input [contenteditable="true"]',
+        ])
+        self.SEND_BUTTON_SELECTORS = selectors.get("send_button", [
+            'button.im-ui-basic-send-btn', '.im-ui-chat-input button:has-text("发送")',
+            'button:has-text("发送")', 'button[type="submit"]',
+            '[role="button"]:has-text("发送")', '.im-ui-send-btn',
+            'button:has-text("发送消息")',
+        ])
+        self.REQUEST_RESUME_SELECTORS = selectors.get("request_resume", [
+            'span.im-ui-action-button.action-item.action-resume',
+            '[class*="action-resume"]', 'button:has-text("索要简历")',
+            'span:has-text("索要简历")', '[class*="resume"]:has-text("索要")',
+            'button:has-text("要简历")',
+        ])
+        self.CONFIRM_BUTTON_SELECTORS = selectors.get("confirm_button", [
+            '.ant-im-modal-confirm-btns button.ant-im-btn-primary',
+            '.ant-modal-confirm-btns button.ant-btn-primary',
+            '.ant-modal button.ant-btn-primary', 'button:has-text("确认")',
+            'button:has-text("确定")', '.ant-btn-primary',
+        ])
+        self.CLOSE_DIALOG_SELECTORS = selectors.get("close_dialog", [
+            'button[class*="close"]', 'button[aria-label="Close"]',
+            '.ant-modal-close', "[class*='close-btn']",
+            'button:has-text("关闭")', 'button:has-text("取消")',
+        ])
+        self.SELECT_JOB_DROPDOWN_SELECTORS = selectors.get("select_job_dropdown", [
+            '.ant-select:has-text("选择职位")', '[class*="select"]:has-text("选择职位")',
+            'input[placeholder*="选择职位"]',
+        ])
+        self.SELECT_JOB_OPTION_SELECTORS = selectors.get("select_job_option", [
+            '.ant-select-item', '[role="option"]',
+        ])
+
+        self.ALREADY_GREETED_MARKERS = markers.get("already_greeted", ["已沟通", "已打招呼", "继续沟通", "继续聊聊"])
+        self.GOLD_COLLAR_TEXT_MARKERS = markers.get("gold_collar_text", ["金领人才", "金领简历"])
+        self.NO_JOB_CHAT_TEXT = markers.get("no_job_chat", "不选择职位开聊")
+        self.REQUEST_RESUME_TEXT = markers.get("request_resume", "索要简历")
+        self.CONFIRM_TEXT = markers.get("confirm", "确认")
+        self.CONFIRM_ALT_TEXT = markers.get("confirm_alt", "确定")
+        self.STATUS_SKIPPED_TEXT = markers.get("status_skipped", "非金领候选人，跳过打招呼")
+        self.STATUS_ALREADY_TEXT = markers.get("status_already", "已打过招呼")
+        self.ERROR_NO_BUTTON_TEXT = markers.get("error_no_button", "未找到沟通按钮")
+        self.ERROR_DIALOG_TEXT = markers.get("error_dialog", "打招呼弹窗处理失败")
+        self.ERROR_RESUME_BUTTON_TEXT = markers.get("error_resume_button", "未找到索要简历按钮")
+        self.ERROR_CONFIRM_BUTTON_TEXT = markers.get("error_confirm_button", "未找到确认按钮")
+
+        timing = _load_json_config("liepin_timing.json")
+        self.timing_detail_page_wait = timing.get("detail_page_wait", 0.6)
+        self.timing_greeting_page_wait = timing.get("greeting_page_wait", 1.5)
+        self.timing_js_navigation_wait = timing.get("js_navigation_wait", 2.5)
+        self.timing_poll_interval = timing.get("poll_interval", 0.25)
+        self.timing_click_settle = timing.get("click_settle", 1.0)
+        self.timing_dialog_settle = timing.get("dialog_settle", 0.8)
+        self.timing_short_settle = timing.get("short_settle", 0.2)
+        self.timing_typing_delay = timing.get("typing_delay", 0.2)
 
     def _open_greeting_detail_page(self, page, summary: LiepinSearchCandidate):
         try:
@@ -234,37 +328,23 @@ class RealLiepinTool:
             summary.profile_url = page.url or summary.profile_url
             return page
 
-    @staticmethod
-    def _wait_for_greeting_page_ready(page, timeout_ms: int = 15000) -> None:
+    def _wait_for_greeting_page_ready(self, page, timeout_ms: int = 15000) -> None:
         try:
             page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
         except Exception:
             pass
         deadline = time.time() + max(1, timeout_ms / 1000)
-        ready_selectors = (
-            ".name-box",
-            ".elite-tag-gold",
-            'button:has-text("立即沟通")',
-            'button:has-text("打招呼")',
-            'button:has-text("继续沟通")',
-            '.chat-btn',
-            'button.chat-btn',
-            '[role="button"]:has-text("立即沟通")',
-            '[role="button"]:has-text("打招呼")',
-            'a:has-text("立即沟通")',
-        )
         while time.time() < deadline:
-            for selector in ready_selectors:
+            for selector in self.PAGE_READY_SELECTORS:
                 try:
                     locator = page.locator(selector)
                     if locator.count() > 0 and locator.first.is_visible(timeout=500):
                         return
                 except Exception:
                     continue
-            time.sleep(0.25)
+            time.sleep(self.timing_poll_interval)
 
-    @staticmethod
-    def _navigate_to_profile(page, url: str) -> bool:
+    def _navigate_to_profile(self, page, url: str) -> bool:
         profile_url = RealLiepinTool._ensure_absolute_url(url)
         if not profile_url:
             return False
@@ -274,40 +354,33 @@ class RealLiepinTool:
         ):
             try:
                 page.goto(profile_url, wait_until=wait_until, timeout=timeout)
-                time.sleep(1.5)
+                time.sleep(self.timing_greeting_page_wait)
                 if RealLiepinTool._looks_like_detail_url(page.url or profile_url):
                     return True
             except Exception:
                 pass
         try:
             page.evaluate("(url) => { window.location.href = url; }", profile_url)
-            time.sleep(2.5)
+            time.sleep(self.timing_js_navigation_wait)
             return RealLiepinTool._looks_like_detail_url(page.url or profile_url)
         except Exception:
             return False
 
-    @staticmethod
-    def _is_gold_collar_detail_page(page, wait_seconds: float = 0.0) -> bool:
+    def _is_gold_collar_detail_page(self, page, wait_seconds: float = 0.0) -> bool:
         deadline = time.time() + max(0.0, wait_seconds)
         while True:
-            for selector in (
-                ".name-box .elite-tag-gold",
-                ".elite-tag-gold",
-                '[class*="elite-tag-gold"]',
-                '.name-box [class*="gold"]',
-                '[class*="gold"]:has-text("金领")',
-            ):
+            for selector in self.GOLD_COLLAR_SELECTORS:
                 try:
                     if page.locator(selector).count() > 0:
                         return True
                 except Exception:
                     continue
             body_text = RealLiepinTool._safe_body_text(page)
-            if "金领人才" in body_text or "金领简历" in body_text:
+            if any(marker in body_text for marker in self.GOLD_COLLAR_TEXT_MARKERS):
                 return True
             if time.time() >= deadline:
                 return False
-            time.sleep(0.25)
+            time.sleep(self.timing_poll_interval)
 
     @staticmethod
     def _safe_body_text(page) -> str:
@@ -326,22 +399,14 @@ class RealLiepinTool:
                 if locator.count() > 0 and locator.first.is_visible(timeout=2000):
                     locator.first.click(force=True)
                     logger.warning("manual_greeting: clicked greeting button selector=%s", selector)
-                    time.sleep(1.0)
+                    time.sleep(self.timing_click_settle)
                     return True
             except Exception:
                 continue
         return False
 
-    @staticmethod
-    def _has_continue_chat_button(page) -> bool:
-        for selector in (
-            'button:has-text("继续沟通")',
-            'button:has-text("继续聊聊")',
-            '.chat-btn',
-            'button.chat-btn',
-            'a:has-text("继续沟通")',
-            '[role="button"]:has-text("继续沟通")',
-        ):
+    def _has_continue_chat_button(self, page) -> bool:
+        for selector in self.CONTINUE_CHAT_SELECTORS:
             try:
                 locator = page.locator(selector)
                 if locator.count() > 0 and locator.first.is_visible(timeout=2000):
@@ -351,14 +416,14 @@ class RealLiepinTool:
         return False
 
     def _handle_greeting_dialog(self, page, message_template: str) -> bool:
-        time.sleep(1.5)
+        time.sleep(self.timing_greeting_page_wait)
         clicked_no_job = False
         try:
-            no_job_btn = page.locator('button:has-text("不选择职位开聊")')
+            no_job_btn = page.locator(f'button:has-text("{self.NO_JOB_CHAT_TEXT}")')
             if no_job_btn.count() > 0 and no_job_btn.first.is_visible(timeout=2000):
                 no_job_btn.first.click()
                 clicked_no_job = True
-                time.sleep(1.5)
+                time.sleep(self.timing_greeting_page_wait)
         except Exception:
             pass
         if not clicked_no_job:
@@ -367,41 +432,28 @@ class RealLiepinTool:
             return self._send_chat_message(page, message_template)
         return True
 
-    @staticmethod
-    def _select_job_if_needed(page) -> bool:
-        for selector in (
-            '.ant-select:has-text("选择职位")',
-            '[class*="select"]:has-text("选择职位")',
-            'input[placeholder*="选择职位"]',
-        ):
+    def _select_job_if_needed(self, page) -> bool:
+        for selector in self.SELECT_JOB_DROPDOWN_SELECTORS:
             try:
                 dropdown = page.locator(selector)
                 if dropdown.count() <= 0 or not dropdown.first.is_visible(timeout=1000):
                     continue
                 dropdown.first.click()
-                time.sleep(0.8)
-                options = page.locator('.ant-select-item, [role="option"]')
+                time.sleep(self.timing_dialog_settle)
+                options = page.locator(", ".join(self.SELECT_JOB_OPTION_SELECTORS))
                 if options.count() > 0:
                     options.first.click()
-                    time.sleep(0.8)
+                    time.sleep(self.timing_dialog_settle)
                     return True
             except Exception:
                 continue
         return False
 
-    @staticmethod
-    def _request_resume(page) -> str:
+    def _request_resume(self, page) -> str:
         """在已打开的聊天窗口中点击"索要简历"并确认。"""
         try:
             clicked = False
-            for selector in (
-                'span.im-ui-action-button.action-item.action-resume',
-                '[class*="action-resume"]',
-                'button:has-text("索要简历")',
-                'span:has-text("索要简历")',
-                '[class*="resume"]:has-text("索要")',
-                'button:has-text("要简历")',
-            ):
+            for selector in self.REQUEST_RESUME_SELECTORS:
                 try:
                     resume_btn = page.locator(selector)
                     if resume_btn.count() > 0 and resume_btn.first.is_visible(timeout=2000):
@@ -412,18 +464,11 @@ class RealLiepinTool:
                     continue
             if not clicked:
                 logger.warning("request_resume: resume button not found")
-                return "未找到索要简历按钮"
-            time.sleep(1.5)
+                return self.ERROR_RESUME_BUTTON_TEXT
+            time.sleep(self.timing_greeting_page_wait)
 
             confirm_clicked = False
-            for selector in (
-                '.ant-im-modal-confirm-btns button.ant-im-btn-primary',
-                '.ant-modal-confirm-btns button.ant-btn-primary',
-                '.ant-modal button.ant-btn-primary',
-                'button:has-text("确认")',
-                'button:has-text("确定")',
-                '.ant-btn-primary',
-            ):
+            for selector in self.CONFIRM_BUTTON_SELECTORS:
                 try:
                     confirm_btn = page.locator(selector)
                     if confirm_btn.count() > 0 and confirm_btn.first.is_visible(timeout=2000):
@@ -434,28 +479,19 @@ class RealLiepinTool:
                     continue
             if not confirm_clicked:
                 logger.warning("request_resume: confirm button not found")
-                return "未找到确认按钮"
-            time.sleep(1.5)
+                return self.ERROR_CONFIRM_BUTTON_TEXT
+            time.sleep(self.timing_greeting_page_wait)
             logger.warning("request_resume: success")
             return "已发送索要简历"
         except Exception as exc:
             logger.warning("request_resume: failed %s", exc)
             return "索要简历失败: {}".format(exc)
 
-    @staticmethod
-    def _send_chat_message(page, message: str) -> bool:
+    def _send_chat_message(self, page, message: str) -> bool:
         """在聊天弹窗中填写并发送消息，返回是否成功。"""
         if not message:
             return True
-        for selector in (
-            'textarea[placeholder*="请输入文字"]',
-            'input[placeholder*="请输入文字"]',
-            '[contenteditable="true"]',
-            '[role="textbox"]',
-            'dialog textarea',
-            'dialog input[type="text"]',
-            '.im-ui-chat-input [contenteditable="true"]',
-        ):
+        for selector in self.CHAT_INPUT_SELECTORS:
             try:
                 locator = page.locator(selector)
                 for index in range(min(locator.count(), 3)):
@@ -465,32 +501,24 @@ class RealLiepinTool:
                     # contenteditable 用 type 更能触发 input 事件，激活发送按钮
                     if 'contenteditable' in selector:
                         chat_input.click()
-                        time.sleep(0.2)
+                        time.sleep(self.timing_short_settle)
                         chat_input.type(message, delay=10)
                     else:
                         chat_input.fill(message)
-                    time.sleep(0.8)
-                    for send_selector in (
-                        'button.im-ui-basic-send-btn',
-                        '.im-ui-chat-input button:has-text("发送")',
-                        'button:has-text("发送")',
-                        'button[type="submit"]',
-                        '[role="button"]:has-text("发送")',
-                        '.im-ui-send-btn',
-                        'button:has-text("发送消息")',
-                    ):
+                    time.sleep(self.timing_dialog_settle)
+                    for send_selector in self.SEND_BUTTON_SELECTORS:
                         try:
                             send_btn = page.locator(send_selector).first
                             if send_btn.is_visible(timeout=1000) and send_btn.is_enabled():
                                 send_btn.click()
-                                time.sleep(1)
+                                time.sleep(self.timing_click_settle)
                                 return True
                         except Exception:
                             continue
                     # 回退：按 Enter 发送，但验证输入框是否被清空，避免只是换行
                     try:
                         chat_input.press("Enter")
-                        time.sleep(1)
+                        time.sleep(self.timing_click_settle)
                         try:
                             remaining = chat_input.input_value(timeout=500)
                         except Exception:
@@ -505,8 +533,7 @@ class RealLiepinTool:
                 continue
         return False
 
-    @staticmethod
-    def _close_any_dialog(page) -> None:
+    def _close_any_dialog(self, page) -> None:
         """关闭弹窗，但避免隐藏聊天主界面等正常交互元素。"""
         try:
             page.evaluate(
@@ -534,28 +561,21 @@ class RealLiepinTool:
                 }
                 """
             )
-            time.sleep(0.2)
+            time.sleep(self.timing_short_settle)
         except Exception:
             pass
         try:
             page.keyboard.press("Escape")
-            time.sleep(0.2)
+            time.sleep(self.timing_short_settle)
             page.keyboard.press("Escape")
         except Exception:
             pass
-        for selector in (
-            'button[class*="close"]',
-            'button[aria-label="Close"]',
-            ".ant-modal-close",
-            "[class*='close-btn']",
-            'button:has-text("关闭")',
-            'button:has-text("取消")',
-        ):
+        for selector in self.CLOSE_DIALOG_SELECTORS:
             try:
                 locator = page.locator(selector)
                 if locator.count() > 0 and locator.first.is_visible(timeout=300):
                     locator.first.click()
-                    time.sleep(0.2)
+                    time.sleep(self.timing_short_settle)
                     return
             except Exception:
                 continue

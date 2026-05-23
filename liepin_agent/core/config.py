@@ -51,6 +51,34 @@ class AppConfig(BaseModel):
     backend_llm_provider: str = "openai"
     debug_snapshots_enabled: bool = False
 
+    # --- 运行时可调参数（之前硬编码的魔法数字）---
+    # LLM 调用参数
+    llm_max_retries: int = Field(default=2, ge=0, le=10)
+    llm_max_tokens: int = Field(default=4096, ge=1, le=8192)
+    llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+
+    # Agent 运行时参数
+    match_queue_workers: int = Field(default=3, ge=1, le=20)
+    match_concurrency_limit: int = Field(default=10, ge=1, le=50)
+    max_rounds_default: int = Field(default=10, ge=1, le=50)
+    max_detail_fetches_default: int = Field(default=999, ge=1, le=9999)
+    target_ab_count_default: int = Field(default=999, ge=1, le=9999)
+    consecutive_low_yield_threshold: int = Field(default=2, ge=1, le=10)
+    jd_truncate_length: int = Field(default=800, ge=100, le=5000)
+
+    # 浏览器自动化参数
+    browser_task_timeout: int = Field(default=180, ge=30, le=600)
+    detail_page_wait_seconds: float = Field(default=0.6, ge=0.0, le=10.0)
+    greeting_page_wait_seconds: float = Field(default=1.5, ge=0.0, le=10.0)
+
+    # 详情抓取策略参数
+    sample_detail_limit: int = Field(default=10, ge=1, le=50)
+    validate_detail_limit: int = Field(default=20, ge=1, le=50)
+    harvest_detail_limit: int = Field(default=40, ge=1, le=100)
+    sample_detail_min_results: int = Field(default=3, ge=1, le=20)
+    validate_detail_min_results: int = Field(default=8, ge=1, le=20)
+    match_wait_timeout_seconds: int = Field(default=300, ge=30, le=1800)
+
     @field_validator("timeout", mode="before")
     @classmethod
     def _coerce_timeout(cls, v):

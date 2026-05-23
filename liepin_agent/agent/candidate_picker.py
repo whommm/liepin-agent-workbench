@@ -3,13 +3,53 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import List
+from typing import Dict, List
 
 from ..domain.models import CandidateSummary, FetchDecision, Observation
 from ..domain.states import RoundType
 
 
 class CandidatePicker:
+    """Decide whether and which candidate details should be fetched.
+
+    Strategy numbers can be overridden via the ``strategies`` constructor argument
+    so users can tune them without touching code.
+    """
+
+    DEFAULT_STRATEGIES = {
+        RoundType.SAMPLE_DETAIL.value: {
+            "limit": 10,
+            "min_results": 3,
+            "timeout_seconds": 300,
+            "high_confidence": 4,
+            "diversity": 3,
+            "uncertain": 3,
+        },
+        RoundType.VALIDATE_DETAIL.value: {
+            "limit": 20,
+            "min_results": 8,
+            "timeout_seconds": 300,
+            "high_confidence": 12,
+            "diversity": 4,
+            "uncertain": 4,
+        },
+        RoundType.HARVEST_DETAIL.value: {
+            "limit": 40,
+            "min_results": 5,
+            "timeout_seconds": 300,
+            "high_confidence": 30,
+            "diversity": 6,
+            "uncertain": 4,
+        },
+    }
+
+    def __init__(self, strategies: Dict[str, Dict[str, int]] | None = None):
+        self.strategies = dict(self.DEFAULT_STRATEGIES)
+        if strategies:
+            for key, values in strategies.items():
+                if key in self.strategies and isinstance(values, dict):
+                    self.strategies[key].update(values)
+
     def decide(
         self,
         observation: Observation,
@@ -24,19 +64,17 @@ class CandidatePicker:
                 reason=observation.reason,
             )
 
-        # 大幅提高抽取上限，不再让死规则限制 LLM 的抓取决策
+        cfg = self.strategies.get(round_type, self.strategies[RoundType.HARVEST_DETAIL.value])
+        limit = min(cfg["limit"], remaining_detail_budget)
         if round_type == RoundType.SAMPLE_DETAIL.value:
-            limit = min(10, remaining_detail_budget)
-            policy = {"mode": "wait_min_results", "min_results": min(3, limit), "timeout_seconds": 300}
-            strategy = {"high_confidence": 4, "diversity": 3, "uncertain": 3}
+            policy = {"mode": "wait_min_results", "min_results": min(cfg["min_results"], limit), "timeout_seconds": cfg["timeout_seconds"]}
+            strategy = {"high_confidence": cfg["high_confidence"], "diversity": cfg["diversity"], "uncertain": cfg["uncertain"]}
         elif round_type == RoundType.VALIDATE_DETAIL.value:
-            limit = min(20, remaining_detail_budget)
-            policy = {"mode": "wait_min_results", "min_results": min(8, limit), "timeout_seconds": 300}
-            strategy = {"high_confidence": 12, "diversity": 4, "uncertain": 4}
+            policy = {"mode": "wait_min_results", "min_results": min(cfg["min_results"], limit), "timeout_seconds": cfg["timeout_seconds"]}
+            strategy = {"high_confidence": cfg["high_confidence"], "diversity": cfg["diversity"], "uncertain": cfg["uncertain"]}
         else:
-            limit = min(40, remaining_detail_budget)
-            policy = {"mode": "no_wait"}
-            strategy = {"high_confidence": 30, "diversity": 6, "uncertain": 4}
+            policy = {"mode": "no_wait", "min_results": min(cfg.get("min_results", 5), limit), "timeout_seconds": cfg["timeout_seconds"]}
+            strategy = {"high_confidence": cfg["high_confidence"], "diversity": cfg["diversity"], "uncertain": cfg["uncertain"]}
 
         picked = self._pick_candidates(candidates, limit)
         return FetchDecision(

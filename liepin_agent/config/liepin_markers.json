@@ -1,0 +1,15 @@
+{
+  "_comment": "猎聘页面中文文本标记配置。页面文案改版时改这里。",
+  "already_greeted": ["已沟通", "已打招呼", "继续沟通", "继续聊聊"],
+  "gold_collar_text": ["金领人才", "金领简历"],
+  "no_job_chat": "不选择职位开聊",
+  "request_resume": "索要简历",
+  "confirm": "确认",
+  "confirm_alt": "确定",
+  "status_skipped": "非金领候选人，跳过打招呼",
+  "status_already": "已打过招呼",
+  "error_no_button": "未找到沟通按钮",
+  "error_dialog": "打招呼弹窗处理失败",
+  "error_resume_button": "未找到索要简历按钮",
+  "error_confirm_button": "未找到确认按钮"
+}

@@ -514,7 +514,8 @@ def test_gold_collar_detection_falls_back_to_body_text():
                 return type("Body", (), {"inner_text": lambda self, timeout=0: "金领人才"})()
             return EmptyLocator()
 
-    assert RealLiepinTool._is_gold_collar_detail_page(Page()) is True
+    tool = RealLiepinTool()
+    assert tool._is_gold_collar_detail_page(Page()) is True
 
 
 def test_gold_collar_detection_waits_for_delayed_elite_tag():
@@ -541,7 +542,8 @@ def test_gold_collar_detection_waits_for_delayed_elite_tag():
         def locator(self, selector):
             return Locator(self, selector)
 
-    assert RealLiepinTool._is_gold_collar_detail_page(Page(), wait_seconds=1.0) is True
+    tool = RealLiepinTool()
+    assert tool._is_gold_collar_detail_page(Page(), wait_seconds=1.0) is True
 
 
 def test_active_days_normalizes_half_month():

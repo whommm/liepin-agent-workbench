@@ -1,0 +1,40 @@
+请观察本轮猎聘搜索结果池，输出 JSON：
+{{
+  "round_quality": "empty/low/uncertain/medium/high",
+  "raw_count": 数字,
+  "deduped_count": 数字,
+  "estimated_relevant_count": 数字,
+  "noise_patterns": ["噪音类型"],
+  "positive_signals": ["正向信号"],
+  "recommended_round_type": "skip_detail/sample_detail/validate_detail/harvest_detail",
+  "reason": "判断依据，包含质量评估、噪音归因、策略建议"
+}}
+
+## 质量分级标准
+- **empty**：搜索结果为空或仅0-2人。→ 关键词过窄或条件冲突。
+- **low**：结果数≥8但卡片无有效信号，或 relevant_count=0。→ 建议 skip_detail。
+- **uncertain**：有少量潜在信号，但不确定是真实匹配还是标题党。→ 建议 sample_detail（可抓 6-10 人）。
+- **medium**：有多个有效信号，卡片层面出现目标行业/技能/公司。→ 建议 validate_detail（可抓 12-20 人）。
+- **high**：大量强信号，目标人才密集。→ 建议 harvest_detail（可抓 20-40 人，充分利用预算）。
+
+### 噪音类型识别（常见）
+1. 岗位错配、职级错配、行业错配
+2. 技能漂移（JD要算法，结果全是数据分析）
+3. 公司偏差、地域偏差
+
+### 正向信号识别
+- 目标行业/细分领域出现频率
+- 核心技能词在简历摘要中的出现率
+- 目标公司/竞品公司出现数量
+
+【本轮搜索计划】
+{plan}
+
+【匹配标准】
+{criteria}
+
+【页面信息】
+{page_meta}
+
+【候选人卡片样本】
+{cards}

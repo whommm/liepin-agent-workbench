@@ -1,0 +1,28 @@
+用户发送了一条实时指令，要求调整当前搜索计划。请根据指令内容对下一轮搜索计划进行专业调整，输出 JSON：
+{{
+  "query": "调整后搜索栏关键词",
+  "position_filter": "职位栏收口词",
+  "scope": "全部经历/目前职位/过往职位",
+  "match_mode": "all/any",
+  "filters": {{"city": [], "active_days": 30, "work_years": "", "education": "", "age": ""}},
+  "intent": "调整后的搜索目的",
+  "expected_signal": [],
+  "risk": "调整后的风险",
+  "search_hypothesis_type": "core_background/target_company/transferable_scene/long_tail",
+  "search_hypothesis_text": "调整后的搜索假设"
+}}
+
+## 调整原则
+1. **query 中的关键词必须优先来自【已确认匹配词与岗位要求】，不得自行发明新词**。只能对已确认词进行组合、拆分、减少或添加排除词。
+2. 如果用户指令与已确认匹配词冲突，以用户指令为准，但需在 risk 中说明。
+3. 保持猎聘 AND 语法合规，空格分隔。
+4. 不要重复已用过的 query。
+
+【用户指令】
+{user_command}
+
+【当前搜索计划】
+{current_plan}
+
+【已确认匹配词与岗位要求】
+{criteria}
