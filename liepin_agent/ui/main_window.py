@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
+from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextBrowser,
     QTextEdit,
+    QProgressBar,
     QVBoxLayout,
     QWidget,
 )
@@ -39,7 +42,7 @@ from ..core.config import ConfigManager
 from ..services.event_bus import EventBus
 from ..storage.sqlite_store import SQLiteStore, from_json
 from ..tools.exporter import ExportService
-from ..tools.excel_greeting import ExcelGreetingService
+from ..tools.excel_greeting import ExcelGreetingService, GreetingQuotaTracker
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
 from .dialogs import BatchGreetingDialog, NewSessionDialog, PoolNotificationDialog, SettingsDialog
@@ -121,45 +124,79 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("TopBar")
         layout = QHBoxLayout(frame)
-        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setContentsMargins(14, 6, 14, 6)
+        layout.setSpacing(8)
 
         self.title_label = QLabel("未选择任务")
         self.title_label.setObjectName("TitleLabel")
+
         self.stage_label = QLabel("就绪")
-        self.browser_label = QLabel("浏览器：真实猎聘")
-        self.stats_label = QLabel("轮次 0 | 候选人 0 | 详情 0 | A/B 0")
+        self.stage_label.setObjectName("SessionInfo")
 
-        layout.addWidget(self.title_label, 2)
+        self.greeting_progress = QProgressBar()
+        self.greeting_progress.setVisible(False)
+        self.greeting_progress.setMaximumWidth(180)
+        self.greeting_progress.setFixedHeight(14)
+        self.greeting_progress.setTextVisible(True)
+        self.greeting_progress.setFormat("%v/%m")
+
+        self.stats_label = QLabel("")
+        self.stats_label.setObjectName("SessionInfo")
+
+        self.browser_label = QLabel("")
+        self.browser_label.setObjectName("SessionInfo")
+
+        layout.addWidget(self.title_label)
         layout.addWidget(self.stage_label)
-        layout.addWidget(self.browser_label)
-        layout.addWidget(self.stats_label)
+        layout.addWidget(self.greeting_progress)
         layout.addStretch(1)
+        layout.addWidget(self.stats_label)
+        layout.addWidget(self.browser_label)
 
+        sep1 = QFrame()
+        sep1.setObjectName("ToolbarSeparator")
+        layout.addWidget(sep1)
+
+        # 任务操作组
         self.new_btn = QPushButton("新建")
-        self.add_to_pool_btn = QPushButton("添加到池")
+        self.add_to_pool_btn = QPushButton("加入池")
         self.add_to_pool_btn.setObjectName("SecondaryBtn")
+        layout.addWidget(self.new_btn)
+        layout.addWidget(self.add_to_pool_btn)
+
+        sep2 = QFrame()
+        sep2.setObjectName("ToolbarSeparator")
+        layout.addWidget(sep2)
+
+        # 浏览器组
         self.open_liepin_btn = QPushButton("打开猎聘")
         self.open_liepin_btn.setObjectName("SuccessBtn")
         self.close_liepin_btn = QPushButton("关闭浏览器")
         self.close_liepin_btn.setObjectName("DangerBtn")
+        layout.addWidget(self.open_liepin_btn)
+        layout.addWidget(self.close_liepin_btn)
+
+        sep3 = QFrame()
+        sep3.setObjectName("ToolbarSeparator")
+        layout.addWidget(sep3)
+
+        # 批量与设置组
         self.batch_greeting_btn = QPushButton("Excel 批量打招呼")
         self.batch_greeting_btn.setObjectName("SuccessBtn")
+        self.cancel_greeting_btn = QPushButton("取消打招呼")
+        self.cancel_greeting_btn.setObjectName("DangerBtn")
+        self.cancel_greeting_btn.setVisible(False)
         self.settings_btn = QPushButton("设置")
         self.settings_btn.setObjectName("SecondaryBtn")
-        for button in [
-            self.new_btn,
-            self.add_to_pool_btn,
-            self.open_liepin_btn,
-            self.close_liepin_btn,
-            self.batch_greeting_btn,
-            self.settings_btn,
-        ]:
-            layout.addWidget(button)
+        layout.addWidget(self.batch_greeting_btn)
+        layout.addWidget(self.cancel_greeting_btn)
+        layout.addWidget(self.settings_btn)
+
         return frame
 
     def _build_left_panel(self) -> QWidget:
         container = QWidget()
-        container.setMinimumWidth(280)
+        container.setMinimumWidth(320)
         outer_layout = QVBoxLayout(container)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(6)
@@ -172,7 +209,9 @@ class MainWindow(QMainWindow):
         pool_layout = QVBoxLayout(pool_frame)
         pool_layout.setContentsMargins(6, 6, 6, 6)
         pool_header = QHBoxLayout()
-        pool_header.addWidget(QLabel("项目池"))
+        pool_title = QLabel("项目池")
+        pool_title.setObjectName("SectionTitle")
+        pool_header.addWidget(pool_title)
         pool_header.addStretch(1)
         self.start_queue_btn = QPushButton("开始队列")
         self.start_queue_btn.setObjectName("SuccessBtn")
@@ -199,7 +238,9 @@ class MainWindow(QMainWindow):
         sessions_frame.setObjectName("Panel")
         sessions_layout = QVBoxLayout(sessions_frame)
         sessions_layout.setContentsMargins(6, 6, 6, 6)
-        sessions_layout.addWidget(QLabel("寻访任务"))
+        session_title = QLabel("寻访任务")
+        session_title.setObjectName("SectionTitle")
+        sessions_layout.addWidget(session_title)
         self.session_list = QListWidget()
         self.session_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -215,7 +256,10 @@ class MainWindow(QMainWindow):
         timeline_frame = QFrame()
         timeline_frame.setObjectName("Panel")
         timeline_layout = QVBoxLayout(timeline_frame)
-        timeline_layout.addWidget(QLabel("Agent 决策时间线"))
+        timeline_layout.setContentsMargins(8, 8, 8, 8)
+        timeline_title = QLabel("Agent 决策时间线")
+        timeline_title.setObjectName("SectionTitle")
+        timeline_layout.addWidget(timeline_title)
         self.timeline = QTextBrowser()
         self.timeline.setOpenExternalLinks(False)
         timeline_layout.addWidget(self.timeline, 1)
@@ -223,7 +267,10 @@ class MainWindow(QMainWindow):
         table_frame = QFrame()
         table_frame.setObjectName("Panel")
         table_layout = QVBoxLayout(table_frame)
-        table_layout.addWidget(QLabel("候选人池"))
+        table_layout.setContentsMargins(8, 8, 8, 8)
+        table_title = QLabel("候选人池")
+        table_title.setObjectName("SectionTitle")
+        table_layout.addWidget(table_title)
         self.candidate_table = QTableWidget(0, 12)
         self.candidate_table.setHorizontalHeaderLabels(
             [
@@ -245,6 +292,21 @@ class MainWindow(QMainWindow):
         self.candidate_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.candidate_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.candidate_table.verticalHeader().setVisible(False)
+        self.candidate_table.setAlternatingRowColors(True)
+        self.candidate_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.candidate_table.verticalHeader().setDefaultSectionSize(28)
+        self.candidate_table.setColumnWidth(0, 75)
+        self.candidate_table.setColumnWidth(1, 120)
+        self.candidate_table.setColumnWidth(2, 100)
+        self.candidate_table.setColumnWidth(3, 50)
+        self.candidate_table.setColumnWidth(4, 40)
+        self.candidate_table.setColumnWidth(5, 50)
+        self.candidate_table.setColumnWidth(6, 40)
+        self.candidate_table.setColumnWidth(7, 70)
+        self.candidate_table.setColumnWidth(8, 45)
+        self.candidate_table.setColumnWidth(9, 60)
+        self.candidate_table.setColumnWidth(10, 50)
         self._candidate_table_initialized = False
         table_layout.addWidget(self.candidate_table, 1)
 
@@ -257,8 +319,11 @@ class MainWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("Panel")
         layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 8)
 
-        layout.addWidget(QLabel("岗位匹配要求"))
+        criteria_title = QLabel("岗位匹配要求")
+        criteria_title.setObjectName("SectionTitle")
+        layout.addWidget(criteria_title)
         self.criteria_requirements_input = QTextEdit()
         self.criteria_requirements_input.setPlaceholderText(
             "用一段话描述本岗位最关键的匹配要求，例如：\n"
@@ -267,7 +332,9 @@ class MainWindow(QMainWindow):
         self.criteria_requirements_input.setMaximumHeight(150)
         layout.addWidget(self.criteria_requirements_input)
 
-        layout.addWidget(QLabel("寻访方向（AI 对岗位的理解，可直接编辑修正）"))
+        direction_title = QLabel("寻访方向（AI 对岗位的理解，可直接编辑修正）")
+        direction_title.setObjectName("HintLabel")
+        layout.addWidget(direction_title)
         self.search_direction_input = QLineEdit()
         self.search_direction_input.setPlaceholderText("AI 生成草案后显示对岗位的理解方向")
         self.search_direction_input.setEnabled(False)
@@ -284,20 +351,21 @@ class MainWindow(QMainWindow):
         criteria_buttons.addWidget(self.confirm_and_start_btn)
         layout.addLayout(criteria_buttons)
 
-        # Tabbed lower area: 策略 / 候选人详情 / 日志
+        # Tabbed lower area: 策略 / 详情 / 日志
         self.right_tabs = QTabWidget()
+        self.right_tabs.setDocumentMode(True)
 
         strategy_widget = QWidget()
         strategy_layout = QVBoxLayout(strategy_widget)
-        strategy_layout.setContentsMargins(4, 4, 4, 4)
+        strategy_layout.setContentsMargins(8, 8, 8, 8)
         self.strategy_view = QTextBrowser()
         self.strategy_view.setMinimumHeight(120)
         strategy_layout.addWidget(self.strategy_view)
-        self.right_tabs.addTab(strategy_widget, "当前策略")
+        self.right_tabs.addTab(strategy_widget, "📋 策略")
 
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.setContentsMargins(4, 4, 4, 4)
+        detail_layout.setContentsMargins(8, 8, 8, 8)
         detail_header = QHBoxLayout()
         detail_header.addStretch(1)
         self.manual_greeting_btn = QPushButton("手动打招呼")
@@ -306,14 +374,14 @@ class MainWindow(QMainWindow):
         detail_layout.addLayout(detail_header)
         self.detail_view = QTextBrowser()
         detail_layout.addWidget(self.detail_view, 1)
-        self.right_tabs.addTab(detail_widget, "候选人详情")
+        self.right_tabs.addTab(detail_widget, "👤 详情")
 
         log_widget = QWidget()
         log_layout = QVBoxLayout(log_widget)
-        log_layout.setContentsMargins(4, 4, 4, 4)
+        log_layout.setContentsMargins(8, 8, 8, 8)
         self.log_view = QTextBrowser()
         log_layout.addWidget(self.log_view, 1)
-        self.right_tabs.addTab(log_widget, "详细日志")
+        self.right_tabs.addTab(log_widget, "📝 日志")
 
         layout.addWidget(self.right_tabs, 1)
         return frame
@@ -324,6 +392,7 @@ class MainWindow(QMainWindow):
         self.open_liepin_btn.clicked.connect(self.open_liepin_browser)
         self.close_liepin_btn.clicked.connect(self.close_liepin_browser)
         self.batch_greeting_btn.clicked.connect(self.open_batch_greeting_dialog)
+        self.cancel_greeting_btn.clicked.connect(self._cancel_batch_greeting)
         self.settings_btn.clicked.connect(self.open_settings)
         self.start_queue_btn.clicked.connect(self._start_queue)
         self.stop_queue_btn.clicked.connect(self._stop_queue)
@@ -532,20 +601,45 @@ class MainWindow(QMainWindow):
         verify_gold_on_page = bool(payload.get("verify_gold_on_page"))
         request_resume = bool(payload.get("request_resume"))
         gold_only = bool(payload.get("gold_only"))
+        delay_min = float(payload.get("delay_min") or 2.0)
+        delay_max = float(payload.get("delay_max") or 5.0)
+        max_retries = int(payload.get("max_retries") or 1)
+        max_candidates = int(payload.get("max_candidates") or 0)
+        excel_path = str(payload.get("excel_path") or "")
+        if excel_path:
+            self.config_manager.update(last_greeting_excel_path=excel_path)
+            self.config_manager.save_config()
+        if not dry_run:
+            quota_tracker = GreetingQuotaTracker(self.workspace_root)
+            today_count = quota_tracker.today_count()
+            warn_limit = self.config_manager.config.greet_daily_quota_warn
+            if warn_limit > 0 and today_count + count > warn_limit:
+                reply = QMessageBox.warning(
+                    self,
+                    "额度提醒",
+                    "今日已打招呼 {} 人，本次将再处理 {} 人，合计将超过 {} 人的预警阈值。\n\n是否继续？".format(
+                        today_count, count, warn_limit,
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
         action_label = "预览 dry-run（不会实际发送）" if dry_run else "实际发送打招呼"
         gold_label = "发送前会重新打开页面复核金领状态" if verify_gold_on_page else "将信任 Excel 金领字段，不做页面复核"
         resume_label = "同时索要简历" if request_resume else "不索要简历"
         scope_label = "A/B + 金领" if gold_only else "A/B（全部）"
+        limit_label = "全部（{} 人）".format(count) if max_candidates == 0 else "前 {} 人（A 档优先）".format(count)
         reply = QMessageBox.question(
             self,
             "确认批量打招呼",
-            "即将处理 Excel 中 {} 候选人。\n\n模式：{}\n安全复核：{}\n索要简历：{}\n文件：{}\n人数：{}\n候选人：{}\n\n是否继续？".format(
+            "即将处理 Excel 中 {} 候选人。\n\n模式：{}\n安全复核：{}\n索要简历：{}\n处理人数：{}\n文件：{}\n候选人：{}\n\n是否继续？".format(
                 scope_label,
                 action_label,
                 gold_label,
                 resume_label,
+                limit_label,
                 payload.get("excel_path") or "",
-                count,
                 names or "-",
             ),
         )
@@ -558,6 +652,10 @@ class MainWindow(QMainWindow):
             verify_gold_on_page=verify_gold_on_page,
             request_resume=request_resume,
             gold_only=gold_only,
+            delay_min=delay_min,
+            delay_max=delay_max,
+            max_retries=max_retries,
+            max_candidates=max_candidates,
         )
 
     def _start_excel_batch_greeting(
@@ -568,27 +666,44 @@ class MainWindow(QMainWindow):
         verify_gold_on_page: bool = True,
         request_resume: bool = False,
         gold_only: bool = True,
+        delay_min: float = 2.0,
+        delay_max: float = 5.0,
+        max_retries: int = 1,
+        max_candidates: int = 0,
     ) -> None:
         self.batch_greeting_btn.setEnabled(False)
         self.batch_greeting_btn.setText("预览中..." if dry_run else "打招呼中...")
+        self.cancel_greeting_btn.setVisible(True)
+        self.greeting_progress.setVisible(True)
+        self.greeting_progress.setValue(0)
         self.stage_label.setText("Excel 批量打招呼预览中" if dry_run else "Excel 批量打招呼进行中")
+
+        service = ExcelGreetingService(self.runtime.liepin_tool)
+        self._active_greeting_service = service
 
         def _run():
             try:
-                service = ExcelGreetingService(self.runtime.liepin_tool)
                 results = service.greet_from_excel(
                     excel_path,
                     message_template=message,
+                    delay_min=delay_min,
+                    delay_max=delay_max,
                     dry_run=dry_run,
                     verify_gold_on_page=verify_gold_on_page,
                     request_resume=request_resume,
                     gold_only=gold_only,
+                    max_retries=max_retries,
+                    max_candidates=max_candidates,
                     progress_callback=lambda current, total, name: self.event_bus.publish(
                         "excel_greeting_progress",
                         {"current": current, "total": total, "name": name},
                     ),
                 )
-                summary = ExcelGreetingService.generate_summary(results)
+                if not dry_run:
+                    success_count = sum(1 for r in results if r.get("status") == "success")
+                    if success_count > 0:
+                        GreetingQuotaTracker(self.workspace_root).increment(success_count)
+                summary = ExcelGreetingService.generate_summary(results, cancelled=service.is_stopped)
                 self.event_bus.publish(
                     "excel_greeting_done",
                     {"summary": summary, "excel_path": excel_path},
@@ -597,6 +712,14 @@ class MainWindow(QMainWindow):
                 self.event_bus.publish("excel_greeting_error", {"error": str(exc)})
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _cancel_batch_greeting(self) -> None:
+        service = getattr(self, "_active_greeting_service", None)
+        if service:
+            service.request_stop()
+        self.cancel_greeting_btn.setEnabled(False)
+        self.cancel_greeting_btn.setText("正在取消...")
+        self.stage_label.setText("正在取消批量打招呼...")
 
     def greet_selected_candidate(self) -> None:
         session_id = self.selected_session_id
@@ -1177,14 +1300,22 @@ class MainWindow(QMainWindow):
             else:
                 self._pending_status_text = "手动打招呼未完成"
         elif event_type == "excel_greeting_progress":
+            current = int(payload.get("current") or 0)
+            total = int(payload.get("total") or 0)
             self._pending_status_text = "Excel 批量打招呼：{}/{} {}".format(
-                payload.get("current") or 0,
-                payload.get("total") or 0,
-                payload.get("name") or "",
+                current, total, payload.get("name") or "",
             )
+            if total > 0:
+                self.greeting_progress.setMaximum(total)
+                self.greeting_progress.setValue(current)
         elif event_type == "excel_greeting_done":
             self.batch_greeting_btn.setEnabled(True)
             self.batch_greeting_btn.setText("Excel 批量打招呼")
+            self.cancel_greeting_btn.setVisible(False)
+            self.cancel_greeting_btn.setEnabled(True)
+            self.cancel_greeting_btn.setText("取消打招呼")
+            self.greeting_progress.setVisible(False)
+            self._active_greeting_service = None
             self._pending_status_text = "Excel 批量打招呼完成"
             QMessageBox.information(
                 self,
@@ -1198,6 +1329,11 @@ class MainWindow(QMainWindow):
         elif event_type == "excel_greeting_error":
             self.batch_greeting_btn.setEnabled(True)
             self.batch_greeting_btn.setText("Excel 批量打招呼")
+            self.cancel_greeting_btn.setVisible(False)
+            self.cancel_greeting_btn.setEnabled(True)
+            self.cancel_greeting_btn.setText("取消打招呼")
+            self.greeting_progress.setVisible(False)
+            self._active_greeting_service = None
             self._pending_status_text = "Excel 批量打招呼失败"
             QMessageBox.warning(self, "批量打招呼失败", str(payload.get("error") or "未知错误"))
         elif event_type == "criteria_ready":
@@ -1448,14 +1584,47 @@ class MainWindow(QMainWindow):
             ]
             for column, value in enumerate(values):
                 str_value = str(value)
+                is_color_column = column in {8, 9}
                 existing = self.candidate_table.item(row, column)
-                if existing is not None and existing.text() == str_value:
+                if existing is not None and existing.text() == str_value and not is_color_column:
                     continue  # skip unchanged cells
                 table_item = QTableWidgetItem(str_value)
                 if column == 0:
                     table_item.setData(Qt.UserRole, candidate_id)
                 if column in {6, 7, 9}:
                     table_item.setTextAlignment(Qt.AlignCenter)
+
+                # 匹配等级 Badge 着色
+                if column == 8:
+                    tier = str(value).strip().upper()
+                    if tier == "A":
+                        table_item.setBackground(QBrush(QColor("#2d6a4f")))
+                        table_item.setForeground(QBrush(QColor("#ffffff")))
+                    elif tier == "B":
+                        table_item.setBackground(QBrush(QColor("#52b788")))
+                        table_item.setForeground(QBrush(QColor("#ffffff")))
+                    elif tier == "C":
+                        table_item.setBackground(QBrush(QColor("#e9c46a")))
+                        table_item.setForeground(QBrush(QColor("#3d3929")))
+                    elif tier == "D":
+                        table_item.setBackground(QBrush(QColor("#a8a29e")))
+                        table_item.setForeground(QBrush(QColor("#ffffff")))
+
+                # 打招呼状态 Badge 着色
+                elif column == 9:
+                    greeting = str(value).strip()
+                    color_map = {
+                        "已发送": ("#5a9a5a", "#ffffff"),
+                        "已打过": ("#7cb87c", "#ffffff"),
+                        "已跳过": ("#c4956a", "#ffffff"),
+                        "失败": ("#c56a6a", "#ffffff"),
+                        "待处理": ("#6a8aaa", "#ffffff"),
+                    }
+                    bg, fg = color_map.get(greeting, (None, None))
+                    if bg:
+                        table_item.setBackground(QBrush(QColor(bg)))
+                        table_item.setForeground(QBrush(QColor(fg)))
+
                 self.candidate_table.setItem(row, column, table_item)
 
         selection_model = self.candidate_table.selectionModel()
@@ -1477,7 +1646,7 @@ class MainWindow(QMainWindow):
         # Only resize columns on first population to prevent column-width jumps
         if not self._candidate_table_initialized and new_count > 0:
             self.candidate_table.resizeColumnsToContents()
-            self.candidate_table.setColumnWidth(11, 260)
+            self.candidate_table.horizontalHeader().setStretchLastSection(True)
             self._candidate_table_initialized = True
 
     def _render_strategy(self) -> None:

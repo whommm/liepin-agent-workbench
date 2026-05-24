@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
+from threading import Event
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -35,8 +38,18 @@ class ExcelGreetingService:
     STATUS_SKIPPED = "已跳过"
     STATUS_DRY_RUN = "待发送"
 
+    PERMANENT_STATUSES = {"already_greeted", "skipped", "dry_run"}
+
     def __init__(self, liepin_tool):
         self.liepin_tool = liepin_tool
+        self._stop_event = Event()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    @property
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
 
     @classmethod
     def load_greetable_candidates(cls, excel_path: str | Path, gold_only: bool = True) -> List[ExcelGreetingCandidate]:
@@ -93,13 +106,21 @@ class ExcelGreetingService:
         verify_gold_on_page: bool = True,
         request_resume: bool = False,
         gold_only: bool = True,
+        max_retries: int = 1,
+        max_candidates: int = 0,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> List[Dict[str, object]]:
         candidates = self.load_greetable_candidates(excel_path, gold_only=gold_only)
         candidates.sort(key=lambda c: (c.tier != "A", c.row_index))
+        if max_candidates > 0:
+            candidates = candidates[:max_candidates]
         results: List[Dict[str, object]] = []
+        pending_writes: List[Dict[str, object]] = []
         total = len(candidates)
+        batch_write_interval = min(10, max(1, total // 5)) if total > 0 else 1
         for index, candidate in enumerate(candidates, start=1):
+            if self._stop_event.is_set():
+                break
             if progress_callback:
                 progress_callback(index, total, candidate.name)
             if dry_run:
@@ -116,6 +137,8 @@ class ExcelGreetingService:
                 continue
             if index > 1:
                 time.sleep(random.uniform(delay_min, delay_max))
+            if self._stop_event.is_set():
+                break
             payload = {
                 "id": str(candidate.row_index),
                 "name": candidate.name,
@@ -125,39 +148,68 @@ class ExcelGreetingService:
                 "is_gold_collar": candidate.is_gold_collar,
                 "skip_gold_check": not verify_gold_on_page,
             }
+            response = self._greet_with_retry(payload, message_template, request_resume, max_retries)
+            status = str(response.get("status") or "failed")
+            message = str(response.get("message") or "")
+            error = str(response.get("error") or "")
+            request_resume_status = str(response.get("request_resume_status") or "")
+            result_item = {
+                "row_index": candidate.row_index,
+                "candidate_name": candidate.name,
+                "status": status,
+                "message": message,
+                "error": error,
+                "request_resume_status": request_resume_status,
+            }
+            results.append(result_item)
+            pending_writes.append(result_item)
+            if len(pending_writes) >= batch_write_interval:
+                try:
+                    self._write_batch_results(excel_path, pending_writes)
+                    pending_writes = []
+                except Exception as exc:
+                    logger.warning("periodic batch write failed: %s", exc)
+        if pending_writes:
+            try:
+                self._write_batch_results(excel_path, pending_writes)
+            except Exception as exc:
+                logger.warning("final batch write failed: %s", exc)
+        try:
+            self._write_batch_results(excel_path, results)
+        except Exception as exc:
+            logger.warning("full batch write results failed: %s", exc)
+        return results
+
+    def _greet_with_retry(
+        self,
+        payload: Dict[str, object],
+        message_template: str,
+        request_resume: bool,
+        max_retries: int,
+    ) -> Dict[str, str]:
+        last_response: Dict[str, str] = {"status": "failed", "message": "", "error": "未知错误"}
+        for attempt in range(1 + max(0, max_retries)):
+            if self._stop_event.is_set():
+                return {"status": "failed", "message": "", "error": "用户取消"}
             try:
                 response = self.liepin_tool.greet_candidate(
                     payload, message_template=message_template, request_resume=request_resume
                 )
             except Exception as exc:
                 response = {"status": "failed", "message": "", "error": str(exc)}
+            last_response = response
             status = str(response.get("status") or "failed")
-            message = str(response.get("message") or "")
-            error = str(response.get("error") or "")
-            request_resume_status = str(response.get("request_resume_status") or "")
-            try:
-                self.write_greeting_result(excel_path, candidate.row_index, status, message, error, request_resume_status)
-            except PermissionError as exc:
-                logger.warning("write_greeting_result permission denied: %s", exc)
-                error = "{}（Excel写入失败：文件可能被占用，请关闭Excel后重试）".format(error) if error else "Excel写入失败：文件可能被占用，请关闭Excel后重试"
-            except Exception as exc:
-                logger.warning("write_greeting_result failed: %s", exc)
-            results.append(
-                {
-                    "row_index": candidate.row_index,
-                    "candidate_name": candidate.name,
-                    "status": status,
-                    "message": message,
-                    "error": error,
-                    "request_resume_status": request_resume_status,
-                }
-            )
-        # 批量处理结束后统一再写一遍，补救中间因文件占用而失败的写入
-        try:
-            self._write_batch_results(excel_path, results)
-        except Exception as exc:
-            logger.warning("batch write results failed: %s", exc)
-        return results
+            if status != "failed" or status in self.PERMANENT_STATUSES:
+                return response
+            if attempt < max_retries:
+                logger.warning(
+                    "greet retry %d/%d for %s: %s",
+                    attempt + 1, max_retries,
+                    payload.get("name") or payload.get("id"),
+                    response.get("error") or "",
+                )
+                time.sleep(random.uniform(2.0, 4.0))
+        return last_response
 
     @classmethod
     def write_greeting_result(
@@ -250,7 +302,7 @@ class ExcelGreetingService:
                 raise
 
     @staticmethod
-    def generate_summary(results: List[Dict[str, object]]) -> str:
+    def generate_summary(results: List[Dict[str, object]], cancelled: bool = False) -> str:
         total = len(results)
         success = sum(1 for item in results if item.get("status") == "success")
         already = sum(1 for item in results if item.get("status") == "already_greeted")
@@ -262,7 +314,7 @@ class ExcelGreetingService:
             if item.get("request_resume_status") == "已发送索要简历"
         )
         lines = [
-            "批量打招呼完成：共处理 {} 位候选人".format(total),
+            "批量打招呼{}：共处理 {} 位候选人".format("（已取消）" if cancelled else "完成", total),
             "成功：{} 人".format(success),
             "已打过：{} 人".format(already),
             "跳过：{} 人".format(skipped),
@@ -331,3 +383,35 @@ class ExcelGreetingService:
     @staticmethod
     def _is_yes(value: str) -> bool:
         return str(value or "").strip().lower() in {"是", "yes", "true", "1", "金领"}
+
+
+class GreetingQuotaTracker:
+    def __init__(self, workspace_root: str | Path):
+        self._path = Path(workspace_root) / ".greeting_quota.json"
+
+    def _load(self) -> Dict[str, object]:
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save(self, data: Dict[str, object]) -> None:
+        try:
+            self._path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def today_count(self) -> int:
+        data = self._load()
+        if data.get("date") != str(date.today()):
+            return 0
+        return int(data.get("count") or 0)
+
+    def increment(self, n: int = 1) -> int:
+        data = self._load()
+        today = str(date.today())
+        if data.get("date") != today:
+            data = {"date": today, "count": 0}
+        data["count"] = int(data.get("count") or 0) + n
+        self._save(data)
+        return int(data["count"])

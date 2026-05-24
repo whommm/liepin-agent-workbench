@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -165,7 +166,7 @@ class BatchGreetingDialog(QDialog):
         self._generation_signals.done.connect(self._on_generation_done)
         self._generation_signals.failed.connect(self._on_generation_failed)
         self.setWindowTitle("Excel 批量打招呼")
-        self.resize(760, 620)
+        self.resize(760, 700)
 
         layout = QVBoxLayout(self)
         layout.addWidget(
@@ -175,6 +176,9 @@ class BatchGreetingDialog(QDialog):
         file_row = QHBoxLayout()
         self.excel_path = QLineEdit()
         self.excel_path.setPlaceholderText("选择导出的候选人 Excel")
+        last_path = config_manager.config.last_greeting_excel_path
+        if last_path and Path(last_path).exists():
+            self.excel_path.setText(last_path)
         browse_btn = QPushButton("选择 Excel")
         browse_btn.setObjectName("SecondaryBtn")
         browse_btn.clicked.connect(self._pick_excel)
@@ -186,11 +190,24 @@ class BatchGreetingDialog(QDialog):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
+        limit_row = QHBoxLayout()
+        limit_row.addWidget(QLabel("本次打招呼人数："))
+        self.max_candidates_spin = QSpinBox()
+        self.max_candidates_spin.setRange(0, 9999)
+        self.max_candidates_spin.setValue(0)
+        self.max_candidates_spin.setSpecialValueText("全部")
+        self.max_candidates_spin.setToolTip("0 = 全部处理；填写具体数字则只处理前 N 位（A 档优先）。")
+        self.max_candidates_spin.setSuffix(" 人")
+        limit_row.addWidget(self.max_candidates_spin)
+        limit_row.addStretch(1)
+        layout.addLayout(limit_row)
+
         self.dry_run_check = QCheckBox("仅预览 dry-run，不实际发送打招呼")
         self.dry_run_check.setChecked(True)
         self.gold_only_check = QCheckBox("仅处理金领候选人")
         self.gold_only_check.setChecked(config_manager.config.greet_gold_only)
         self.gold_only_check.setToolTip("开启后只向 Excel 中标记为金领的候选人打招呼；关闭则全部 A/B 档候选人都处理。")
+        self.gold_only_check.stateChanged.connect(self._on_gold_only_changed)
         self.verify_gold_check = QCheckBox("发送前重新打开页面复核金领状态")
         self.verify_gold_check.setChecked(True)
         self.verify_gold_check.setToolTip("建议保持开启，避免 Excel 被编辑或数据过期后误发。")
@@ -200,6 +217,31 @@ class BatchGreetingDialog(QDialog):
         layout.addWidget(self.gold_only_check)
         layout.addWidget(self.verify_gold_check)
         layout.addWidget(self.request_resume_check)
+
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(QLabel("间隔延迟（秒）："))
+        self.delay_min_spin = QDoubleSpinBox()
+        self.delay_min_spin.setRange(0.5, 30.0)
+        self.delay_min_spin.setSingleStep(0.5)
+        self.delay_min_spin.setValue(config_manager.config.greet_delay_min)
+        self.delay_min_spin.setToolTip("每个候选人之间的最小随机延迟")
+        delay_row.addWidget(self.delay_min_spin)
+        delay_row.addWidget(QLabel("~"))
+        self.delay_max_spin = QDoubleSpinBox()
+        self.delay_max_spin.setRange(1.0, 60.0)
+        self.delay_max_spin.setSingleStep(0.5)
+        self.delay_max_spin.setValue(config_manager.config.greet_delay_max)
+        self.delay_max_spin.setToolTip("每个候选人之间的最大随机延迟")
+        delay_row.addWidget(self.delay_max_spin)
+        delay_row.addWidget(QLabel("  失败重试："))
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(0, 5)
+        self.retry_spin.setValue(config_manager.config.greet_max_retries)
+        self.retry_spin.setToolTip("对临时性错误自动重试的次数")
+        self.retry_spin.setSuffix(" 次")
+        delay_row.addWidget(self.retry_spin)
+        delay_row.addStretch(1)
+        layout.addLayout(delay_row)
 
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
@@ -241,6 +283,11 @@ class BatchGreetingDialog(QDialog):
         self.message_text.setPlaceholderText("请先生成或手动填写打招呼文本。留空则使用平台默认打招呼。")
         layout.addWidget(self.message_text, 1)
 
+        hint_label = QLabel("可用变量：{name} 姓名 · {current_company} 公司 · {current_title} 职位")
+        hint_label.setObjectName("SessionInfo")
+        hint_label.setToolTip("在文本中使用 {变量名} 会被自动替换为对应候选人信息。")
+        layout.addWidget(hint_label)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel_btn = QPushButton("取消")
@@ -252,6 +299,14 @@ class BatchGreetingDialog(QDialog):
         buttons.addWidget(cancel_btn)
         buttons.addWidget(start_btn)
         layout.addLayout(buttons)
+
+        if last_path and Path(last_path).exists():
+            self._load_preview(last_path)
+
+    def _on_gold_only_changed(self, _state: int) -> None:
+        path = self.excel_path.text().strip()
+        if path and Path(path).exists():
+            self._load_preview(path)
 
     def _pick_excel(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -291,6 +346,9 @@ class BatchGreetingDialog(QDialog):
                 gold_text,
             )
         )
+        self.max_candidates_spin.setMaximum(len(self._candidates))
+        if self.max_candidates_spin.value() == 0 or self.max_candidates_spin.value() > len(self._candidates):
+            self.max_candidates_spin.setValue(0)
         self.preview.setPlainText(names or "没有符合条件的候选人。")
 
     def set_job_defaults(self, title: str, jd_text: str, city: str = "", salary: str = "") -> None:
@@ -424,15 +482,21 @@ class BatchGreetingDialog(QDialog):
         self.accept()
 
     def payload(self) -> Dict[str, object]:
+        max_candidates = self.max_candidates_spin.value()
+        effective_count = max_candidates if max_candidates > 0 else len(self._candidates)
         return {
             "excel_path": self.excel_path.text().strip(),
             "message": self.message_text.toPlainText().strip(),
-            "candidate_count": len(self._candidates),
-            "candidate_names": [item.name for item in self._candidates],
+            "candidate_count": effective_count,
+            "candidate_names": [item.name for item in self._candidates[:effective_count]],
             "dry_run": self.dry_run_check.isChecked(),
             "verify_gold_on_page": self.verify_gold_check.isChecked(),
             "request_resume": self.request_resume_check.isChecked(),
             "gold_only": self.gold_only_check.isChecked(),
+            "delay_min": self.delay_min_spin.value(),
+            "delay_max": self.delay_max_spin.value(),
+            "max_retries": self.retry_spin.value(),
+            "max_candidates": max_candidates,
         }
 
 

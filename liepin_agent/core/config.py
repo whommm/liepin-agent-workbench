@@ -47,6 +47,11 @@ class AppConfig(BaseModel):
     greeting_template: str = ""
     auto_greeting_enabled: bool = False
     greet_gold_only: bool = False
+    greet_delay_min: float = Field(default=2.0, ge=0.5, le=30.0)
+    greet_delay_max: float = Field(default=5.0, ge=1.0, le=60.0)
+    greet_max_retries: int = Field(default=1, ge=0, le=5)
+    greet_daily_quota_warn: int = Field(default=50, ge=0, le=500)
+    last_greeting_excel_path: str = ""
     llm_provider: str = "openai"
     backend_llm_provider: str = "openai"
     debug_snapshots_enabled: bool = False
