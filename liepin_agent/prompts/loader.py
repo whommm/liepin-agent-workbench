@@ -131,7 +131,8 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 {{
   "core_requirement": "一句话核心要求，如：小家电无刷电机领域，必须有无刷电机经验，CAD优先",
   "position_filter": "猎聘职位栏收口词，1-2个词。必须从JD中的真实岗位名称提取，如：车间主任、生产经理、产品经理、算法工程师。不要编造，不要写'产品' unless JD确实是产品岗",
-  "search_direction": "一句话描述AI对本岗位寻访方向的理解，不是搜索关键词，是策略方向，用户可编辑修正"
+  "search_direction": "一句话描述AI对本岗位寻访方向的理解，不是搜索关键词，是策略方向，用户可编辑修正",
+  "target_companies": ["从JD或补充说明中提取的目标/对标公司名列表。如客户说'必须XX公司出身'或JD写'有XX公司背景优先'，则填入。无则留空数组"]
 }}
 
 要求：
@@ -139,6 +140,7 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 2. core_requirement 要短、清楚，聚焦硬门槛。
 3. position_filter 务必准确：它是猎聘网站左侧职位栏的过滤条件，写错了会直接过滤掉目标候选人。
 4. search_directions 是对岗位的理解方向，每方向一句话，给出不同切入角度（如收紧/放宽/跨行业）。
+5. target_companies 只在明确提到对标/目标公司时填写，不要凭空编造。
 
 【JD】
 {jd}
@@ -152,7 +154,7 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
   "position_filter": "职位栏收口词。1-2个词，从JD真实岗位名称提取。如觉得需要调整可以换词，没把握就留空",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
   "intent": "本轮搜索目的",
   "expected_signal": ["期待在候选人卡片中看到的具体信号，至少3条"],
   "risk": "本轮可能噪音及规避方式",
@@ -170,6 +172,7 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 7. 如需排除噪音，可在 query 中用减号（如 `产品经理 -助理`）。
 8. expected_signal 必须具体、可观察。
 9. 如果匹配条件中包含 **selected_direction**（用户确认的寻访方向），必须严格按该方向生成搜索计划，不要偏离。
+10. 如果匹配条件中包含 target_companies（目标/对标公司列表）或 selected_direction 中提到"锁定XX公司"、"对标公司"等，search_hypothesis_type 应优先使用 target_company，并在 filters.company 填入其中一家公司名（第一轮选最核心的一家），同时 scope 设为"目前公司"或"过往公司"。
 
 【JD】
 {jd}
@@ -316,8 +319,9 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 
 ### 4. next_plan 字段要求
 - query：2-3 个词 AND 组合，空格分隔，明确是收紧/放宽/换维度。**如果本轮搜索零产出，下一轮query必须减少到2个词，优先去掉最细分/最罕见的那个词**
-- filters：只保留 city / active_days / education / age，**严禁填充 work_years**
+- filters：只保留 city / active_days / education / age / company，**严禁填充 work_years**
 - scope：target_company 优先用"目前/过往公司"；transferable_scene 用"全部经历"
+- company：target_company 假设时，如需精准定向某家对标公司，可在 filters 中填 company="公司名"
 - expected_signal：具体、可观察
 
 【should_stop】{should_stop}
@@ -345,7 +349,7 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
   "position_filter": "职位栏收口词",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "work_years": "", "education": "", "age": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
   "intent": "调整后的搜索目的",
   "expected_signal": [],
   "risk": "调整后的风险",
@@ -358,6 +362,8 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 2. 如果用户指令与已确认匹配词冲突，以用户指令为准，但需在 risk 中说明。
 3. 保持猎聘 AND 语法合规，空格分隔。
 4. 不要重复已用过的 query。
+5. 如需定向某家对标公司，可在 filters.company 填入公司名，配合 scope="目前公司"或"过往公司"。
+6. 工作年限不要填入 filters，由后续匹配模型判断。
 
 【用户指令】
 {user_command}

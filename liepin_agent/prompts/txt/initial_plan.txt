@@ -4,7 +4,7 @@
   "position_filter": "职位栏收口词。1-2个词，从JD真实岗位名称提取。如觉得需要调整可以换词，没把握就留空",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
   "intent": "本轮搜索目的",
   "expected_signal": ["期待在候选人卡片中看到的具体信号，至少3条"],
   "risk": "本轮可能噪音及规避方式",

@@ -155,11 +155,8 @@ class SessionListItemWidget(QFrame):
         root_layout.addLayout(content, 1)
 
         # 事件绑定
-        self.send_cmd_btn.clicked.connect(
-            lambda: parent_window.send_user_command(
-                self.session_id, self.command_input.text()
-            )
-        )
+        self.send_cmd_btn.clicked.connect(self._on_send_command)
+        self.command_input.returnPressed.connect(self._on_send_command)
         self.continue_btn.clicked.connect(
             lambda: parent_window.toggle_session_run(self.session_id)
         )
@@ -176,3 +173,48 @@ class SessionListItemWidget(QFrame):
         if status in {"completed", "failed", "cancelled"}:
             self.stop_btn.setEnabled(False)
             self.send_cmd_btn.setEnabled(False)
+
+    def _on_send_command(self) -> None:
+        text = self.command_input.text().strip()
+        if text:
+            self.parent_window.send_user_command(self.session_id, text)
+            self.command_input.clear()
+
+    def update_from_session(self, session: Dict[str, object]) -> None:
+        """增量更新状态，避免重建 widget 导致焦点丢失。"""
+        self.session = session
+        status = str(session.get("status") or "")
+        status_color = STATUS_COLORS.get(status, "#b8a890")
+
+        # 更新色带
+        stripe = self.findChild(QFrame, "StatusStripe")
+        if stripe:
+            stripe.setStyleSheet("background: {};".format(status_color))
+
+        # 更新圆点
+        dot = self.findChild(QLabel, "StatusDot")
+        if dot:
+            dot.setStyleSheet(
+                "background: {}; border-radius: 4px; min-width: 8px; max-width: 8px; "
+                "min-height: 8px; max-height: 8px;".format(status_color)
+            )
+
+        # 更新状态文本
+        info = self.findChild(QLabel, "SessionInfo")
+        if info:
+            status_text = STATUS_LABELS.get(status, status)
+            info.setText(
+                "{}  |  候选 {}  |  A/B {}".format(
+                    status_text,
+                    session.get("candidate_count") or 0,
+                    session.get("ab_count") or 0,
+                )
+            )
+
+        # 更新按钮
+        is_running = status == "running"
+        self.continue_btn.setText("暂停" if is_running else "继续")
+
+        finished = status in {"completed", "failed", "cancelled"}
+        self.stop_btn.setEnabled(not finished)
+        self.send_cmd_btn.setEnabled(not finished)

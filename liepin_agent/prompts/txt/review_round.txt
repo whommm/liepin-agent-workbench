@@ -54,6 +54,7 @@
 - query：2-3 个词 AND 组合，空格分隔，明确是收紧/放宽/换维度。**如果本轮搜索零产出，下一轮query必须减少到2个词，优先去掉最细分/最罕见的那个词**
 - filters：只保留 city / active_days / education / age，**严禁填充 work_years**
 - scope：target_company 优先用"目前/过往公司"；transferable_scene 用"全部经历"
+- company：target_company 假设时，如需精准定向某家对标公司，可在 filters 中填 company="公司名"
 - expected_signal：具体、可观察
 
 【should_stop】{should_stop}

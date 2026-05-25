@@ -4,7 +4,7 @@
   "position_filter": "职位栏收口词",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "work_years": "", "education": "", "age": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
   "intent": "调整后的搜索目的",
   "expected_signal": [],
   "risk": "调整后的风险",
@@ -17,6 +17,8 @@
 2. 如果用户指令与已确认匹配词冲突，以用户指令为准，但需在 risk 中说明。
 3. 保持猎聘 AND 语法合规，空格分隔。
 4. 不要重复已用过的 query。
+5. 如需定向某家对标公司，可在 filters.company 填入公司名，配合 scope="目前公司"或"过往公司"。
+6. 工作年限不要填入 filters，由后续匹配模型判断。
 
 【用户指令】
 {user_command}

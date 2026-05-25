@@ -1388,9 +1388,13 @@ class MainWindow(QMainWindow):
                 session = sessions_by_id.get(session_id)
                 if session is None:
                     continue
-                new_widget = SessionListItemWidget(session, self)
-                item.setSizeHint(new_widget.sizeHint())
-                self.session_list.setItemWidget(item, new_widget)
+                existing_widget = self.session_list.itemWidget(item)
+                if isinstance(existing_widget, SessionListItemWidget):
+                    existing_widget.update_from_session(session)
+                else:
+                    new_widget = SessionListItemWidget(session, self)
+                    item.setSizeHint(new_widget.sizeHint())
+                    self.session_list.setItemWidget(item, new_widget)
             return
 
         # Full rebuild when the session list changes (add/remove)

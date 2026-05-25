@@ -135,6 +135,7 @@ class LLMAgentBrain:
             "requirements_text": str(data.get("core_requirement") or "").strip(),
             "keywords_text": str(data.get("core_requirement") or "").strip(),
             "search_direction": str(data.get("search_direction") or "").strip(),
+            "target_companies": self._string_list(data.get("target_companies"))[:8],
         }
 
     def initial_plan(
@@ -335,10 +336,6 @@ class LLMAgentBrain:
         data: Dict[str, object], criteria: Dict[str, object]
     ) -> SearchPlan:
         filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
-        if "city" not in filters and criteria.get("city_scope"):
-            filters["city"] = criteria.get("city_scope")
-        if "active_days" not in filters:
-            filters["active_days"] = 30
         return SearchPlan(
             query=str(data.get("query") or "").strip(),
             position_filter=str(data.get("position_filter") or ""),

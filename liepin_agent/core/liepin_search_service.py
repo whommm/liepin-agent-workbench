@@ -249,6 +249,17 @@ class LiepinSearchService(
             confirm_selector=".sfilter-speciality-box .shadow-box-submit-btn",
             requires_expanded=True,
         ),
+        "公司名称": LiepinFilterFieldSpec(
+            title="公司名称",
+            field_type="autocomplete",
+            container_selector='div.search-item:has(span.search-item-title:has-text("公司名称"))',
+            title_text="公司名称",
+            fallback_container_selectors=(
+                "div.search-item:has-text('公司名称')",
+            ),
+            confirm_selector="",
+            requires_expanded=False,
+        ),
     }
 
     def __init__(self, browser_manager: LiepinBrowserManager):

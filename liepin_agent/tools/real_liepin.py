@@ -707,4 +707,7 @@ class RealLiepinTool:
                     mapped["活跃度"] = "最近一年活跃"
             else:
                 mapped["活跃度"] = active_days
+        company = filters.get("company") or filters.get("公司名称")
+        if company:
+            mapped["公司名称"] = company
         return mapped
