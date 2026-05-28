@@ -93,8 +93,8 @@ class NewSessionDialog(QDialog):
         form.addRow("运行模式", self.mode_combo)
 
         self.max_rounds = QSpinBox()
-        self.max_rounds.setRange(1, 12)
-        self.max_rounds.setValue(10)
+        self.max_rounds.setRange(1, 30)
+        self.max_rounds.setValue(20)
         form.addRow("最大轮次", self.max_rounds)
 
         self.max_details = QSpinBox()
