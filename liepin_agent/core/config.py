@@ -282,6 +282,11 @@ class ConfigManager:
             BACKEND_API_ENV_NAMES["model_name"], config.backend_model_name
         )
 
+        # Tavily API key
+        tavily_key = env_values.get("TAVILY_API_KEY", "")
+        config.tavily_api_key = tavily_key or config.tavily_api_key
+        config.tavily_api_key = os.environ.get("TAVILY_API_KEY", config.tavily_api_key)
+
     @staticmethod
     def _value_source(
         env_name: str,
@@ -308,6 +313,7 @@ class ConfigManager:
         env_values[BACKEND_API_ENV_NAMES["api_base_url"]] = self.config.backend_api_base_url or ""
         env_values[BACKEND_API_ENV_NAMES["api_key"]] = self.config.backend_api_key or ""
         env_values[BACKEND_API_ENV_NAMES["model_name"]] = self.config.backend_model_name or ""
+        env_values["TAVILY_API_KEY"] = self.config.tavily_api_key or ""
         self._write_env_file(env_values)
 
     def _read_env_file(self) -> dict:
@@ -336,6 +342,7 @@ class ConfigManager:
             BACKEND_API_ENV_NAMES["api_base_url"],
             BACKEND_API_ENV_NAMES["api_key"],
             BACKEND_API_ENV_NAMES["model_name"],
+            "TAVILY_API_KEY",
         ]
         written = set()
         lines = ["# Liepin Agent API configuration"]
