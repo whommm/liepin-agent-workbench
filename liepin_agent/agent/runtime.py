@@ -212,11 +212,17 @@ class AgentRuntime:
                 )
                 plan = self.brain.initial_plan(jd_text, user_notes, criteria)
             consecutive_low_yield_rounds = 0
-            max_rounds = int(session.get("max_rounds") or 10)
+            config_max_rounds = getattr(
+                getattr(self.store, "config", None), "max_rounds_default", 20
+            )
+            config_low_yield = getattr(
+                getattr(self.store, "config", None), "consecutive_low_yield_threshold", 4
+            )
+            max_rounds = int(session.get("max_rounds") or config_max_rounds)
             max_detail_fetches = int(session.get("max_detail_fetches") or 999)
             target_ab_count = int(session.get("target_ab_count") or 999)
             max_runtime_minutes = int(session.get("max_runtime_minutes") or 0)
-            low_yield_threshold = 2
+            low_yield_threshold = int(session.get("consecutive_low_yield_threshold") or config_low_yield)
             run_mode = str(session.get("mode") or "自动")
 
             start_round_index = len(existing_rounds) + 1

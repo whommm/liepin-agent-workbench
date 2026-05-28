@@ -36,10 +36,10 @@
   "_comment_runtime": "【Agent 运行时参数】控制寻访任务的并发和停止条件",
   "match_queue_workers": 3,
   "match_concurrency_limit": 10,
-  "max_rounds_default": 10,
+  "max_rounds_default": 20,
   "max_detail_fetches_default": 999,
   "target_ab_count_default": 999,
-  "consecutive_low_yield_threshold": 2,
+  "consecutive_low_yield_threshold": 4,
   "jd_truncate_length": 800,
 
   "_comment_fetch": "【详情抓取策略】不同轮次类型的抓取上限和等待策略",

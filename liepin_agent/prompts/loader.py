@@ -296,11 +296,17 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 
 ### 1. 停止条件（如果 should_stop 为 true，必须 action=stop）
 - 已达到目标 A/B 数量
-- 连续多轮低产出且无明显改进空间
+- 连续多轮低产出且**完全没有任何改进迹象**（如重复相同关键词、反复换词但噪音根因一致）
 - 预算耗尽
-- 已穷尽合理搜索假设
+- 已穷尽**所有**合理搜索假设（core_background / target_company / transferable_scene / long_tail 四大方向均已尝试）
 
-### 2. 噪音归因与迭代策略
+### 2. 鼓励多搜索（重要）
+- **默认允许最多搜索 20 轮**，所以不要轻易停止。只要还有未尝试的关键词组合、未验证的搜索假设、未探索的 transferable_scene，就应该 continue。
+- 即使连续几轮低产出，只要每一轮都在尝试不同的搜索维度（换词、换行业、换假设类型），就是有价值的探索，**不要因为短期低产出自乱阵脚**。
+- 猎头寻访本来就是多轮试探过程，前 5-8 轮在摸清水下结构是完全正常的。
+- 只有在连续低产出**且**策略明显僵化（如一直在同一关键词上微调）时，才考虑停止。
+
+### 3. 噪音归因与迭代策略
 | 噪音根因 | 表现 | 迭代策略 |
 |---------|------|---------|
 | 关键词太宽 | 结果量大但匹配度低 | **收紧**：增加 AND 条件，加限定词 |
@@ -310,14 +316,15 @@ _BUILT_IN_PROMPTS: Dict[str, str] = {
 | 职级错配 | junior/senior 混错 | **调整**：加年限词或用 scope 区分 |
 | 长尾不足 | 核心人才被大词淹没 | **长尾狙击**：用专业工具/细分技术词 |
 
-### 3. 搜索假设迭代路径
+### 4. 搜索假设迭代路径
 - 不要重复 used_queries
 - 围绕 JD 核心要求自主调整搜索词，可以换同义词、加限定词、减词
 - 如果同一假设方向已验证成功，沿相邻场景扩展
 - 如果同一假设方向已验证失败，切换假设类型
-- 当 core_background 和 target_company 都耗尽时，优先尝试 transferable_scene
+- **四大假设类型（core_background / target_company / transferable_scene / long_tail）都至少尝试一轮之前，不要轻易判定"已穷尽"**
+- 当 core_background 和 target_company 都耗尽时，优先尝试 transferable_scene，其次 long_tail
 
-### 4. next_plan 字段要求
+### 5. next_plan 字段要求
 - query：2-3 个词 AND 组合，空格分隔，明确是收紧/放宽/换维度。**如果本轮搜索零产出，下一轮query必须减少到2个词，优先去掉最细分/最罕见的那个词**
 - filters：只保留 city / active_days / education / age / company，**严禁填充 work_years**
 - scope：target_company 优先用"目前/过往公司"；transferable_scene 用"全部经历"
