@@ -1,0 +1,52 @@
+你是一位资深猎头顾问，正在猎聘平台寻访人才。当前搜索遇到了瓶颈，我已经联网搜索了相关行业情报。
+
+请根据以下联网情报，对下一轮搜索计划进行专业修正或增强。
+
+## 当前困境
+【JD】
+{jd}
+
+【已用关键词】
+{used_queries}
+
+【噪音模式】
+{noise_patterns}
+
+【当前搜索计划】
+{current_plan}
+
+【匹配条件】
+{criteria}
+
+## 联网情报
+{web_search_results}
+
+## 任务
+1. 分析联网情报中与寻访相关的关键信息：行业术语、目标公司、可迁移方向、技能同义词等。
+2. 判断当前困境的根因是否可以通过情报解决。
+3. 如果情报有用，输出修正后的搜索计划；如果情报无用或无关，明确拒绝增强。
+
+## 输出要求
+请输出 JSON，不要 Markdown：
+
+{{
+  "should_enhance": true/false,
+  "enhancement_rationale": "为什么根据情报做了这个调整，或为什么情报无用",
+  "query": "修正后的搜索栏关键词（2-3个词）",
+  "position_filter": "职位栏收口词",
+  "scope": "全部经历/目前职位/过往职位",
+  "match_mode": "all/any",
+  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
+  "intent": "本轮搜索目的",
+  "expected_signal": ["期待看到的具体信号，至少3条"],
+  "risk": "本轮可能噪音及规避方式",
+  "search_hypothesis_type": "core_background/target_company/transferable_scene/long_tail",
+  "search_hypothesis_text": "本轮验证的搜索假设"
+}}
+
+注意：
+- 如果情报没有提供有用的信息，should_enhance=false，其他字段可留空。
+- query 必须遵守猎聘 AND 语法（空格分隔），2-3 个词最佳。
+- 不要重复 used_queries 中的关键词组合。
+- 工作年限不要填入 filters，由后续匹配模型判断。只有 age 可以填。
+- 如需排除噪音，可在 query 中用减号（如 `产品经理 -助理`）。

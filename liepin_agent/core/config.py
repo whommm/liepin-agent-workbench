@@ -39,6 +39,7 @@ class AppConfig(BaseModel):
     backend_model_name: str = ""
 
     tavily_api_key: str = ""
+    web_search_enabled: bool = True
     timeout: int = Field(default=300, ge=1, le=3600)
     theme: str = "light"
     liepin_browser_channel: str = "msedge"

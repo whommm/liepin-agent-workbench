@@ -24,6 +24,7 @@ from ..services.match_queue import MatchQueue
 from ..storage.sqlite_store import SQLiteStore
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
+from ..tools.web_search import WebSearchTool
 from .brain import LLMAgentBrain
 
 
@@ -46,6 +47,7 @@ class AgentRuntime:
         liepin_tool: Optional[object] = None,
         matcher: Optional[object] = None,
         agent_brain: Optional[object] = None,
+        web_search_tool: Optional[WebSearchTool] = None,
     ):
         self.store = store
         self.event_bus = event_bus or EventBus()
@@ -58,6 +60,7 @@ class AgentRuntime:
         self.liepin_tool = liepin_tool or RealLiepinTool()
         self.matcher = matcher or RealMatchService.from_config()
         self.brain = agent_brain or LLMAgentBrain.from_config()
+        self.web_search_tool = web_search_tool or WebSearchTool()
         self._threads: Dict[str, threading.Thread] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
         self._pause_events: Dict[str, threading.Event] = {}
@@ -534,6 +537,64 @@ class AgentRuntime:
                     review.summary,
                     review.to_dict(),
                 )
+
+                # Web Search 增强：当搜索遇到瓶颈时，联网查询补充情报
+                if (
+                    review.action != "stop"
+                    and review.next_plan
+                    and self.web_search_tool.enabled
+                    and consecutive_low_yield_rounds >= 1
+                    and round_index >= 2
+                ):
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.ROUND_REVIEW.value,
+                        "正在联网查询补充情报",
+                        "当前搜索遇到瓶颈，正在通过搜索引擎获取行业情报辅助决策。",
+                        {},
+                    )
+                    try:
+                        intel = self.web_search_tool.gather_intelligence(
+                            jd_text=jd_text,
+                            current_query=plan.query,
+                            used_queries=used_queries,
+                            noise_patterns=observation.noise_patterns,
+                        )
+                        if intel.summary:
+                            enhanced_plan = self.brain.enhance_plan_with_web_search(
+                                current_plan=review.next_plan,
+                                jd_text=jd_text,
+                                used_queries=used_queries,
+                                noise_patterns=observation.noise_patterns,
+                                web_search_intel=intel.to_dict(),
+                                criteria=criteria,
+                            )
+                            if enhanced_plan:
+                                self._event(
+                                    session_id,
+                                    round_id,
+                                    AgentEventType.ROUND_REVIEW.value,
+                                    "已根据联网情报修正搜索策略",
+                                    enhanced_plan.intent
+                                    or "搜索方向已根据外部情报调整。",
+                                    {
+                                        "original_plan": review.next_plan.to_dict(),
+                                        "enhanced_plan": enhanced_plan.to_dict(),
+                                        "intel_summary": intel.summary[:300],
+                                    },
+                                )
+                                review.next_plan = enhanced_plan
+                    except Exception as exc:
+                        logger.warning("Web search enhancement failed: %s", exc)
+                        self._event(
+                            session_id,
+                            round_id,
+                            AgentEventType.ERROR.value,
+                            "联网查询失败",
+                            str(exc),
+                            {},
+                        )
 
                 if review.action == "stop" or not review.next_plan:
                     break

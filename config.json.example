@@ -12,6 +12,7 @@
 
   "_comment_tavily": "【搜索增强】Tavily 搜索引擎 API Key（可选）",
   "tavily_api_key": "",
+  "web_search_enabled": true,
 
   "_comment_llm": "【LLM 调用参数】控制模型输出行为和重试策略",
   "timeout": 120,
