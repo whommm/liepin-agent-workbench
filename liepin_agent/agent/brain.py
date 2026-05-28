@@ -86,41 +86,6 @@ class RuleBasedAgentBrain:
             stop_reason=stop_reason,
         )
 
-    def enhance_plan_with_web_search(
-        self,
-        current_plan: SearchPlan,
-        jd_text: str,
-        used_queries: List[str],
-        noise_patterns: List[str],
-        web_search_intel: Dict[str, object],
-        criteria: Dict[str, object] | None = None,
-    ) -> Optional[SearchPlan]:
-        """Enhance next search plan with web search intelligence.
-
-        Returns a new SearchPlan if the web intelligence yields a useful
-        adjustment, otherwise None so the caller falls back to the
-        original plan.
-        """
-        if not web_search_intel or not web_search_intel.get("summary"):
-            return None
-
-        prompt = self._prompt.get(
-            "enhance_plan",
-            jd=jd_text or "",
-            used_queries=json.dumps(used_queries or [], ensure_ascii=False),
-            noise_patterns=json.dumps(noise_patterns or [], ensure_ascii=False),
-            current_plan=json.dumps(current_plan.to_dict(), ensure_ascii=False, indent=2),
-            web_search_results=str(web_search_intel.get("summary", "")),
-            criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
-        )
-        data = self._chat_json(prompt)
-        if not data.get("should_enhance"):
-            return None
-        enhanced = self._plan_from_data(data, criteria or {})
-        if enhanced.query in set(used_queries or []):
-            return None
-        return enhanced
-
     def apply_user_command(
         self,
         user_command: str,
@@ -329,6 +294,41 @@ class LLMAgentBrain:
             if isinstance(data.get("evidence"), dict)
             else {},
         )
+
+    def enhance_plan_with_web_search(
+        self,
+        current_plan: SearchPlan,
+        jd_text: str,
+        used_queries: List[str],
+        noise_patterns: List[str],
+        web_search_intel: Dict[str, object],
+        criteria: Dict[str, object] | None = None,
+    ) -> Optional[SearchPlan]:
+        """Enhance next search plan with web search intelligence.
+
+        Returns a new SearchPlan if the web intelligence yields a useful
+        adjustment, otherwise None so the caller falls back to the
+        original plan.
+        """
+        if not web_search_intel or not web_search_intel.get("summary"):
+            return None
+
+        prompt = self._prompt.get(
+            "enhance_plan",
+            jd=jd_text or "",
+            used_queries=json.dumps(used_queries or [], ensure_ascii=False),
+            noise_patterns=json.dumps(noise_patterns or [], ensure_ascii=False),
+            current_plan=json.dumps(current_plan.to_dict(), ensure_ascii=False, indent=2),
+            web_search_results=str(web_search_intel.get("summary", "")),
+            criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
+        )
+        data = self._chat_json(prompt)
+        if not data.get("should_enhance"):
+            return None
+        enhanced = self._plan_from_data(data, criteria or {})
+        if enhanced.query in set(used_queries or []):
+            return None
+        return enhanced
 
     def apply_user_command(
         self,
