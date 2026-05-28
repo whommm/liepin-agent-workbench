@@ -43,3 +43,26 @@ Thumbs.db
 .claude/
 .playwright-mcp/
 opencode.json
+
+# Temporary scripts and output files generated during development
+fix_brain*.py
+update_brain*.py
+safe_replace.py
+final_replace.py
+replace_bc.py
+extract_bc.py
+check_db*.py
+_tmp_*.py
+test_age_*.py
+test_planner_*.py
+test_greeting_flow.py
+actual_bc.txt
+db_output.txt
+diff.txt
+err.txt
+pytest_output.txt
+test_extract.txt
+test_greeting_output.txt
+test_planner_result.txt
+test_debug*.db
+.greeting_quota.json

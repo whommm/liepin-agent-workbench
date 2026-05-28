@@ -1,7 +1,0 @@
-﻿.\.venv\Scripts\python.exe : D:\liepin-agent-workbench\.venv\Scripts\python.exe: No module named pytest
-所在位置 行:1 字符: 31
-+ ... -workbench; .\.venv\Scripts\python.exe -m pytest tests -v 2>&1 | Out- ...
-+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (D:\liepin-agent...le named pytest:String) [], RemoteException
-    + FullyQualifiedErrorId : NativeCommandError
- 
