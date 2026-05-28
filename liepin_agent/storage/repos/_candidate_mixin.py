@@ -134,7 +134,15 @@ class _CandidateMixin:
                   SELECT m2.id
                   FROM match_results m2
                   WHERE m2.candidate_id = c.id
-                  ORDER BY m2.created_at DESC, m2.id DESC
+                  ORDER BY
+                      CASE UPPER(COALESCE(m2.tier, ''))
+                          WHEN 'A' THEN 1
+                          WHEN 'B' THEN 2
+                          WHEN 'C' THEN 3
+                          WHEN 'D' THEN 4
+                          ELSE 5
+                      END,
+                      m2.created_at DESC
                   LIMIT 1
               )
             LEFT JOIN candidate_details d

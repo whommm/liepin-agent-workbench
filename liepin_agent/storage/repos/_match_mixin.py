@@ -103,7 +103,7 @@ class _MatchMixin:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT COUNT(*) AS count
+                SELECT COUNT(DISTINCT candidate_id) AS count
                 FROM match_results
                 WHERE session_id = ? AND UPPER(COALESCE(tier, '')) IN ('A', 'B')
                 """,
