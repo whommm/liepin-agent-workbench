@@ -199,7 +199,7 @@ class LLMClient:
             logger.debug(
                 "_execute_with_retry: attempt=%s/%s func=%s",
                 attempt + 1,
-                self.MAX_RETRIES + 1,
+                self.max_retries + 1,
                 getattr(func, "__name__", func),
             )
             try:
@@ -214,7 +214,7 @@ class LLMClient:
                 if isinstance(translated, AuthError):
                     raise translated
                 last_error = translated
-                if attempt < self.MAX_RETRIES:
+                if attempt < self.max_retries:
                     sleep_sec = 1.0 * (2 ** attempt)
                     logger.info("_execute_with_retry: sleeping %.1fs before retry", sleep_sec)
                     time.sleep(sleep_sec)

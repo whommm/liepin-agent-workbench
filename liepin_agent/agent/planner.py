@@ -98,6 +98,9 @@ class Planner:
         education = self.extract_education(text)
         if education:
             filters["education"] = education
+        age = self.extract_age(text)
+        if age:
+            filters["age"] = age
         return SearchPlan(
             query=query,
             position_filter=position_filter,
@@ -262,6 +265,24 @@ class Planner:
         return []
 
     @staticmethod
+    def extract_age(text: str) -> str:
+        """Extract age upper limit or range from JD text."""
+        text = text or ""
+        # Match patterns like "40岁以内", "40周岁以下", "不超过40岁", "年龄40岁以下"
+        match = re.search(r"(?:年龄|年龄要求|年龄限制)?[:：\s]*(?:不超过|不大于|小于|低于|)?\s*(\d+)\s*周岁?\s*(?:以内|以下|之内|上限|下|内)", text)
+        if match:
+            return match.group(1)
+        # Match "年龄：25-35岁" or "年龄25~35"
+        match = re.search(r"(?:年龄|年龄要求)[:：\s]*(\d+)\s*(?:-|~|到|至|,)\s*(\d+)\s*周岁?", text)
+        if match:
+            return "{}-{}".format(match.group(1), match.group(2))
+        # Match "40岁" near age-related keywords
+        match = re.search(r"年龄(?:要求|限制)?[:：\s]*(\d+)\s*周岁?", text)
+        if match:
+            return match.group(1)
+        return ""
+
+    @staticmethod
     def extract_work_years(text: str) -> str:
         match = re.search(r"(\d+)\s*[-~到至]\s*(\d+)\s*年", text or "")
         if match:
@@ -283,10 +304,13 @@ class Planner:
         result = []
         work_years = Planner.extract_work_years(text)
         education = Planner.extract_education(text)
+        age = Planner.extract_age(text)
         if work_years:
             result.append(work_years)
         if education:
             result.append(education)
+        if age:
+            result.append("{}岁以内".format(age) if "-" not in age else "年龄{}".format(age))
         return result
 
     @staticmethod
