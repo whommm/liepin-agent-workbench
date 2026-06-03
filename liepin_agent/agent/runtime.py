@@ -64,6 +64,7 @@ class AgentRuntime:
         self._threads: Dict[str, threading.Thread] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
         self._pause_events: Dict[str, threading.Event] = {}
+        self._web_search_count: Dict[str, int] = {}
 
     def start_session(self, session_id: str) -> None:
         if session_id in self._threads and self._threads[session_id].is_alive():
@@ -163,6 +164,11 @@ class AgentRuntime:
 
             used_queries: List[str] = [
                 str(item.get("query") or "")
+                for item in existing_rounds
+                if item.get("query")
+            ]
+            used_query_signatures: List[str] = [
+                self._query_signature_from_round(item)
                 for item in existing_rounds
                 if item.get("query")
             ]
@@ -278,6 +284,7 @@ class AgentRuntime:
                     criteria_version_id=str(criteria.get("criteria_version_id") or ""),
                 )
                 used_queries.append(plan.query)
+                used_query_signatures.append(self._plan_signature(plan))
                 self._event(
                     session_id,
                     round_id,
@@ -442,11 +449,14 @@ class AgentRuntime:
                     self.store.update_round(
                         round_id, status=RoundStatus.FETCHING_DETAILS.value
                     )
+                    match_criteria = dict(criteria or {})
+                    match_criteria["jd_text"] = jd_text
+                    match_criteria["user_notes"] = user_notes
                     futures = self._fetch_and_match_candidates(
                         session_id,
                         round_id,
                         decision.candidate_ids,
-                        criteria,
+                        match_criteria,
                         cancel_event,
                         pause_event,
                     )
@@ -506,6 +516,19 @@ class AgentRuntime:
                     "正在调用模型综合匹配结果，决定下一轮搜索或停止。",
                     {"matched_count": len(match_results)},
                 )
+                review_criteria = dict(criteria or {})
+                if (
+                    plan.filters
+                    and plan.filters.get("city")
+                    and len(match_results) < 3
+                ):
+                    review_criteria["_strategy_hint"] = (
+                        "当前搜索设置了城市限制（{}）但结果极少，"
+                        "建议优先去掉 city 限制，保持搜索关键词不变，"
+                        "扩大地理范围后再搜一轮。".format(
+                            "、".join(str(c) for c in plan.filters.get("city") if c)
+                        )
+                    )
                 review = self.brain.review_round(
                     previous_plan=plan,
                     jd_text=jd_text,
@@ -515,7 +538,8 @@ class AgentRuntime:
                     target_met=total_ab_count >= target_ab_count,
                     should_stop=stop.should_stop,
                     stop_reason=stop.reason,
-                    criteria=criteria,
+                    criteria=review_criteria,
+                    used_query_signatures=used_query_signatures,
                 )
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 self.store.update_round(
@@ -544,28 +568,54 @@ class AgentRuntime:
                     review.to_dict(),
                 )
 
-                # Web Search 增强：当搜索遇到瓶颈时，联网查询补充情报
-                if (
+                # Web Search 增强：联网查询补充情报
+                web_search_max_per_session = 3
+                should_web_search = (
                     review.action != "stop"
                     and review.next_plan
                     and self.web_search_tool.enabled
-                    and consecutive_low_yield_rounds >= 1
-                    and round_index >= 2
-                ):
+                    and self._web_search_count.get(session_id, 0) < web_search_max_per_session
+                    and (
+                        consecutive_low_yield_rounds >= 1
+                        or (observation.noise_patterns and round_index >= 1)
+                        or round_index == 1
+                    )
+                )
+                if should_web_search:
+                    self._web_search_count[session_id] = (
+                        self._web_search_count.get(session_id, 0) + 1
+                    )
                     self._event(
                         session_id,
                         round_id,
                         AgentEventType.ROUND_REVIEW.value,
                         "正在联网查询补充情报",
-                        "当前搜索遇到瓶颈，正在通过搜索引擎获取行业情报辅助决策。",
-                        {},
+                        "Agent 正在通过搜索引擎获取行业情报辅助优化搜索策略。",
+                        {"web_search_count": self._web_search_count[session_id]},
                     )
                     try:
+                        custom_queries = self.brain.generate_web_search_queries(
+                            jd_text=jd_text,
+                            current_query=plan.query,
+                            used_queries=used_queries,
+                            noise_patterns=observation.noise_patterns,
+                            match_results=match_results,
+                            criteria=criteria,
+                        )
+                        self._event(
+                            session_id,
+                            round_id,
+                            AgentEventType.ROUND_REVIEW.value,
+                            "LLM 生成联网查询",
+                            "",
+                            {"custom_queries": custom_queries},
+                        )
                         intel = self.web_search_tool.gather_intelligence(
                             jd_text=jd_text,
                             current_query=plan.query,
                             used_queries=used_queries,
                             noise_patterns=observation.noise_patterns,
+                            custom_queries=custom_queries if custom_queries else None,
                         )
                         if intel.summary:
                             enhanced_plan = self.brain.enhance_plan_with_web_search(
@@ -738,6 +788,39 @@ class AgentRuntime:
             ),
             search_hypothesis_text=str(row.get("search_hypothesis_text") or ""),
         )
+
+    @staticmethod
+    def _query_signature_from_round(row: Dict[str, object]) -> str:
+        query = str(row.get("query") or "").strip()
+        position_filter = str(row.get("position_filter") or "").strip()
+        scope = str(row.get("scope") or "全部经历").strip()
+        from ..storage.sqlite_store import from_json
+
+        filters = from_json(row.get("filters_json"), {}) or {}
+        parts = [query]
+        if position_filter:
+            parts.append("pos={}".format(position_filter))
+        if scope and scope != "全部经历":
+            parts.append("scope={}".format(scope))
+        if filters.get("city"):
+            parts.append("city={}".format(",".join(str(c) for c in filters["city"] if c)))
+        if filters.get("company"):
+            parts.append("company={}".format(filters["company"]))
+        return " | ".join(parts)
+
+    @staticmethod
+    def _plan_signature(plan: SearchPlan) -> str:
+        parts = [plan.query]
+        if plan.position_filter:
+            parts.append("pos={}".format(plan.position_filter))
+        if plan.scope and plan.scope != "全部经历":
+            parts.append("scope={}".format(plan.scope))
+        filters = plan.filters or {}
+        if filters.get("city"):
+            parts.append("city={}".format(",".join(str(c) for c in filters["city"] if c)))
+        if filters.get("company"):
+            parts.append("company={}".format(filters["company"]))
+        return " | ".join(parts)
 
     def _fetch_and_match_candidates(
         self,

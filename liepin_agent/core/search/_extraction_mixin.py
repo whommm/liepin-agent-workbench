@@ -562,6 +562,15 @@ class _ExtractionMixin:
         return [], ""
 
 
+    @staticmethod
+    def _is_valid_profile_url(url: str) -> bool:
+        if not url:
+            return False
+        lower = url.lower().strip()
+        if lower.startswith("javascript:") or lower == "#" or lower == "void(0)":
+            return False
+        return True
+
     def _extract_profile_url(self, card) -> str:
         for selector in self.PROFILE_LINK_SELECTORS:
             try:
@@ -571,7 +580,7 @@ class _ExtractionMixin:
                 href = locator.get_attribute("href", timeout=300)
             except Exception:
                 continue
-            if href:
+            if self._is_valid_profile_url(href):
                 return self._ensure_absolute_url(href)
         try:
             href = card.evaluate(

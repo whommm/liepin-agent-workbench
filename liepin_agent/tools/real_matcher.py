@@ -22,10 +22,17 @@ MATCH_SYSTEM_PROMPT = """你是资深猎头顾问，判断候选人与岗位的�
 3. 看近期：近 3 年经验权重更高
 4. 不瞎编：推断要有依据，不确定的标注出来
 
+## 薪资匹配（重要）
+- **你必须自行从 JD 原文中读取岗位薪资范围，从简历中读取候选人目前/期望薪资，然后判断两者是否匹配。**
+- 如果 JD 中有明确薪资范围（如年薪 30-50万、月薪 25-35k 等），候选人期望/目前薪资严重超出该范围的，**不得评为 A 档**
+- 候选人薪资明显高于岗位上限的（如岗位 30-50万，候选人目前 80万+或期望 100万），应视为核心风险，至少降一档至 B 或 C
+- 候选人薪资明显低于岗位下限的（如岗位 30-50万，候选人目前 15万），除非有明确理由（如转行、地域差异），否则也需标注风险
+- 如果 JD 中未提及具体薪资范围（或只有"面议""竞争力薪资"等模糊表述），不做薪资判断，正常评估其他维度
+
 ## 档位
-A = 核心技能明确 + 近期相关
-B = 核心技能有但非近期，或行业有偏差但可迁移
-C = 有相关背景但核心技能不明确，需沟通确认
+A = 核心技能明确 + 近期相关 + 薪资匹配（或岗位未限薪资）
+B = 核心技能有但非近期，或行业有偏差但可迁移，或薪资略超范围但其他维度优秀
+C = 有相关背景但核心技能不明确，或薪资严重不匹配，需沟通确认
 D = 不相关或明显不符
 
 只输出 JSON，不要 Markdown。字段：
@@ -95,16 +102,51 @@ class RealMatchService:
 
     @staticmethod
     def _build_prompt(criteria: Dict[str, object], resume_text: str) -> str:
+        jd_section = ""
+        jd_text = str(criteria.get("jd_text") or "").strip()
+        if jd_text:
+            # JD 薪资信息通常在后半部分，不要简单截断前 N 字。
+            # 如果过长，保留头部（职位描述）+ 尾部（薪资、要求、福利）。
+            max_len = 4000
+            if len(jd_text) > max_len:
+                head = jd_text[:1500]
+                tail = jd_text[-(max_len - 1500):]
+                jd_trimmed = "{}\n\n...（中间省略）...\n\n{}".format(head, tail)
+            else:
+                jd_trimmed = jd_text
+            jd_section = """
+
+【岗位 JD 原文】
+{jd}
+
+请从 JD 原文中自行识别薪资范围（如有），并与简历中的候选人薪资信息对比。""".format(
+                jd=jd_trimmed
+            )
+
+        notes_section = ""
+        user_notes = str(criteria.get("user_notes") or "").strip()
+        if user_notes:
+            notes_section = """
+
+【项目要点 / 客户备注】
+{notes}
+
+以上是客户或项目经理额外强调的要求（如学历院校要求、英语等级、背调、经验区间、加班/休假制度等），匹配时必须重点参考，和 JD 要求同等重要。""".format(
+                notes=user_notes[:2000]
+            )
+
         return """【岗位匹配标准】
 {criteria}
 
 【候选人简历】
 {resume}
+{jd_section}
+{notes_section}
 
 请判断候选人与岗位的匹配档位：
-A = 核心技能明确 + 近期相关
-B = 核心技能有但非近期，或行业有偏差但可迁移
-C = 有相关背景但核心技能不明确，需沟通确认
+A = 核心技能明确 + 近期相关 + 薪资匹配（或岗位未限薪资）
+B = 核心技能有但非近期，或行业有偏差但可迁移，或薪资略超范围但其他维度优秀
+C = 有相关背景但核心技能不明确，或薪资严重不匹配，需沟通确认
 D = 不相关或明显不符
 
 要求：
@@ -112,9 +154,13 @@ D = 不相关或明显不符
 2. evidence 尽量引用简历原文证据。
 3. 合理推断要有依据，不确定的放入 questions。
 4. A/B/C/D 只是标签，核心是证据、推断、风险和待确认问题。
+5. **薪资匹配：你必须自行从 JD 原文中读取岗位薪资范围，从简历中读取候选人薪资，然后判断。严重不匹配时必须在 risks 中明确标注，且不得给 A 档。**
+6. **项目要点中的额外要求（如 CET4、211 硕士、背调接受度、经验区间等）必须重点评估，不符合的不得给 A 档。**
 """.format(
             criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
             resume=resume_text or "",
+            jd_section=jd_section,
+            notes_section=notes_section,
         )
 
     @staticmethod

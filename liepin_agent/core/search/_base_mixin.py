@@ -55,6 +55,7 @@ class _BaseMixin:
 
     def _dismiss_any_open_modal(self, page: Page) -> None:
         """关闭页面上可能残留的城市选择模态框/遮罩层，防止遮挡后续交互。"""
+        # 1. 关闭标准 ant-modal 弹窗
         try:
             modal = page.locator(
                 "div.ant-modal.city-modal, div.ant-modal-wrap.antd-fd-city-modal"
@@ -67,6 +68,7 @@ class _BaseMixin:
             logger.warning("检测到残留模态框，尝试关闭...")
             for selector in (
                 'button:has-text("取消")',
+                'button:has-text("关闭")',
                 "button.ant-modal-close",
                 "span.ant-modal-close-x",
             ):
@@ -85,8 +87,10 @@ class _BaseMixin:
             except Exception:
                 pass
 
+        # 2. 强制关闭猎聘城市选择器侧边栏/下拉菜单等遮挡层
         try:
             page.evaluate("""() => {
+                // 关闭 ant-select 下拉菜单
                 document.querySelectorAll('.ant-select-dropdown').forEach(function(el) {
                     var style = window.getComputedStyle(el);
                     if (style.display !== 'none' && style.visibility !== 'hidden') {
@@ -94,17 +98,46 @@ class _BaseMixin:
                         el.style.pointerEvents = 'none';
                     }
                 });
-                document.querySelectorAll('.ant-modal-wrap, .ant-modal-mask, .ant-city-menu-list').forEach(function(el) {
+                // 关闭城市选择器侧边栏 (antd-lp-city-sider)
+                document.querySelectorAll('.antd-lp-city-sider, .antd-lp-city-sider-switch, [class*="city-sider"]').forEach(function(el) {
                     var style = window.getComputedStyle(el);
                     var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
                     var visible = style.display !== 'none' && style.visibility !== 'hidden' && rect && rect.width > 0 && rect.height > 0;
-                    if (!visible) {
+                    if (visible) {
+                        el.style.display = 'none';
                         el.style.pointerEvents = 'none';
+                    }
+                });
+                // 关闭 ant-menu 下拉列表
+                document.querySelectorAll('.ant-menu, .ant-city-menu-list, [class*="city-menu"]').forEach(function(el) {
+                    var style = window.getComputedStyle(el);
+                    var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                    var visible = style.display !== 'none' && style.visibility !== 'hidden' && rect && rect.width > 0 && rect.height > 0;
+                    if (visible) {
+                        el.style.display = 'none';
+                        el.style.pointerEvents = 'none';
+                    }
+                });
+                // 关闭 ant-modal-wrap / mask
+                document.querySelectorAll('.ant-modal-wrap, .ant-modal-mask').forEach(function(el) {
+                    var style = window.getComputedStyle(el);
+                    var rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                    var visible = style.display !== 'none' && style.visibility !== 'hidden' && rect && rect.width > 0 && rect.height > 0;
+                    if (visible) {
+                        el.style.pointerEvents = 'none';
+                        el.style.display = 'none';
                     }
                 });
             }""")
         except Exception as exc:
             logger.debug("JS dismiss modal failed: %s", exc)
+
+        # 3. 兜底：发送 Escape 键关闭可能残留的面板
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
 
 
     @staticmethod

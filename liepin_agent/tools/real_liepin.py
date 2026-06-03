@@ -70,24 +70,50 @@ class RealLiepinTool:
     def close_browser(self) -> None:
         self.browser_manager.close_browser()
 
+    # 猎聘城市弹窗对直辖市（北京/上海/天津/重庆）不稳定，直接合并到 query
+    _MUNICIPALITIES = ("北京", "上海", "天津", "重庆")
+
     def run_search_round(
         self, session_id: str, round_id: str, plan: SearchPlan
     ) -> List[CandidateSummary]:
         """Run one real Liepin search and return only result-card summaries."""
         _ = session_id, round_id
         filters = self._map_filters(plan.filters or {})
+
+        # Workaround: 直辖市城市弹窗点击不稳定，把城市名合并到 query 中
+        query = plan.query
+        original_cities = plan.filters.get("city") if plan.filters else None
+        if original_cities:
+            cities = (
+                original_cities
+                if isinstance(original_cities, list)
+                else [original_cities]
+            )
+            for city in cities:
+                city_str = str(city).strip()
+                if city_str and city_str in self._MUNICIPALITIES:
+                    if city_str not in query:
+                        query = "{} {}".format(query, city_str)
+                    filters.pop("目前城市", None)
+                    filters.pop("期望城市", None)
+
+        max_pages = getattr(
+            self.config_manager.config, "search_max_pages_per_round", 3
+        )
         logger.warning(
-            "RealLiepinTool search query=%s position=%s filters=%s",
-            plan.query,
+            "RealLiepinTool search query=%s position=%s filters=%s max_pages=%s",
+            query,
             plan.position_filter,
             filters,
+            max_pages,
         )
         candidates = self.search_service.search(
-            plan.query,
+            query,
             filters=filters,
             match_mode=plan.match_mode,
             scope=plan.scope,
             position_filter=plan.position_filter,
+            max_pages=max_pages,
         )
         return [
             self._to_candidate_summary(item, index)
@@ -107,6 +133,7 @@ class RealLiepinTool:
             profile_url=str(candidate.get("profile_url") or ""),
             summary=str(candidate.get("summary_text") or ""),
             result_index=int(candidate.get("result_index") or 0),
+            page_meta=dict(candidate.get("page_meta") or {}),
         )
 
         def _extract(page):

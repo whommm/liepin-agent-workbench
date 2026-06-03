@@ -114,15 +114,47 @@ class _DetailMixin:
         if candidate.result_index < 0:
             raise LiepinSearchPageChangedError("候选人缺少详情入口，无法打开完整简历")
 
+        # 如果候选人来自非第1页，先导航到对应页面（避免 result_index 在当前页上失效）
+        target_page_num = candidate.page_meta.get("page_num", 1) if candidate.page_meta else 1
+        if target_page_num > 1:
+            current_page_num = self._get_current_page_number(page)
+            if current_page_num != target_page_num:
+                logger.warning(
+                    "open_candidate_detail: candidate from page %s but current page is %s, navigating",
+                    target_page_num,
+                    current_page_num,
+                )
+                navigated = False
+                try:
+                    navigated = self._navigate_to_page_via_url(page, target_page_num)
+                except Exception:
+                    pass
+                if not navigated:
+                    try:
+                        navigated = self._click_page_number(page, target_page_num)
+                    except Exception:
+                        pass
+                if navigated:
+                    self._soft_wait_for_results(page)
+                else:
+                    logger.warning(
+                        "open_candidate_detail: failed to navigate to page %s", target_page_num
+                    )
+
         try:
             before_pages = list(page.context.pages)
         except Exception:
             before_pages = [page]
 
+        # 优先用姓名+公司匹配点击（比 result_index 更可靠，不受翻页影响）
+        target_name = (candidate.name or "").strip()
+        target_company = (candidate.current_company or "").strip()
         try:
             clicked = page.evaluate(
                 r"""
-                (targetIndex) => {
+                (args) => {
+                  const targetName = args.name || '';
+                  const targetCompany = args.company || '';
                   // Use the same action-button logic as DOM fallback for consistency
                   let actionButtons = Array.from(document.querySelectorAll('button')).filter((button) => {
                     const text = (button.innerText || button.textContent || '').replace(/\s+/g, ' ').trim();
@@ -148,7 +180,6 @@ class _DetailMixin:
                       const rect = current.getBoundingClientRect ? current.getBoundingClientRect() : null;
                       const text = (current.innerText || current.textContent || '').replace(/\s+/g, ' ').trim();
                       const checkbox = current.querySelector('input[name="res_id_encode"]');
-                      // RELAXED: match DOM fallback size rules
                       const minWidth = window.innerWidth < 1500 ? 400 : 600;
                       const minHeight = window.innerHeight < 800 ? 80 : 100;
                       if (checkbox && rect && rect.height >= minHeight && rect.width >= minWidth && text.length >= 10) {
@@ -168,7 +199,23 @@ class _DetailMixin:
                     containers.push(chosen);
                   }
 
-                  const container = containers[targetIndex];
+                  // 先用姓名+公司匹配，找不到再用 result_index
+                  let container = null;
+                  if (targetName) {
+                    for (const c of containers) {
+                      const text = (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
+                      if (text.includes(targetName)) {
+                        if (!targetCompany || text.includes(targetCompany)) {
+                          container = c;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  // 姓名匹配失败，fallback 到 result_index
+                  if (!container && args.resultIndex >= 0 && args.resultIndex < containers.length) {
+                    container = containers[args.resultIndex];
+                  }
                   if (!container) {
                     return false;
                   }
@@ -187,7 +234,7 @@ class _DetailMixin:
                   return true;
                 }
                 """,
-                candidate.result_index,
+                {"name": target_name, "company": target_company, "resultIndex": candidate.result_index},
             )
         except Exception as exc:
             raise LiepinSearchPageChangedError(

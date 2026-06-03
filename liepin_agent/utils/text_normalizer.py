@@ -45,6 +45,7 @@ NOISE_CONTAINS = {
     "简历洞察", "一秒洞察", "去查看", "算法备案",
     "算法推荐", "违法和不良信息举报", "未成年人举报",
     "Copyright", "All Rights Reserved", "人才服务许可证",
+    "ICP备", "ICP经营许可证", "ICP证", "公网安备", "营业执照",
 }
 
 NOISE_PATTERNS = [
@@ -60,6 +61,10 @@ NOISE_PATTERNS = [
 ]
 
 
+# 薪资相关关键词，包含这些的行不应被噪音过滤误伤
+_SALARY_KEYWORDS = ("年薪", "月薪", "薪资", "期望", "目前", "k", "万", "元")
+
+
 def is_noise_line(line: str) -> bool:
     """Heuristic to decide whether a single line is page UI noise."""
     text = line.strip()
@@ -73,10 +78,12 @@ def is_noise_line(line: str) -> bool:
         for keyword in NOISE_CONTAINS:
             if keyword in text:
                 return True
-    # Pattern-based noise
-    for pattern in NOISE_PATTERNS:
-        if pattern.match(text):
-            return True
+    # Pattern-based noise — 但保护薪资相关信息
+    is_salary_related = any(kw in text for kw in _SALARY_KEYWORDS)
+    if not is_salary_related:
+        for pattern in NOISE_PATTERNS:
+            if pattern.match(text):
+                return True
     # Very short lines that are not meaningful Chinese words
     if len(text) <= 2 and not re.search(r"[\u4e00-\u9fa5]{2}", text):
         return True
@@ -101,11 +108,13 @@ def build_resume_text(
     project_lines: Iterable[str],
     education_lines: Iterable[str],
     extra_lines: Iterable[str],
+    job_intention_lines: Iterable[str] = None,
 ) -> str:
     """Build a stable resume text structure for downstream matching."""
 
     sections = [
         ("候选人基础信息", clean_text_lines(basic_lines)),
+        ("求职期望", clean_text_lines(job_intention_lines or [])),
         ("个人概述", clean_text_lines(summary_lines)),
         ("工作经历", clean_text_lines(experience_lines)),
         ("项目经历", clean_text_lines(project_lines)),

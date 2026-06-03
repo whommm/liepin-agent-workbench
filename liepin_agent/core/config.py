@@ -72,6 +72,9 @@ class AppConfig(BaseModel):
     consecutive_low_yield_threshold: int = Field(default=4, ge=1, le=10)
     jd_truncate_length: int = Field(default=800, ge=100, le=5000)
 
+    # 搜索参数
+    search_max_pages_per_round: int = Field(default=3, ge=1, le=10)
+
     # 浏览器自动化参数
     browser_task_timeout: int = Field(default=180, ge=30, le=600)
     detail_page_wait_seconds: float = Field(default=0.6, ge=0.0, le=10.0)

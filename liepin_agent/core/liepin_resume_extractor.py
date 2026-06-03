@@ -86,6 +86,18 @@ class LiepinResumeExtractor:
         ".additional-info",
         ".skill-info",
     ]
+    JOB_INTENTION_SELECTORS = [
+        # Primary: heading text-based
+        'heading:has-text("求职期望")',
+        'heading:has-text("求职意向")',
+        'heading:has-text("期望工作")',
+        'xpath=//*[contains(text(), "求职期望") or contains(text(), "求职意向") or contains(text(), "期望工作")]/following-sibling::*[1]',
+        # Fallback: class-based
+        ".job-intention",
+        ".intention-section",
+        ".expectation-section",
+        ".resume-intention",
+    ]
 
     def extract_candidate(
         self, page: Page, summary: LiepinSearchCandidate
@@ -99,6 +111,7 @@ class LiepinResumeExtractor:
             project_lines=sections.get("projects", []),
             education_lines=sections.get("education", []),
             extra_lines=sections.get("extra", []),
+            job_intention_lines=sections.get("job_intention", []),
         )
         summary_lines = (
             sections.get("basic_info", [])
@@ -164,6 +177,7 @@ class LiepinResumeExtractor:
             "projects": self._extract_first_section(page, self.PROJECT_SELECTORS),
             "education": self._extract_first_section(page, self.EDUCATION_SELECTORS),
             "extra": self._extract_first_section(page, self.EXTRA_SELECTORS),
+            "job_intention": self._extract_first_section(page, self.JOB_INTENTION_SELECTORS),
         }
         if not any(sections.values()):
             # Fallback: extract full body text as basic_info so we don't lose everything

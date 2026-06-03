@@ -249,6 +249,7 @@ class _FiltersMixin:
             )
 
         if low_value:
+            self._dismiss_any_open_modal(page)
             low_input = self._resolve_filter_locator(
                 page,
                 container,
@@ -257,6 +258,7 @@ class _FiltersMixin:
             )
             self._fill_filter_input(low_input, low_value)
         if high_value:
+            self._dismiss_any_open_modal(page)
             high_input = self._resolve_filter_locator(
                 page,
                 container,
@@ -685,7 +687,14 @@ class _FiltersMixin:
 
     @staticmethod
     def _fill_filter_input(locator, value: str) -> None:
-        locator.click(timeout=3000)
+        try:
+            locator.click(timeout=3000)
+        except Exception:
+            # 如果被遮挡，尝试强制点击
+            try:
+                locator.click(timeout=3000, force=True)
+            except Exception:
+                locator.focus()
         try:
             locator.fill("")
             locator.fill(value)
@@ -812,7 +821,13 @@ class _FiltersMixin:
         normalized = (value or "").strip()
         if not normalized:
             return False
-        expected_texts = (normalized, "全{}".format(normalized))
+        expected_texts = [normalized, "全{}".format(normalized)]
+        # 直辖市常见变体（猎聘城市弹窗中可能显示为"上海市"等）
+        if normalized in ("北京", "上海", "天津", "重庆"):
+            expected_texts.extend([
+                "{}市".format(normalized),
+                "全{}市".format(normalized),
+            ])
         selectors = [
             "span.ant-tag.ant-tag-checkable",
             "label.tag-item",

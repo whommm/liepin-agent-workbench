@@ -40,8 +40,9 @@ class _ExecutorMixin:
         match_mode: str = "",
         scope: str = "",
         position_filter: str = "",
+        max_pages: int = 1,
     ) -> List[LiepinSearchCandidate]:
-        """Run a keyword search, apply optional filters, and return first page summaries."""
+        """Run a keyword search, apply optional filters, and return result summaries."""
         if not keyword.strip():
             raise LiepinSearchError("搜索关键词不能为空")
 
@@ -60,16 +61,64 @@ class _ExecutorMixin:
                 self._execute_search(page, keyword.strip())
             if filters:
                 self._apply_filters_on_page(page, filters)
-            candidates = self.extract_candidates_from_page(page)
-            page_meta = self._extract_page_meta(page)
-            for c in candidates:
-                c.page_meta = page_meta
-            return candidates
+
+            all_candidates: List[LiepinSearchCandidate] = []
+            seen_keys: set[str] = set()
+
+            for page_num in range(1, max_pages + 1):
+                try:
+                    candidates = self.extract_candidates_from_page(page)
+                except Exception as exc:
+                    if page_num == 1:
+                        raise
+                    logger.warning(
+                        "search: page %s extraction failed, stopping pagination: %s",
+                        page_num,
+                        exc,
+                    )
+                    break
+
+                page_meta = self._extract_page_meta(page)
+
+                new_candidates = []
+                for c in candidates:
+                    c.page_meta = {**page_meta, "page_num": page_num}
+                    dedupe_key = self._candidate_dedupe_key(c)
+                    if dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+                    c.result_index = len(all_candidates) + len(new_candidates)
+                    new_candidates.append(c)
+
+                all_candidates.extend(new_candidates)
+
+                if page_num < max_pages:
+                    next_ok = self.go_to_next_result_page()
+                    if not next_ok:
+                        logger.warning(
+                            "search: pagination stopped at page %s", page_num
+                        )
+                        break
+
+            return all_candidates
 
         return self._with_debug_snapshot(
             "search_keyword_{}".format(keyword.strip()),
             lambda: self.browser_manager.run_with_page(_run),
         )
+
+    @staticmethod
+    def _candidate_dedupe_key(candidate: LiepinSearchCandidate) -> str:
+        url = (candidate.profile_url or "").strip()
+        if url:
+            if url.startswith("/") and not url.startswith("//"):
+                url = "https://h.liepin.com" + url
+            return url
+        return "|".join([
+            (candidate.name or "").strip(),
+            (candidate.current_company or "").strip(),
+            (candidate.current_title or "").strip(),
+        ])
 
 
     def _execute_search(

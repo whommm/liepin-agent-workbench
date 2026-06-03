@@ -45,8 +45,8 @@ def test_sales_position_is_not_treated_as_default_noise():
         negative_terms=["销售", "客服"],
     )
 
-    assert score >= 65
+    assert score >= 45  # pre_score 对销售岗已降级为固定 50
     assert not any("销售" in reason and "疑似噪音" in reason for reason in reasons)
-    assert decision == "fetch"
+    assert decision in ("fetch", "maybe")  # 销售岗 pre_score 降级后可能为 maybe
     assert "客服" not in risks
     assert signals

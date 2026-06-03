@@ -108,12 +108,13 @@ class WebSearchTool:
         current_query: str,
         used_queries: List[str],
         noise_patterns: List[str],
+        custom_queries: Optional[List[str]] = None,
     ) -> WebSearchIntel:
         """Gather web intelligence based on current sourcing困境."""
         if not self.enabled:
             return WebSearchIntel(summary="Web search not configured.")
 
-        queries = self._build_search_queries(jd_text, current_query, noise_patterns)
+        queries = custom_queries if custom_queries else self._build_search_queries(jd_text, current_query, noise_patterns)
         all_results: List[Dict[str, str]] = []
         for q in queries:
             results = self.search(q, max_results=3)

@@ -72,8 +72,9 @@ class RuleBasedAgentBrain:
         noise_patterns: List[str],
         target_met: bool,
         should_stop: bool,
-        stop_reason: str,
+        stop_reason: str = "",
         criteria: Dict[str, object] | None = None,
+        **kwargs,
     ) -> RoundReview:
         return self.reviewer.review(
             previous_plan=previous_plan,
@@ -255,6 +256,7 @@ class LLMAgentBrain:
         should_stop: bool,
         stop_reason: str,
         criteria: Dict[str, object] | None = None,
+        used_query_signatures: List[str] | None = None,
     ) -> RoundReview:
         prompt = self._prompt.get(
             "review_round",
@@ -284,7 +286,8 @@ class LLMAgentBrain:
         next_plan = None
         if action != "stop" and isinstance(data.get("next_plan"), dict):
             next_plan = self._plan_from_data(data["next_plan"], {})
-            if next_plan.query in set(used_queries or []):
+            signatures = set(used_query_signatures or used_queries or [])
+            if self._plan_signature(next_plan) in signatures:
                 action = "stop"
         return RoundReview(
             action=action if action in {"continue", "stop"} else "continue",
@@ -294,6 +297,42 @@ class LLMAgentBrain:
             if isinstance(data.get("evidence"), dict)
             else {},
         )
+
+    @staticmethod
+    def _plan_signature(plan: SearchPlan) -> str:
+        parts = [plan.query]
+        if plan.position_filter:
+            parts.append("pos={}".format(plan.position_filter))
+        if plan.scope and plan.scope != "全部经历":
+            parts.append("scope={}".format(plan.scope))
+        filters = plan.filters or {}
+        if filters.get("city"):
+            parts.append("city={}".format(",".join(str(c) for c in filters["city"] if c)))
+        if filters.get("company"):
+            parts.append("company={}".format(filters["company"]))
+        return " | ".join(parts)
+
+    def generate_web_search_queries(
+        self,
+        jd_text: str,
+        current_query: str,
+        used_queries: List[str],
+        noise_patterns: List[str],
+        match_results: List[Dict[str, object]],
+        criteria: Dict[str, object] | None = None,
+    ) -> List[str]:
+        """让 LLM 根据当前寻访困境生成有针对性的联网搜索查询。"""
+        prompt = self._prompt.get(
+            "generate_web_search_queries",
+            jd=jd_text or "",
+            current_query=current_query or "",
+            used_queries=json.dumps(used_queries or [], ensure_ascii=False),
+            noise_patterns=json.dumps(noise_patterns or [], ensure_ascii=False),
+            matches=json.dumps(match_results or [], ensure_ascii=False, indent=2),
+            criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
+        )
+        data = self._chat_json(prompt)
+        return self._string_list(data.get("queries"))[:3]
 
     def enhance_plan_with_web_search(
         self,
