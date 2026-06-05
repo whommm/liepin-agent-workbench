@@ -18,28 +18,28 @@ class CandidatePicker:
 
     DEFAULT_STRATEGIES = {
         RoundType.SAMPLE_DETAIL.value: {
-            "limit": 10,
+            "limit": 999,
             "min_results": 3,
             "timeout_seconds": 300,
-            "high_confidence": 4,
-            "diversity": 3,
-            "uncertain": 3,
+            "high_confidence": 999,
+            "diversity": 999,
+            "uncertain": 999,
         },
         RoundType.VALIDATE_DETAIL.value: {
-            "limit": 20,
+            "limit": 999,
             "min_results": 8,
             "timeout_seconds": 300,
-            "high_confidence": 12,
-            "diversity": 4,
-            "uncertain": 4,
+            "high_confidence": 999,
+            "diversity": 999,
+            "uncertain": 999,
         },
         RoundType.HARVEST_DETAIL.value: {
-            "limit": 40,
+            "limit": 999,
             "min_results": 5,
             "timeout_seconds": 300,
-            "high_confidence": 30,
-            "diversity": 6,
-            "uncertain": 4,
+            "high_confidence": 999,
+            "diversity": 999,
+            "uncertain": 999,
         },
     }
 
@@ -112,8 +112,6 @@ class CandidatePicker:
             if item.id not in seen and item.card_decision == "fetch":
                 picked.append(item)
                 seen.add(item.id)
-            if len(picked) >= max(1, int(limit * 0.65)):
-                break
 
         by_company = defaultdict(list)
         for item in sorted_candidates:

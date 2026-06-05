@@ -137,6 +137,8 @@ class LLMAgentBrain:
             "keywords_text": str(data.get("core_requirement") or "").strip(),
             "search_direction": str(data.get("search_direction") or "").strip(),
             "target_companies": self._string_list(data.get("target_companies"))[:8],
+            "city_requirement": str(data.get("city_requirement") or "").strip(),
+            "city_scope": self._string_list(data.get("city_scope"))[:8],
         }
 
     def initial_plan(
@@ -212,8 +214,9 @@ class LLMAgentBrain:
             if item in valid_ids
         ]
         # 不再硬上限 15，完全信任 LLM 的抓取决策（用户明确不在乎成本）
+        # 以 LLM 实际返回的 candidate_ids 长度为准，不受 fetch_limit 字段额外约束
         fetch_limit = min(
-            int(data.get("fetch_limit") or len(candidate_ids)),
+            len(candidate_ids),
             remaining_detail_budget,
         )
         candidate_ids = candidate_ids[:fetch_limit]

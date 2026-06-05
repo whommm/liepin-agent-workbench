@@ -235,6 +235,7 @@ class _CriteriaMixin:
                 "negative_terms": ai_raw.get("negative_terms") or [],
                 "hard_requirements": ai_raw.get("hard_requirements") or [],
                 "city_scope": ai_raw.get("city_scope") or [],
+                "city_requirement": str(ai_raw.get("city_requirement") or "").strip(),
                 "position_filter": str(ai_raw.get("position_filter") or "").strip(),
                 "selected_direction": str(ai_raw.get("selected_direction") or "").strip(),
             }

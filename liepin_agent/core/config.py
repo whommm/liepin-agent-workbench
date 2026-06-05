@@ -81,9 +81,9 @@ class AppConfig(BaseModel):
     greeting_page_wait_seconds: float = Field(default=1.5, ge=0.0, le=10.0)
 
     # 详情抓取策略参数
-    sample_detail_limit: int = Field(default=10, ge=1, le=50)
-    validate_detail_limit: int = Field(default=20, ge=1, le=50)
-    harvest_detail_limit: int = Field(default=40, ge=1, le=100)
+    sample_detail_limit: int = Field(default=999, ge=1, le=9999)
+    validate_detail_limit: int = Field(default=999, ge=1, le=9999)
+    harvest_detail_limit: int = Field(default=999, ge=1, le=9999)
     sample_detail_min_results: int = Field(default=3, ge=1, le=20)
     validate_detail_min_results: int = Field(default=8, ge=1, le=20)
     match_wait_timeout_seconds: int = Field(default=300, ge=30, le=1800)
