@@ -7,8 +7,11 @@ tests and emergency fallback only; it is not wired as the default runtime brain.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from ..core.config import ConfigManager
 from ..domain.models import (
@@ -25,6 +28,45 @@ from .candidate_picker import CandidatePicker
 from .observer import Observer
 from .planner import Planner
 from .reviewer import Reviewer
+
+# 程序护栏常量：LLM 偶尔违反搜索规则，用代码兜底避免零产出 / 重复搜索。
+
+# query 词数上限（按空格分词后的词数）。第一轮探测或常规轮次，超过 3 个词
+# AND 在猎聘上几乎一定零产出，截断到 MAX_QUERY_TERMS。
+MAX_QUERY_TERMS = 3
+
+# 常见职位方向后缀/关键词。query 里出现这些词时，说明 query 已自带职位方向，
+# 此时再填 position_filter 会形成双重 AND 过滤、把结果挤压到归零，应清空它。
+_POSITION_TITLE_TOKENS = (
+    "总监", "经理", "主管", "工程师", "设计师", "专员", "顾问", "主任", "厂长",
+    "架构师", "分析师", "产品经理", "设计师", "开发", "设计师", "插画师", "工程师",
+    "研究员", "设计师", "美术",
+)
+# 常见职位方向词根（不带后缀，单独出现也算职位方向）
+_POSITION_TITLE_ROOTS = (
+    "设计", "研发", "产品", "运营", "算法", "前端", "后端", "测试", "运维",
+    "插画", "原画", "美宣", "视觉", "平面设计", "结构", "机械",
+)
+
+
+def _query_has_position_intent(query: str) -> bool:
+    """query 是否已经自带职位方向（用于双重过滤检测）。"""
+    text = (query or "").strip()
+    if not text:
+        return False
+    if any(token in text for token in _POSITION_TITLE_TOKENS):
+        return True
+    return any(root in text for root in _POSITION_TITLE_ROOTS)
+
+
+def _normalize_query_terms(query: str) -> List[str]:
+    """把 query 拆成词列表，去掉排除词（-xxx）后返回，用于词集去重和词数统计。"""
+    terms: List[str] = []
+    for part in (query or "").split():
+        part = part.strip()
+        if part and not part.startswith("-"):
+            terms.append(part)
+    return terms
 
 
 class RuleBasedAgentBrain:
@@ -139,6 +181,9 @@ class LLMAgentBrain:
             "target_companies": self._string_list(data.get("target_companies"))[:8],
             "city_requirement": str(data.get("city_requirement") or "").strip(),
             "city_scope": self._string_list(data.get("city_scope"))[:8],
+            # gender_requirement 直接影响猎聘搜索的性别筛选，必须透传，
+            # 否则下游 initial_plan / matcher 都拿不到 JD 的性别要求。
+            "gender_requirement": str(data.get("gender_requirement") or "").strip(),
         }
 
     def initial_plan(
@@ -288,7 +333,7 @@ class LLMAgentBrain:
             )
         next_plan = None
         if action != "stop" and isinstance(data.get("next_plan"), dict):
-            next_plan = self._plan_from_data(data["next_plan"], {})
+            next_plan = self._plan_from_data(data["next_plan"], criteria or {})
             signatures = set(used_query_signatures or used_queries or [])
             if self._plan_signature(next_plan) in signatures:
                 action = "stop"
@@ -303,7 +348,10 @@ class LLMAgentBrain:
 
     @staticmethod
     def _plan_signature(plan: SearchPlan) -> str:
-        parts = [plan.query]
+        # query 用词集去重，让 "潮玩 插画" 和 "插画 潮玩" 识别为同一签名，
+        # 避免模型靠调换词序绕过 used_query 检查而反复搜同一组合。
+        terms = sorted(_normalize_query_terms(plan.query))
+        parts = [" ".join(terms)]
         if plan.position_filter:
             parts.append("pos={}".format(plan.position_filter))
         if plan.scope and plan.scope != "全部经历":
@@ -389,9 +437,69 @@ class LLMAgentBrain:
             return self._plan_from_data(data, criteria)
         return current_plan
 
+    # JSON 解析重试上限：LLM 偶尔输出不规范的 JSON（被截断、夹带说明文字、
+    # 空回复等），直接抛异常会让整个寻访 session 失败。这里在解析失败时把
+    # 上次的错误输出反馈给模型，给它 1-2 次自我纠正的机会，避免一次抖动
+    # 导致全盘皆输。
+    JSON_PARSE_MAX_RETRIES = 2
+
     def _chat_json(self, prompt: str) -> Dict[str, object]:
-        raw = self.llm_client.chat(prompt, system_message=system_prompt())
-        return self._parse_json(raw)
+        last_error: Optional[Exception] = None
+        last_raw = ""
+        for attempt in range(self.JSON_PARSE_MAX_RETRIES + 1):
+            if attempt == 0:
+                full_prompt = prompt
+            else:
+                # 把上一次的错误输出和解析失败原因反馈给模型，要求严格重出 JSON。
+                full_prompt = self._build_retry_prompt(prompt, last_raw, last_error)
+                logger.warning(
+                    "brain._chat_json: JSON parse retry %s/%s after error: %s",
+                    attempt,
+                    self.JSON_PARSE_MAX_RETRIES,
+                    last_error,
+                )
+            raw = self.llm_client.chat(full_prompt, system_message=system_prompt())
+            last_raw = raw or ""
+            try:
+                return self._parse_json(raw)
+            except (ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                logger.warning(
+                    "brain._chat_json: parse failed on attempt %s, raw_len=%s, head=%r",
+                    attempt + 1,
+                    len(last_raw),
+                    last_raw[:200],
+                )
+        # 重试用尽仍失败，抛出最后一次的解析异常，由 runtime 兜底处理。
+        raise last_error or ValueError("Agent JSON 解析失败")
+
+    @staticmethod
+    def _build_retry_prompt(
+        original_prompt: str, bad_raw: str, error: Optional[Exception]
+    ) -> str:
+        """构造解析重试的 prompt：附上上次错误输出并要求严格只输出 JSON。"""
+        error_text = str(error or "JSON 解析失败")
+        bad_sample = (bad_raw or "").strip()
+        if len(bad_sample) > 1500:
+            bad_sample = bad_sample[:1500] + "\n...（已截断）"
+        return (
+            "{original}\n\n"
+            "====================\n"
+            "【重要纠错】你上一轮的输出无法被解析为合法 JSON，错误原因：{error}\n"
+            "你上次的原始输出（供参考，请勿重复同样的错误）：\n"
+            "-----\n"
+            "{bad}\n"
+            "-----\n"
+            "请重新输出，并严格遵守：\n"
+            "1. 只输出一个 JSON 对象，不要任何 Markdown 标记、不要前后说明文字。\n"
+            "2. 不要用 ```json 代码块，直接以 {{ 开头、以 }} 结尾。\n"
+            "3. 字符串值不要包含未转义的换行或引号。\n"
+            "4. 保持字段结构与你被要求的输出 schema 完全一致。"
+        ).format(
+            original=original_prompt,
+            error=error_text,
+            bad=bad_sample,
+        )
 
     @staticmethod
     def _parse_json(raw: str) -> Dict[str, object]:
@@ -413,9 +521,45 @@ class LLMAgentBrain:
         data: Dict[str, object], criteria: Dict[str, object]
     ) -> SearchPlan:
         filters = data.get("filters") if isinstance(data.get("filters"), dict) else {}
+        query = str(data.get("query") or "").strip()
+        position_filter = str(data.get("position_filter") or "").strip()
+
+        # 护栏 1：query 词数上限。超过 MAX_QUERY_TERMS 个词 AND 在猎聘几乎一定
+        # 零产出，截断保留前 MAX_QUERY_TERMS 个词（保留排除词 -xxx 不计入上限）。
+        terms = _normalize_query_terms(query)
+        excludes = [p for p in query.split() if p.startswith("-")]
+        if len(terms) > MAX_QUERY_TERMS:
+            kept = " ".join(terms[:MAX_QUERY_TERMS])
+            if excludes:
+                kept = "{} {}".format(kept, " ".join(excludes))
+            logger.warning(
+                "plan_guard: query terms %s > %s, truncated to '%s'",
+                len(terms), MAX_QUERY_TERMS, kept,
+            )
+            query = kept
+
+        # 护栏 2：双重过滤检测。query 已自带职位方向时，position_filter 会叠加
+        # AND 把结果挤压归零，自动清空 position_filter。
+        if position_filter and _query_has_position_intent(query):
+            logger.warning(
+                "plan_guard: query '%s' already has position intent, "
+                "cleared position_filter '%s' to avoid double filtering",
+                query, position_filter,
+            )
+            position_filter = ""
+
+        # 护栏 3：性别筛选强制透传。LLM 在 initial_plan / next_plan 里经常漏填
+        # filters.gender，导致 JD 明确"限男/限女"时猎聘搜索却没有勾选性别。
+        # 只要 criteria 里识别到 gender_requirement（且不是"不限"），就在这里
+        # 硬性补进 filters.gender，不依赖 LLM 自觉。
+        if not filters.get("gender"):
+            gender_req = str((criteria or {}).get("gender_requirement") or "").strip()
+            if gender_req and gender_req != "不限":
+                filters["gender"] = gender_req
+
         return SearchPlan(
-            query=str(data.get("query") or "").strip(),
-            position_filter=str(data.get("position_filter") or ""),
+            query=query,
+            position_filter=position_filter,
             scope=str(data.get("scope") or "全部经历"),
             match_mode=str(data.get("match_mode") or "all"),
             filters=filters,

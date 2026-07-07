@@ -72,6 +72,7 @@ class Planner:
             "city_scope": self.extract_city_scope(text),
             "keywords_text": "\n".join(core_terms[:12]),
             "requirements_text": requirements_text,
+            "gender_requirement": self.extract_gender_requirement(text),
         }
 
     def initial_plan(
@@ -101,6 +102,11 @@ class Planner:
         age = self.extract_age(text)
         if age:
             filters["age"] = age
+        gender = criteria.get("gender_requirement") if criteria else ""
+        if not gender:
+            gender = self.extract_gender_requirement(text)
+        if gender and gender != "不限":
+            filters["gender"] = gender
         return SearchPlan(
             query=query,
             position_filter=position_filter,
@@ -263,6 +269,51 @@ class Planner:
                     return ["深圳", "广州", "东莞", "惠州"]
                 return [city]
         return []
+
+    @staticmethod
+    def extract_gender_requirement(text: str) -> str:
+        """Extract gender requirement from JD text.
+
+        支持两种 JD 写法：
+        1. 连写词：限男 / 男士优先 / 限女性 / 男女不限 …
+        2. 结构化"标签: 值"格式，值常常另起一行，例如
+              性别要求：
+              男
+           或 性别要求：男 / 性别:女 / 性别 男
+
+        注意：不能简单匹配单字"男""女"——它们在正文里太常见（如"男女搭配"
+        "男装产品经理"）。必须把单字识别限制在"性别"标签上下文里，否则会误伤。
+        """
+        text = text or ""
+
+        # 1) 结构化"性别[要求] : 男/女"格式（兼容中英文冒号、空格、换行）。
+        #    只取标签后 30 个字符的窗口，避免一路扫到正文里的"男/女"字误伤。
+        gender_label = re.search(
+            r"性别(?:要求)?\s*[:：]?\s*([^\n]{0,30})",
+            text,
+        )
+        if gender_label:
+            window = gender_label.group(1)
+            # 窗口里出现"男"且没有并列的"女"→ 男；反之→ 女
+            has_male = "男" in window
+            has_female = "女" in window
+            if has_male and not has_female:
+                return "男"
+            if has_female and not has_male:
+                return "女"
+            # 同时出现（如"男女均可"）或都不在窗口 → 落到下面"不限"判断
+
+        # 2) 连写词匹配（原有的语义，保留兼容散文式 JD）
+        # Male-only patterns
+        if re.search(r"限男|限男性|只要男|仅男|仅限男|男士优先|男性优先|要求男|需要男|必须是男", text):
+            return "男"
+        # Female-only patterns
+        if re.search(r"限女|限女性|只要女|仅女|仅限女|女士优先|女性优先|要求女|需要女|必须是女", text):
+            return "女"
+        # Gender-neutral / unlimited
+        if re.search(r"男女不限|性别不限|不限性别|男女均可|男女皆可", text):
+            return "不限"
+        return ""
 
     @staticmethod
     def extract_age(text: str) -> str:

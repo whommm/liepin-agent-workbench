@@ -31,7 +31,7 @@ class GreetingTextGenerationService:
             LLMClient(
                 config.api_base_url,
                 config.api_key,
-                config.model_name or "deepseek-chat",
+                config.model_name or "deepseek-v4-flash",
                 timeout=min(int(config.timeout or 60), 60),
                 provider=config.llm_provider or "openai",
             )

@@ -737,4 +737,7 @@ class RealLiepinTool:
         company = filters.get("company") or filters.get("公司名称")
         if company:
             mapped["公司名称"] = company
+        gender = filters.get("gender") or filters.get("性别")
+        if gender:
+            mapped["性别"] = str(gender).strip()
         return mapped

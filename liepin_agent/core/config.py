@@ -30,7 +30,7 @@ class AppConfig(BaseModel):
     api_base_url: str = ""
     api_key: str = ""
     api_key_env: str = "LIEPIN_AGENT_API_KEY"
-    model_name: str = "deepseek-chat"
+    model_name: str = "deepseek-v4-flash"
 
     # 后端 LLM 配置（Matcher：候选人匹配等重任务）
     # 留空时自动 fallback 到默认配置
@@ -160,7 +160,7 @@ class ConfigManager:
         default_spec = {
             "api_base_url": self.config.api_base_url,
             "api_key": self.config.api_key,
-            "model_name": self.config.model_name or "deepseek-chat",
+            "model_name": self.config.model_name or "deepseek-v4-flash",
             "timeout": int(self.config.timeout or 120),
             "provider": self.config.llm_provider or "openai",
             "source": self.config_source_summary("default"),
@@ -170,7 +170,7 @@ class ConfigManager:
             "api_key": self.config.backend_api_key or self.config.api_key,
             "model_name": self.config.backend_model_name
             or self.config.model_name
-            or "deepseek-chat",
+            or "deepseek-v4-flash",
             "timeout": int(self.config.timeout or 120),
             "provider": self.config.backend_llm_provider or "openai",
             "source": self.config_source_summary("backend"),

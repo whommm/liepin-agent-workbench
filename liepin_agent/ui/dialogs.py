@@ -512,7 +512,7 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
 
         self.api_base_url = QLineEdit(config.api_base_url)
-        self.api_base_url.setPlaceholderText("https://api.deepseek.com/v1")
+        self.api_base_url.setPlaceholderText("https://opencode.ai/zen/go/v1")
         form.addRow("API Base URL", self.api_base_url)
 
         self.api_key = QLineEdit(config.api_key)
@@ -524,7 +524,7 @@ class SettingsDialog(QDialog):
         )
         form.addRow("API Key", self.api_key)
 
-        self.model_name = QLineEdit(config.model_name or "deepseek-chat")
+        self.model_name = QLineEdit(config.model_name or "deepseek-v4-flash")
         form.addRow("模型名称", self.model_name)
 
         self.llm_provider = QComboBox()
@@ -547,7 +547,7 @@ class SettingsDialog(QDialog):
         form.addRow(backend_label)
 
         self.backend_api_base_url = QLineEdit(config.backend_api_base_url)
-        self.backend_api_base_url.setPlaceholderText("https://api.deepseek.com/v1")
+        self.backend_api_base_url.setPlaceholderText("https://opencode.ai/zen/go/v1")
         form.addRow("后端 API Base URL", self.backend_api_base_url)
 
         self.backend_api_key = QLineEdit(config.backend_api_key)
@@ -614,7 +614,7 @@ class SettingsDialog(QDialog):
         self.config_manager.update(
             api_base_url=self.api_base_url.text().strip(),
             api_key=self.api_key.text().strip(),
-            model_name=self.model_name.text().strip() or "deepseek-chat",
+            model_name=self.model_name.text().strip() or "deepseek-v4-flash",
             timeout=self.timeout.value(),
             backend_api_base_url=self.backend_api_base_url.text().strip(),
             backend_api_key=self.backend_api_key.text().strip(),

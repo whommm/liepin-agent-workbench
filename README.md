@@ -69,9 +69,9 @@ playwright install chromium
 
 1. 点击右上角 **"设置"**
 2. 填入你的 API 信息：
-   - API Base URL（如 `https://api.deepseek.com/v1`）
+   - API Base URL（如 `https://opencode.ai/zen/go/v1`）
    - API Key
-   - 模型名称（如 `deepseek-chat`）
+   - 模型名称（如 `deepseek-v4-flash`）
 3. 浏览器通道选择 `msedge` 或 `chrome`
 4. 点击 **"保存"**
 

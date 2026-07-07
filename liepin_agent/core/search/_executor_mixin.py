@@ -156,13 +156,37 @@ class _ExecutorMixin:
             page, self.SEARCH_BUTTON_SELECTORS
         )
         if button_locator is not None:
-            button_locator.click(timeout=5000)
+            # 职位筛选按 Enter 可能触发页面 loading，ant-spin 遮罩会拦截搜索按钮的
+            # 点击；先等遮罩消失，普通点击仍被拦截时再用 force 兜底点击。
+            self._wait_for_search_overlay_gone(page, timeout=6000)
+            try:
+                button_locator.click(timeout=5000)
+            except Error as exc:
+                logger.warning(
+                    "submit_search: normal click blocked (%s), retry with force", exc
+                )
+                button_locator.click(timeout=5000, force=True)
             return
 
         input_locator = controls.search_input or self._find_primary_search_input(page)
         if input_locator is None:
             raise LiepinSearchPageChangedError("未找到搜索按钮，也无法回退到输入框提交")
         input_locator.press("Enter")
+
+    def _wait_for_search_overlay_gone(self, page: Page, timeout: int = 6000) -> None:
+        """等待覆盖搜索按钮的 loading 遮罩消失；超时则放行交由 force 兜底。
+
+        ant-spin 等遮罩拦截搜索按钮点击，先轮询 _is_loading；遮罩消失立即返回，
+        一直 loading 到超时也放行，由 _submit_search 的 force click 兜底。
+        """
+        deadline = time.time() + timeout / 1000.0
+        while time.time() < deadline:
+            if not self._is_loading(page):
+                return
+            try:
+                page.wait_for_timeout(250)
+            except Exception:
+                return
 
 
     def _wait_for_results(self, page: Page) -> None:

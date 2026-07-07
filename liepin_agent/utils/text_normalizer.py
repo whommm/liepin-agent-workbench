@@ -62,7 +62,128 @@ NOISE_PATTERNS = [
 
 
 # 薪资相关关键词，包含这些的行不应被噪音过滤误伤
-_SALARY_KEYWORDS = ("年薪", "月薪", "薪资", "期望", "目前", "k", "万", "元")
+_SALARY_KEYWORDS = ("年薪", "月薪", "薪资", "薪金", "期望", "目前", "k", "万", "元", "面议", "税前", "税后", "薪")
+
+# 薪资数字模式：支持 "16k" "25k-35k" "16K·14薪" "年薪30万" "30-50万/年" "25000元/月" 等
+# 匹配带单位/币种后缀的薪资表达，用于从简历行里结构化提取薪资信息。
+_SALARY_VALUE_PATTERN = re.compile(
+    r"(?:(?:年薪|月薪|目前|期望|当前|薪资|薪金)\s*[:：]?\s*)?"  # 可选前缀
+    r"(\d+(?:\.\d+)?)"                                          # 数字
+    r"\s*(k|K|万|w|W|元)"                                        # 单位
+    r"(?:\s*[-~至到]\s*(\d+(?:\.\d+)?)"                          # 可选区间上限
+    r"\s*(k|K|万|w|W|元)?)?"                                     # 可选上限单位
+    r"(?:\s*[·•x×*]\s*\d+\s*薪)?"                               # 可选 "·14薪"
+)
+
+# 归一化薪资为"万元/年"的统一表示，便于和 JD 薪资区间对比。
+# 输入：数字 + 单位（k/K/万/w/W/元）。k 视为千元/月，万视为万元/年（简历惯例），
+# 元视为元/月。返回 (min_wan_year, max_wan_year, raw_text)，无法换算时 raw_text 保留原文。
+_MONTHLY_K_TO_YEAR_WAN = 12 / 10  # 1k/月 ≈ 1.2万/年
+
+
+def parse_salary_lines(lines):
+    """从简历文本行里提取结构化薪资信息。
+
+    返回 dict：
+      {
+        "current_salary": "原始文本，如 '28k·14薪'",
+        "current_salary_wan_year": "估计的目前年薪万元区间，如 '33.6' 或 '30-40'",
+        "expected_salary": "原始文本，如 '年薪30-50万'",
+        "expected_salary_wan_year": "估计的期望年薪万元区间",
+        "salary_lines": [命中的薪资行原文列表],
+      }
+    找不到的字段为空字符串/空列表。本函数只做正则提取与轻度换算，
+    不做语义判断（"目前 vs 期望"靠行内/邻近关键词识别）。
+    """
+    result = {
+        "current_salary": "",
+        "current_salary_wan_year": "",
+        "expected_salary": "",
+        "expected_salary_wan_year": "",
+        "salary_lines": [],
+    }
+    if not lines:
+        return result
+    full = "\n".join(lines)
+    # 收集所有命中的薪资行
+    hit_lines = []
+    for line in lines:
+        line = (line or "").strip()
+        if not line:
+            continue
+        if _SALARY_VALUE_PATTERN.search(line) or any(
+            kw in line for kw in ("年薪", "月薪", "薪资", "期望薪资", "目前薪资")
+        ):
+            # 必须真的含数字薪资才算命中，避免 "薪资面议" 这种无数字的也乱抓
+            if re.search(r"\d", line) and _SALARY_VALUE_PATTERN.search(line):
+                hit_lines.append(line)
+    result["salary_lines"] = hit_lines
+
+    def _classify_and_fill(text_chunk):
+        m = _SALARY_VALUE_PATTERN.search(text_chunk)
+        if not m:
+            return None
+        low, unit_low, high, unit_high = m.group(1), m.group(2), m.group(3), m.group(4)
+        wan_range = _salary_to_wan_year(low, unit_low, high, unit_high)
+        return m.group(0).strip(), wan_range
+
+    # 优先按"期望/期望薪资"识别 expected；按"目前/当前"识别 current。
+    # 简历"求职期望"段里的薪资算期望，"目前"关键词算目前。
+    expected_filled = False
+    current_filled = False
+    for line in hit_lines:
+        if not expected_filled and any(
+            kw in line for kw in ("期望", "求职期望", "意向")
+        ):
+            parsed = _classify_and_fill(line)
+            if parsed:
+                result["expected_salary"], result["expected_salary_wan_year"] = parsed
+                expected_filled = True
+                continue
+        if not current_filled and any(kw in line for kw in ("目前", "当前", "现", "在职")):
+            parsed = _classify_and_fill(line)
+            if parsed:
+                result["current_salary"], result["current_salary_wan_year"] = parsed
+                current_filled = True
+                continue
+    # 兜底：未分类的命中，按出现顺序第一个填 expected、第二个填 current
+    remaining = [ln for ln in hit_lines if ln not in (result["expected_salary"], result["current_salary"])]
+    for line in remaining:
+        parsed = _classify_and_fill(line)
+        if not parsed:
+            continue
+        if not expected_filled:
+            result["expected_salary"], result["expected_salary_wan_year"] = parsed
+            expected_filled = True
+        elif not current_filled:
+            result["current_salary"], result["current_salary_wan_year"] = parsed
+            current_filled = True
+    return result
+
+
+def _salary_to_wan_year(low, unit_low, high, unit_high):
+    """把薪资数字+单位换算成万元/年的字符串区间。无法换算返回空串。"""
+    def _one(value, unit):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        unit = (unit or "").lower()
+        if unit in ("k",):
+            return round(v * _MONTHLY_K_TO_YEAR_WAN, 1)  # k/月 → 万/年
+        if unit in ("万", "w"):
+            return v  # 已是万/年
+        if unit in ("元",):
+            return round(v * 12 / 10000, 1)  # 元/月 → 万/年
+        return None
+
+    low_w = _one(low, unit_low)
+    high_w = _one(high, unit_high or unit_low) if high else None
+    if low_w is None and high_w is None:
+        return ""
+    if high_w is None:
+        return "{:.1f}".format(low_w)
+    return "{:.1f}-{:.1f}".format(low_w, high_w)
 
 
 def is_noise_line(line: str) -> bool:

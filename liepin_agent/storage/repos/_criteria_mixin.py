@@ -238,6 +238,9 @@ class _CriteriaMixin:
                 "city_requirement": str(ai_raw.get("city_requirement") or "").strip(),
                 "position_filter": str(ai_raw.get("position_filter") or "").strip(),
                 "selected_direction": str(ai_raw.get("selected_direction") or "").strip(),
+                # 透传 JD 的性别要求，供 initial_plan 写入猎聘性别筛选、
+                # matcher 做性别降档判断。详见 LLMAgentBrain.build_criteria。
+                "gender_requirement": str(ai_raw.get("gender_requirement") or "").strip(),
             }
         with self.connect() as connection:
             row = connection.execute(

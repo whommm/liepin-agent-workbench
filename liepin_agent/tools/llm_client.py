@@ -42,7 +42,7 @@ class LLMClient:
     ):
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.api_key = api_key or ""
-        self.model_name = model_name or "deepseek-chat"
+        self.model_name = model_name or "deepseek-v4-flash"
         self.timeout = int(timeout or 300)
         self.provider = (provider or "openai").lower()
         self.max_retries = max(0, int(max_retries))
