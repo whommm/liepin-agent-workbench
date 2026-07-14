@@ -35,6 +35,8 @@ class _MetricsMixin:
     """Mixin providing metrics repository functionality."""
     def session_efficiency_metrics(self, session_id: str) -> Dict[str, Any]:
         session = self.get_session(session_id) or {}
+        criteria = self.get_latest_criteria_version(session_id, "confirmed") or {}
+        criteria_version_id = str(criteria.get("id") or "")
         with self.connect() as connection:
             raw = connection.execute(
                 "SELECT COALESCE(SUM(raw_count), 0) AS n FROM search_rounds WHERE session_id = ?",
@@ -50,7 +52,7 @@ class _MetricsMixin:
             ).fetchone()
             details = connection.execute(
                 """
-                SELECT COUNT(*) AS n
+                SELECT COUNT(DISTINCT d.candidate_id) AS n
                 FROM candidate_details d
                 JOIN candidate_summaries c ON c.id = d.candidate_id
                 WHERE c.session_id = ? AND d.capture_status = 'success'
@@ -58,15 +60,32 @@ class _MetricsMixin:
                 (session_id,),
             ).fetchone()
             matched = connection.execute(
-                "SELECT COUNT(*) AS n FROM match_results WHERE session_id = ?",
-                (session_id,),
+                """
+                SELECT COUNT(*) AS n FROM match_results m
+                WHERE m.session_id = ? AND m.criteria_version_id = ?
+                  AND m.id = (
+                      SELECT m2.id FROM match_results m2
+                      WHERE m2.candidate_id = m.candidate_id
+                        AND m2.criteria_version_id = m.criteria_version_id
+                      ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
+                  )
+                """,
+                (session_id, criteria_version_id),
             ).fetchone()
             ab = connection.execute(
                 """
-                SELECT COUNT(*) AS n FROM match_results
-                WHERE session_id = ? AND UPPER(COALESCE(tier, '')) IN ('A', 'B')
+                SELECT COUNT(*) AS n FROM match_results m
+                WHERE m.session_id = ? AND m.criteria_version_id = ?
+                  AND m.status = 'completed'
+                  AND UPPER(COALESCE(m.tier, '')) IN ('A', 'B')
+                  AND m.id = (
+                      SELECT m2.id FROM match_results m2
+                      WHERE m2.candidate_id = m.candidate_id
+                        AND m2.criteria_version_id = m.criteria_version_id
+                      ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
+                  )
                 """,
-                (session_id,),
+                (session_id, criteria_version_id),
             ).fetchone()
             manual = connection.execute(
                 """
@@ -167,6 +186,8 @@ class _MetricsMixin:
     def session_diagnostic_summary(self, session_id: str) -> Dict[str, Any]:
         metrics = self.session_efficiency_metrics(session_id)
         hypothesis = self.search_hypothesis_metrics(session_id)
+        criteria = self.get_latest_criteria_version(session_id, "confirmed") or {}
+        criteria_version_id = str(criteria.get("id") or "")
         with self.connect() as connection:
             round_rows = connection.execute(
                 """
@@ -198,33 +219,47 @@ class _MetricsMixin:
             ).fetchall()
             match_rows = connection.execute(
                 """
-                SELECT COALESCE(status, '') AS status, COUNT(*) AS n
-                FROM match_results
-                WHERE session_id = ?
-                GROUP BY status
+                SELECT COALESCE(m.status, '') AS status, COUNT(*) AS n
+                FROM match_results m
+                WHERE m.session_id = ? AND m.criteria_version_id = ?
+                  AND m.id = (
+                      SELECT m2.id FROM match_results m2
+                      WHERE m2.candidate_id = m.candidate_id
+                        AND m2.criteria_version_id = m.criteria_version_id
+                      ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
+                  )
+                GROUP BY m.status
                 """,
-                (session_id,),
+                (session_id, criteria_version_id),
             ).fetchall()
             tier_rows = connection.execute(
                 """
-                SELECT UPPER(COALESCE(tier, '')) AS tier, COUNT(*) AS n
-                FROM match_results
-                WHERE session_id = ?
-                GROUP BY UPPER(COALESCE(tier, ''))
+                SELECT UPPER(COALESCE(m.tier, '')) AS tier, COUNT(*) AS n
+                FROM match_results m
+                WHERE m.session_id = ? AND m.criteria_version_id = ?
+                  AND m.id = (
+                      SELECT m2.id FROM match_results m2
+                      WHERE m2.candidate_id = m.candidate_id
+                        AND m2.criteria_version_id = m.criteria_version_id
+                      ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
+                  )
+                GROUP BY UPPER(COALESCE(m.tier, ''))
                 """,
-                (session_id,),
+                (session_id, criteria_version_id),
             ).fetchall()
             pending_match = connection.execute(
                 """
-                SELECT COUNT(*) AS n
+                SELECT COUNT(DISTINCT d.candidate_id) AS n
                 FROM candidate_summaries c
                 JOIN candidate_details d ON d.candidate_id = c.id
-                LEFT JOIN match_results m ON m.candidate_id = c.id AND m.session_id = c.session_id
+                LEFT JOIN match_results m ON m.candidate_id = c.id
+                    AND m.session_id = c.session_id
+                    AND m.criteria_version_id = ?
                 WHERE c.session_id = ?
                   AND d.capture_status = 'success'
                   AND m.id IS NULL
                 """,
-                (session_id,),
+                (criteria_version_id, session_id),
             ).fetchone()
             error_rows = connection.execute(
                 """

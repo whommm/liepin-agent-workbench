@@ -48,7 +48,11 @@ class FakeLiepinTool:
     def fetch_candidate_detail(self, candidate):
         return CandidateDetail(
             candidate_id=candidate["id"],
-            resume_text="文创 潮玩 IP衍生品 量产 供应链 从0到1",
+            resume_text=(
+                "负责文创潮玩产品从0到1规划，推进IP衍生品量产并协同供应链。"
+                "覆盖用户研究、产品定义、打样、成本控制和上市复盘。"
+            )
+            * 8,
             resume_summary="测试简历",
             capture_status="success",
         )
@@ -88,7 +92,11 @@ def test_llm_agent_brain_falls_back_on_invalid_json():
 
     assert criteria["position_filter"]
     assert plan.query
+    assert "education" not in plan.filters
+    assert "age" not in plan.filters
+    assert "gender" not in plan.filters
     assert observation.recommended_round_type
+    assert brain.last_fallback["operation"] == "observe_round"
 
 
 def test_stop_conditions_honor_runtime_limit():
@@ -277,6 +285,13 @@ class SlowMatcher:
         )
 
 
+class RaisingMatcher:
+    def match_candidate(
+        self, session_id, round_id, candidate_id, resume_text, criteria
+    ):
+        raise RuntimeError("matching backend unavailable")
+
+
 class GreetingLiepinTool(FakeLiepinTool):
     def __init__(self, gold=True):
         self.gold = gold
@@ -357,28 +372,59 @@ def test_no_wait_policy_does_not_block_round_review(tmp_path):
 
     runtime.run_session(session_id)
     session = store.get_session(session_id)
-    immediate_matches = store.list_match_results(session_id)
-    deadline = time.time() + 2
-    matches = immediate_matches
+    matches = store.list_match_results(session_id)
     rounds = store.list_rounds(session_id)
-    while time.time() < deadline:
-        matches = store.list_match_results(session_id)
-        rounds = store.list_rounds(session_id)
-        if matches and rounds[0]["matched_count"] == 1:
-            break
-        time.sleep(0.05)
+    digests = store.list_round_digests(session_id)
     events = store.list_events(session_id)
 
     runtime.browser_queue.shutdown()
     runtime.match_queue.shutdown()
 
     assert session["status"] == "completed"
-    assert immediate_matches == []
     assert len(matches) == 1
     assert matches[0]["tier"] == "B"
     assert rounds[0]["matched_count"] == 1
     assert rounds[0]["ab_count"] == 1
+    assert digests[0]["matched_count"] == 1
+    assert digests[0]["pending_match_count"] == 0
+    assert digests[0]["b_count"] == 1
     assert any(event["title"] == "后台匹配已提交" for event in events)
+    assert any(event["title"] == "正在收拢后台匹配" for event in events)
+
+
+def test_runtime_matcher_exception_has_no_business_tier(tmp_path):
+    store = SQLiteStore(str(tmp_path / "runtime.db"))
+    session_id = store.create_session(
+        title="销售总监",
+        jd_text="岗位名称：销售总监\n天然气销售。",
+        mode="自动",
+        max_rounds=1,
+        max_detail_fetches=2,
+        target_ab_count=99,
+    )
+    confirm_test_criteria(store, session_id, "天然气\n销售")
+    runtime = AgentRuntime(
+        store=store,
+        event_bus=EventBus(),
+        browser_queue=BrowserQueue(),
+        match_queue=MatchQueue(max_workers=1),
+        liepin_tool=FakeLiepinTool(),
+        matcher=RaisingMatcher(),
+        agent_brain=TierBrain(),
+    )
+
+    runtime.run_session(session_id)
+    results = store.list_match_results(session_id)
+    candidates = store.list_candidates(session_id)
+
+    runtime.browser_queue.shutdown()
+    runtime.match_queue.shutdown()
+
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["tier"] == ""
+    assert candidates[0]["status"] == "deferred"
+    assert candidates[0]["match_tier"] == ""
 
 
 def test_runtime_does_not_greet_gold_ab_candidates_automatically(tmp_path):

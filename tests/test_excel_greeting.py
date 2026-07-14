@@ -41,6 +41,7 @@ def test_excel_greeting_loads_only_ab_gold_candidates(tmp_path):
 def test_excel_greeting_dry_run_does_not_send_or_write(tmp_path):
     path = tmp_path / "candidates.xlsx"
     _make_excel(path)
+    original_bytes = path.read_bytes()
 
     class Tool:
         def greet_candidate(self, candidate, message_template=""):
@@ -49,11 +50,34 @@ def test_excel_greeting_dry_run_does_not_send_or_write(tmp_path):
     results = ExcelGreetingService(Tool()).greet_from_excel(path, dry_run=True)
 
     assert [item["status"] for item in results] == ["dry_run", "dry_run"]
+    assert path.read_bytes() == original_bytes
     workbook = load_workbook(path)
     sheet = workbook["候选人"]
     headers = {cell.value: index for index, cell in enumerate(sheet[1], start=1)}
     assert sheet.cell(row=2, column=headers["打招呼状态"]).value in {None, ""}
     workbook.close()
+
+
+def test_excel_greeting_passes_request_resume_when_tool_supports_it(tmp_path):
+    path = tmp_path / "candidates.xlsx"
+    _make_excel(path)
+    request_resume_values = []
+
+    class Tool:
+        def greet_candidate(
+            self, candidate, message_template="", request_resume=False
+        ):
+            request_resume_values.append(request_resume)
+            return {"status": "success", "message": "ok", "error": ""}
+
+    ExcelGreetingService(Tool()).greet_from_excel(
+        path,
+        delay_min=0,
+        delay_max=0,
+        request_resume=True,
+    )
+
+    assert request_resume_values == [True, True]
 
 
 def test_excel_greeting_rechecks_gold_by_default(tmp_path):

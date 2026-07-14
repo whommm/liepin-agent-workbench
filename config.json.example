@@ -19,6 +19,7 @@
   "llm_max_retries": 2,
   "llm_max_tokens": 4096,
   "llm_temperature": 0.2,
+  "backend_llm_temperature": 0.0,
   "llm_provider": "openai",
   "backend_llm_provider": "openai",
 
@@ -49,6 +50,17 @@
   "sample_detail_min_results": 3,
   "validate_detail_min_results": 8,
   "match_wait_timeout_seconds": 300,
+  "detail_min_resume_chars": 300,
+  "candidate_skip_audit_rate": 0.08,
+
+  "_comment_pagination": "【自适应分页】低收益时提前停止，高潜结果最多继续到 10 页",
+  "search_adaptive_pagination_enabled": true,
+  "search_min_pages_per_round": 3,
+  "search_max_pages_per_round": 10,
+  "search_low_yield_page_patience": 2,
+  "search_min_new_unique_per_page": 3,
+  "search_min_promising_per_page": 1,
+  "search_duplicate_rate_threshold": 0.8,
 
   "_comment_debug": "【调试】是否保存浏览器页面快照用于排错",
   "debug_snapshots_enabled": false

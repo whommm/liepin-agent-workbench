@@ -36,7 +36,7 @@
   "position_filter": "职位栏收口词",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "company": ""}},
   "intent": "本轮搜索目的",
   "expected_signal": ["期待看到的具体信号，至少3条"],
   "risk": "本轮可能噪音及规避方式",
@@ -48,5 +48,5 @@
 - 如果情报没有提供有用的信息，should_enhance=false，其他字段可留空。
 - query 必须遵守猎聘 AND 语法（空格分隔），2-3 个词最佳。
 - 不要重复 used_queries 中的关键词组合。
-- 工作年限不要填入 filters，由后续匹配模型判断。只有 age 可以填。
+- 工作年限、年龄和性别不要填入 filters，由后续匹配与人工确认处理。
 - 如需排除噪音，可在 query 中用减号（如 `产品经理 -助理`）。

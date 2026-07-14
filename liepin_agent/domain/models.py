@@ -119,6 +119,12 @@ class MatchResult:
     missing_or_unclear: List[str] = field(default_factory=list)
     questions_to_verify: List[str] = field(default_factory=list)
     confidence: str = ""
+    prompt_version: str = ""
+    model_name: str = ""
+    model_config_hash: str = ""
+    input_hash: str = ""
+    resume_hash: str = ""
+    match_score: int = 0
 
 
 @dataclass
@@ -169,6 +175,9 @@ class FetchDecision:
     sampling_strategy: Dict[str, int] = field(default_factory=dict)
     match_wait_policy: Dict[str, Any] = field(default_factory=dict)
     reason: str = ""
+    selection_buckets: Dict[str, List[str]] = field(default_factory=dict)
+    selection_reasons: Dict[str, str] = field(default_factory=dict)
+    audit_candidate_ids: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -179,6 +188,12 @@ class FetchDecision:
             "sampling_strategy": dict(self.sampling_strategy or {}),
             "match_wait_policy": dict(self.match_wait_policy or {}),
             "reason": self.reason,
+            "selection_buckets": {
+                key: list(value or [])
+                for key, value in (self.selection_buckets or {}).items()
+            },
+            "selection_reasons": dict(self.selection_reasons or {}),
+            "audit_candidate_ids": list(self.audit_candidate_ids or []),
         }
 
 

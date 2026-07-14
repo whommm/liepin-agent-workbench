@@ -2,6 +2,7 @@ from liepin_agent.agent.candidate_picker import CandidatePicker
 from liepin_agent.agent.observer import Observer
 from liepin_agent.domain.models import CandidateSummary
 from liepin_agent.domain.pre_score import classify_candidate_card, pre_score_candidate
+from liepin_agent.domain.dedupe import normalize_profile_url
 
 
 def test_observer_and_picker_validate_promising_round():
@@ -50,3 +51,17 @@ def test_sales_position_is_not_treated_as_default_noise():
     assert decision in ("fetch", "maybe")  # 销售岗 pre_score 降级后可能为 maybe
     assert "客服" not in risks
     assert signals
+
+
+def test_profile_url_dedupe_ignores_tracking_but_keeps_resume_identity():
+    first = (
+        "https://h.liepin.com/resume/show?res_id_encode=ABC123"
+        "&d_curPage=2&traceId=tracking"
+    )
+    second = (
+        "/resume/show?traceId=other&res_id_encode=ABC123&d_curPage=8"
+    )
+    different = "/resume/show?res_id_encode=XYZ999"
+
+    assert normalize_profile_url(first) == normalize_profile_url(second)
+    assert normalize_profile_url(first) != normalize_profile_url(different)

@@ -143,13 +143,38 @@ JD 用"招聘画像语言"，候选人简历用"履历语言"，两者经常不�
 
 只输出 JSON，不要 Markdown。
 """,
+    "greeting_system_prompt": """你是一个资深猎头顾问，擅长撰写简洁专业的候选人打招呼消息。
+
+要求：
+1. 开头固定格式："您好，我是猎头顾问，目前有个base{{city}}的{{job_title}}机会，"
+2. 中间用1-2句话简洁介绍岗位核心亮点，不要罗列职责
+3. 薪资统一写"薪资待遇优厚"，不要出现具体数字或范围
+4. 结尾固定："方便的话能发一份您的简历看看吗？"
+5. 总字数控制在60-100字
+6. 语气专业、友好、有吸引力，像真人猎头写的
+7. 不要出现公司名称，除非用户特别说明
+8. 不要出现"根据您的简历"等个性化表述，因为这是首次联系
+
+只输出打招呼文本，不要解释，不要加引号。
+""",
+    "greeting_user_prompt": """请根据以下岗位信息，生成一段猎头打招呼文本：
+
+岗位名称：{job_title}
+工作城市：{city}
+岗位描述：{job_description}
+{salary_line}
+生成要求：{style_hint}
+
+请生成：
+""",
     "build_criteria": """请从 JD 中提取匹配条件，输出简洁 JSON：
 {{
   "core_requirement": "一句话核心要求，如：小家电无刷电机领域，必须有无刷电机经验，CAD优先",
   "position_filter": "猎聘职位栏收口词，1-2个词。必须从JD中的真实岗位名称提取，如：车间主任、生产经理、产品经理、算法工程师。不要编造，不要写'产品' unless JD确实是产品岗",
   "search_direction": "一句话描述AI对本岗位寻访方向的理解，不是搜索关键词，是策略方向，用户可编辑修正",
   "target_companies": ["从JD或补充说明中提取的目标/对标公司名列表。如客户说'必须XX公司出身'或JD写'有XX公司背景优先'，则填入。无则留空数组"],
-  "gender_requirement": "从JD中识别性别要求。如'限男性''要求女性''男士优先''女士优先'等填具体性别；'男女不限''性别不限'填'不限'；未提及填''"
+  "city_requirement": "从JD和补充说明中提取的城市/地点要求描述。如'必须base深圳'、'深圳/广州均可'、'接受远程'等。如果没有明确要求，写'无明确要求'",
+  "city_scope": ["从JD中提取的城市名列表，如深圳、广州、东莞。如果没有明确要求，留空数组"]
 }}
 
 要求：
@@ -158,7 +183,7 @@ JD 用"招聘画像语言"，候选人简历用"履历语言"，两者经常不�
 3. position_filter 务必准确：它是猎聘网站左侧职位栏的过滤条件，写错了会直接过滤掉目标候选人。
 4. search_directions 是对岗位的理解方向，每方向一句话，给出不同切入角度（如收紧/放宽/跨行业）。
 5. target_companies 只在明确提到对标/目标公司时填写，不要凭空编造。
-6. gender_requirement 必须认真识别：JD里写"限男""要求男性""男士优先"就填"男"；写"限女""要求女性""女士优先"就填"女"；写"男女不限""性别不限"就填"不限"；没提就留空。这个字段直接影响搜索筛选，不要忽略。
+6. city_requirement 必须准确反映 JD 中的地点要求。如果有多个城市，city_scope 填入所有城市名。
 
 【JD】
 {jd}
@@ -172,7 +197,7 @@ JD 用"招聘画像语言"，候选人简历用"履历语言"，两者经常不�
   "position_filter": "职位栏收口词。1-2个词，从JD真实岗位名称提取。没把握就留空。见下方双重过滤警告",
   "scope": "全部经历/目前职位/过往职位（第一轮默认全部经历）",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "company": ""}},
   "intent": "本轮搜索目的（第一轮目的通常是探测市场水深，不追求命中）",
   "expected_signal": ["先列出你为每个核心要求做的术语翻译，再列出期待在卡片中看到的具体信号，至少5条"],
   "risk": "本轮可能噪音及规避方式",
@@ -202,9 +227,7 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
 ### 4. 其他字段
 - 第一轮不设 city（留空 []），先看全国分布。
 - active_days 默认 30 天。
-- age：JD 写了年龄上限（如"40岁以内"）就填 filters.age="40"（系统自动加3岁缓冲）；
-  写了区间（如"25-35岁"）填"25-35"；没写就留空。
-- gender：匹配条件里有明确性别要求才填，否则留空。
+- 年龄、性别等受保护属性不得由模型自动转成平台硬筛选，只保留为待人工确认信息。
 - work_years 绝不填入 filters，由后续匹配模型判断。
 - position_filter 1-2 词，必须从 JD 真实岗位名提取，不要编造（如 JD 不是产品岗就别写"产品"）。
 
@@ -231,36 +254,30 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
   "noise_patterns": ["噪音类型"],
   "positive_signals": ["正向信号"],
   "recommended_round_type": "skip_detail/sample_detail/validate_detail/harvest_detail",
-  "reason": "判断依据，包含质量评估、噪音归因、策略建议"
+  "reason": "质量判断、噪音归因和下一步建议"
 }}
 
-## 质量分级标准
-- **empty**：搜索结果为空或仅0-2人。→ 关键词过窄或条件冲突。
-- **low**：结果数≥8但卡片无有效信号，或 relevant_count=0。→ 建议 skip_detail。
-- **uncertain**：有少量潜在信号，但不确定是真实匹配还是标题党。→ 建议 sample_detail（可抓 6-10 人）。
-- **medium**：有多个有效信号，卡片层面出现目标行业/技能/公司。→ 建议 validate_detail（可抓 12-20 人）。
-- **high**：大量强信号，目标人才密集。→ 建议 harvest_detail（可抓 20-40 人，充分利用预算）。
-
-### 噪音类型识别（常见）
-1. 岗位错配、职级错配、行业错配
-2. 技能漂移（JD要算法，结果全是数据分析）
-3. 公司偏差、地域偏差
-
-### 正向信号识别
-- 目标行业/细分领域出现频率
-- 核心技能词在简历摘要中的出现率
-- 目标公司/竞品公司出现数量
+## 判断规则
+- 数量必须读取 pool_stats，不要把 representative_samples 的数量当成全池数量。
+- representative_samples 是确定性分层样本：strong_signal、uncertain、diversity。
+- 卡片没写某项要求表示 unknown，不能据此判定不匹配或建议跳过。
+- empty：全池为空；low：有足量卡片但样本几乎没有任何可验证信号；
+  uncertain：有潜在线索但详情不足；medium：多个样本出现目标行业/技能/公司；
+  high：强信号密集且跨样本重复出现。
+- 除空结果、预算耗尽或存在可由卡片直接证明的硬冲突外，优先 sample/validate，
+  不要因为信息不足直接 skip_detail。
+- estimated_relevant_count 是基于分层样本的保守估计，要说明不确定性。
 
 【本轮搜索计划】
 {plan}
 
-【匹配标准】
+【完整匹配标准（硬条件不得忽略）】
 {criteria}
 
-【页面信息】
+【页面聚合信息】
 {page_meta}
 
-【候选人卡片样本】
+【压缩结果池：全池统计 + 最多 12 个代表样本】
 {cards}
 """,
     "decide_fetch": """请决定本轮是否抓取候选人详情，输出 JSON：
@@ -270,47 +287,43 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
   "candidate_ids": ["候选人ID"],
   "fetch_limit": 数字,
   "sampling_strategy": {{"high_confidence": 数字, "diversity": 数字, "uncertain": 数字}},
-  "match_wait_policy": {{"mode": "no_wait/wait_min_results/wait_all", "min_results": 数字, "timeout_seconds": 数字}},
-  "reason": "详细说明：为什么这么抓、抽样逻辑、预期验证什么"
+  "match_wait_policy": {{"mode": "wait_min_results/wait_all", "min_results": 数字, "timeout_seconds": 数字}},
+  "reason": "为何抓取、三个分层各抓多少、要验证什么"
 }}
 
-## 抓取策略指南
+## 核心原则
+- 卡片阶段判断的是“是否值得用详情消除不确定性”，不是最终匹配档位。
+- 卡片缺少技能、求职意向或项目事实只表示 unknown，不是硬冲突。
+- 只有重复/无效卡片、预算为 0，或卡片能直接证明已确认硬条件冲突时才跳过。
+- ranked_candidates 是紧凑排序表；routing 只是路由标签，不是匹配结论。
+- disputed_candidates 只是需要重点仲裁的有争议子集，不代表其余人不应抓取。
+- candidate_ids 只能来自 ranked_candidates，不能编造；fetch_limit 必须等于其长度。
 
-### 各轮次抓取上限
-- **skip_detail**：明显低质轮、空结果轮、或预算耗尽时不抓。
-- **sample_detail（探测轮）**：抓 6-10 个。目的是快速验证搜索假设是否成立。必须混合：高置信 + 多样性（不同公司/背景） + 不确定样本。不要只抓表面最匹配的。
-- **validate_detail（验证轮）**：抓 12-20 个。目的是在 medium 质量池中验证真实匹配度。优先抓卡片信号最明确的，同时保留边缘样本防止漏判。宁可多抓也不要漏抓。
-- **harvest_detail（收割轮）**：抓 20-40 个。目的是在高密度池中批量获取匹配结果。大幅放宽抽样范围，优先抓未被抓过的新面孔。用户明确不在乎成本，请充分利用预算。
+## 分层抓取
+- sample_detail：混合强信号、不确定和多样性样本，用详情校准卡片判断。
+- validate_detail：以强信号为主，保留边缘样本，避免只验证模型已经相信的人。
+- harvest_detail：尽量覆盖所有新的高潜候选人，但仍等待足够匹配结果再复盘。
+- 不要使用 no_wait；复盘需要真实匹配结果，默认 wait_min_results，小样本可 wait_all。
+- 如果压缩结果中的 omitted_count 大于 0，不得把未展示候选人判为不合适；
+  本次只对展示的候选人作决定，并在 reason 中说明未覆盖数量。
 
-### 抽样原则
-1. **系统预评分已禁用，不要参考 pre_score / card_decision**。这些字段是旧规则程序的残留，可能严重误杀人才。请完全基于候选人卡片的实际内容进行判断。
-2. **高置信样本**：当前职位、公司、摘要中明显体现目标技能/行业/背景的候选人。
-3. **多样性样本**：来自不同公司、不同职级段、不同业务线的候选人，避免同一公司抓多人。特别关注"跨行业可迁移"人才。
-4. **不确定样本**：有一项独特亮点（如目标公司背景、罕见项目经验、特殊行业交叉背景）的候选人，即使表面匹配度不高也建议抓取验证。宁可错抓不要漏抓。
-5. **candidate_ids 必须来自候选人卡片列表**，不能编造。
-
-### match_wait_policy 选择
-- **wait_min_results**：sample/validate 轮默认。等待至少 min_results 个匹配完成再进入复盘。
-- **wait_all**：小规模抓取时（≤5人）使用，确保所有结果都进入复盘。
-- **no_wait**：harvest 轮可使用，后台异步匹配不影响下一轮计划。
-
-## 限制
-- 剩余总预算：{budget}
-- 如果 remaining_budget ≤ 0，必须 action="skip_detail"。
+## 预算
+- 剩余详情预算：{budget}
+- 预算小于等于 0 时必须 skip_detail；否则 candidate_ids 不得超过预算。
 
 【观察结论】
 {observation}
 
-【候选人卡片】
+【压缩候选排序 + 有争议子集】
 {cards}
 """,
     "review_round": """请复盘本轮猎聘寻访，并决定停止或下一轮搜索，输出 JSON：
 {{
   "action": "continue/stop",
-  "summary": "复盘结论：本轮产出评估、噪音归因、策略调整方向",
+  "summary": "本轮产出、证据缺口、根因和下一步只调整什么",
   "next_plan": {{
-    "query": "下一轮搜索栏关键词。零产出时优先换语义层，不要简单减词",
-    "position_filter": "职位栏收口词。query含职位词时必须留空（双重过滤警告）",
+    "query": "下一轮搜索关键词",
+    "position_filter": "职位栏收口词；query 含职位词时留空",
     "scope": "全部经历/目前职位/过往职位",
     "match_mode": "all/any",
     "filters": {{}},
@@ -318,96 +331,57 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
     "expected_signal": [],
     "risk": "风险",
     "search_hypothesis_type": "core_background/target_company/transferable_scene/long_tail",
-    "search_hypothesis_text": "下一轮验证的搜索假设"
+    "search_hypothesis_text": "要验证的假设"
   }},
   "evidence": {{
-    "ab_count": "数字",
-    "match_count": "数字",
-    "noise_root_cause": "关键词太宽/关键词太窄/词不在简历出现/维度错误/行业误匹配/职级错配/区域过窄/正常噪音",
-    "iteration_strategy": "收紧/换语义层/换维度/定向公司/跨行业mapping/长尾狙击/放区域/停止"
+    "ab_count": 数字,
+    "match_count": 数字,
+    "noise_root_cause": "关键词太宽/关键词太窄/词不在简历出现/维度错误/行业误匹配/职级错配/区域过窄/正常噪音/结果待完成",
+    "iteration_strategy": "收紧/换语义层/换维度/定向公司/跨行业mapping/长尾狙击/放区域/保持验证/停止"
   }}
 }}
 
-## 复盘要求
+## 证据边界
+- matches.aggregate 是本轮完整计数；representative_matches 只是证据样本。
+- 不会提供 raw_response、简历 detail 或数据库原始行，不得臆造未提供的事实。
+- status_counts 出现 pending/failed，或 match_count 为 0 但本轮抓取已提交时，标为
+  “结果待完成”，不能算作零产出，也不能因此提前停止或大幅改策略。
+- 缺失字段是 unknown，不是未满足。优先从 top_evidence_gaps 提炼下一轮验证点。
 
-### 0. 重要区分
-- 【本轮匹配结果】仅反映本轮抓取后的匹配产出。如果本轮 match_results 为空，
-  可能是因为匹配尚未完成或超时，**不要据此推断"连续多轮零产出"**。
-- 历史各轮搜索效果请参考【已用 query】列表，不要混淆"本轮效果"与"历史累积效果"。
+## 历史隔离
+- strategy_history 只保留最近 query 和有界 RoundDigest；旧轮原文不会重复注入。
+- omitted_query_count/omitted_round_digest_count 表示还有更早历史。
+- 不要重复 recent_queries。完整重复校验由代码执行，不需要索取更早原文。
+- 每轮原则上只改变一个主要变量，并明确本轮假设如何被证实或证伪。
 
-### 1. 先判断本轮属于哪种情境（决策分叉点）
-
-#### 情境 A：本轮零产出或结果极少（raw_count < 5）
-根因几乎都是【词太窄 / 用了简历里不出现的词 / 市场稀疏】。
-按以下优先级调整，**不要停留在同一批词上反复微调**：
-1. 【换语义层】最优先。不要只减词，要把当前词换成品类词/行业词/公司词。
-   例：'潮玩 插画 渲染' 失败 → 不要减成 '潮玩 插画'，
-   而是换品类词 '盲盒' 或 '手办'，或换假设走 target_company（对标公司）。
-2. 【缩到 1 词】用最宽的核心品类词单独试水，先确认市场到底有没有人。
-3. 【换假设类型】core_background 连续失败就转：
-   - target_company：找对标/竞品公司的人（公司名走 filters.company，不进 query）
-   - transferable_scene：拆出核心技能，找有此技能的其他行业（如潮玩要插画 → 找动漫/广告/游戏插画师）
-   - long_tail：用细分专业工具词狙击（如 'ZBrush 手办'）
-
-#### 情境 B：结果量大但噪音高（raw_count ≥ 8 且 relevant 低）
-| 根因 | 表现 | 对策 |
-|------|------|------|
-| 某词被泛化 | 该词命中大量错配行业 | 删该词，或加 -排除词 |
-| 岗位/职级错配 | 结果都是错配岗位或层级 | 调 position_filter 或换 scope |
-| 行业占比低 | 目标行业候选人少 | 跨行业 mapping，用核心技能替代行业词 |
-| 长尾被淹没 | 少数目标人才混在大词里 | 长尾狙击，用细分技术词收紧 |
-
-#### 情境 C：区域过窄（结果少且 filters.city 非空）
-优先去掉 city 限制（设为空数组 []），保持 query 完全不变，扩大地理范围再搜一轮。
-只有去掉 city 后仍搜不到，才回退到情境 A 的换词策略。
-
-### 2. 假设类型与 query 构造法（每轮必须明确当前用哪种）
-- core_background：品类词 + 核心技能词。如 '盲盒 原画'。scope 用"全部经历"。
-- target_company：【公司名不进 query！】用 filters.company="对标公司名" +
-  scope="目前公司"或"过往公司"，query 放该公司的主营业务词。
-- transferable_scene：拆出 JD 的核心技能，找具备此技能的其他行业。
-  如潮玩要插画技能 → query '插画 包装设计' 找广告/快消的人。
-- long_tail：用细分专业词/工具词狙击。如 'ZBrush 潮玩'。
-
-### 3. 停止条件（如果 should_stop 为 true，必须 action=stop）
-- 已达到目标 A/B 数量
-- 连续多轮低产出且**完全没有任何改进迹象**（重复相同关键词、反复换词但噪音根因一致、策略明显僵化）
-- 预算耗尽
-- 已穷尽**所有**合理搜索假设（四大方向均已尝试）
-
-### 4. 鼓励多搜索（重要）
-- 默认允许最多搜索 20 轮，不要轻易停止。
-- 只要每一轮都在尝试不同的搜索维度（换词、换行业、换假设类型），就是有价值的探索。
-- 猎头寻访本来就是多轮试探，前 5-8 轮在摸清水下结构完全正常。
-- 只有连续低产出**且**策略明显僵化（一直在同一批词上微调）时才考虑停止。
-
-### 5. next_plan 字段要求
-- query：2-3 个词 AND 组合（稀疏市场可 1 词）。明确本轮是收紧/换语义层/换维度/定向。
-  **零产出时优先换语义层，不要简单减词。**
-- 双重过滤警告：query 含职位方向词时 position_filter 必须留空；
-  只有 query 是行业/品类宽词时才用 position_filter 收口。拿不准就留空。
-- filters：只保留 city / active_days / education / age / company / gender，**严禁 work_years**。
-- scope：target_company 用"目前/过往公司"；其余默认"全部经历"。
-- expected_signal：具体、可观察。
-- 不要重复 used_queries（包括词的顺序不同但词集合相同的组合）。
+## 下一轮策略
+- 结果少：优先换语义层（品类词、行业词、公司词）或放宽一个筛选，不要只做同义微调。
+- 结果多但噪音高：定位泛化词、岗位/职级错配或行业偏差，只收紧一个维度。
+- city 非空且结果稀少：优先只去掉 city，保持 query 不变。
+- target_company：公司名放 filters.company；query 写业务词，不把公司名重复放进 query。
+- query 通常 1-3 个简历中会出现的词。filters 仅允许 city、active_days、education、company，严禁 work_years；年龄和性别不得自动转成平台硬筛选。
+- 只有达到明确停止条件、预算耗尽或不同假设均已验证失败时才 stop。
 
 【should_stop】{should_stop}
 【stop_reason】{stop_reason}
 【target_met】{target_met}
+
 【上一轮计划】
 {plan}
-【已用 query】（历史搜索记录，按轮次顺序）
+
+【有界策略历史】
 {used_queries}
 
-【本轮匹配结果】（仅含本轮详情抓取后已完成匹配的候选人，不代表历史各轮产出）
+【本轮匹配聚合与代表证据】
 {matches}
 
-【噪音】
+【噪音摘要】
 {noise}
-【JD】
+
+【JD 摘要】
 {jd}
 
-【匹配条件】
+【完整匹配标准（硬条件不得截断）】
 {criteria}
 """,
     "apply_user_command": """用户发送了一条实时指令，要求调整当前搜索计划。请根据指令内容对下一轮搜索计划进行专业调整，输出 JSON：
@@ -416,7 +390,7 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
   "position_filter": "职位栏收口词",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": "", "gender": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "company": ""}},
   "intent": "调整后的搜索目的",
   "expected_signal": [],
   "risk": "调整后的风险",
@@ -430,7 +404,7 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
 3. 保持猎聘 AND 语法合规，空格分隔。
 4. 不要重复已用过的 query。
 5. 如需定向某家对标公司，可在 filters.company 填入公司名，配合 scope="目前公司"或"过往公司"。
-6. 工作年限不要填入 filters，由后续匹配模型判断。
+6. 工作年限、年龄和性别不要填入 filters，由后续匹配与人工确认处理。
 
 【用户指令】
 {user_command}
@@ -521,7 +495,7 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
   "position_filter": "职位栏收口词",
   "scope": "全部经历/目前职位/过往职位",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "company": ""}},
   "intent": "本轮搜索目的",
   "expected_signal": ["期待看到的具体信号，至少3条"],
   "risk": "本轮可能噪音及规避方式",
@@ -533,7 +507,7 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
 - 如果情报没有提供有用的信息，should_enhance=false，其他字段可留空。
 - query 必须遵守猎聘 AND 语法（空格分隔），2-3 个词最佳。
 - 不要重复 used_queries 中的关键词组合。
-- 工作年限不要填入 filters，由后续匹配模型判断。只有 age 可以填。
+- 工作年限、年龄和性别不要填入 filters，由后续匹配与人工确认处理。
 - 如需排除噪音，可在 query 中用减号（如 `产品经理 -助理`）。
 """,
 }

@@ -5,7 +5,18 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional
+
+from ._models import (
+    AdaptivePaginationPolicy,
+    LiepinSearchCandidate,
+    LiepinSearchControls,
+    LiepinSearchError,
+    LiepinSearchNoResultsError,
+    LiepinSearchPageChangedError,
+    PageYieldStats,
+)
+from ...domain.dedupe import normalize_profile_url, normalize_text
 
 try:
     from playwright.sync_api import Error, Page
@@ -14,15 +25,6 @@ except ImportError:  # pragma: no cover
     Page = None
 
 logger = logging.getLogger(__name__)
-
-from ._models import (
-    LiepinSearchCandidate,
-    LiepinSearchControls,
-    LiepinFilterFieldSpec,
-    LiepinSearchError,
-    LiepinSearchPageChangedError,
-    LiepinSearchNoResultsError,
-)
 
 class _ExecutorMixin:
     """Mixin providing executor functionality."""
@@ -40,11 +42,29 @@ class _ExecutorMixin:
         match_mode: str = "",
         scope: str = "",
         position_filter: str = "",
-        max_pages: int = 1,
+        max_pages: int | AdaptivePaginationPolicy = 1,
+        pagination_policy: Optional[AdaptivePaginationPolicy] = None,
+        candidate_classifier: Optional[Callable[[LiepinSearchCandidate], str]] = None,
+        on_page: Optional[Callable[[PageYieldStats], None]] = None,
+        known_candidate_keys: Optional[Iterable[str]] = None,
     ) -> List[LiepinSearchCandidate]:
-        """Run a keyword search, apply optional filters, and return result summaries."""
+        """Run a keyword search and optionally stop on low marginal page yield.
+
+        Passing an integer ``max_pages`` keeps the legacy fixed-page behavior.
+        Adaptive callers may pass a policy as ``max_pages`` or combine an old
+        integer hard cap with ``pagination_policy``.
+        """
         if not keyword.strip():
             raise LiepinSearchError("搜索关键词不能为空")
+
+        if isinstance(max_pages, AdaptivePaginationPolicy):
+            active_policy = max_pages
+            page_cap = active_policy.effective_max_pages
+        else:
+            active_policy = pagination_policy
+            page_cap = min(10, max(1, int(max_pages)))
+            if active_policy is not None:
+                page_cap = min(page_cap, active_policy.effective_max_pages)
 
         self.open_search_page()
 
@@ -63,9 +83,16 @@ class _ExecutorMixin:
                 self._apply_filters_on_page(page, filters)
 
             all_candidates: List[LiepinSearchCandidate] = []
-            seen_keys: set[str] = set()
+            historical_keys = {
+                self._normalize_candidate_key(item)
+                for item in (known_candidate_keys or [])
+                if self._normalize_candidate_key(item)
+            }
+            seen_keys: set[str] = set(historical_keys)
+            page_history: List[PageYieldStats] = []
+            self.last_pagination_stats = page_history
 
-            for page_num in range(1, max_pages + 1):
+            for page_num in range(1, page_cap + 1):
                 try:
                     candidates = self.extract_candidates_from_page(page)
                 except Exception as exc:
@@ -80,19 +107,64 @@ class _ExecutorMixin:
 
                 page_meta = self._extract_page_meta(page)
 
-                new_candidates = []
-                for c in candidates:
+                new_unique_candidates = []
+                duplicate_count = 0
+                for page_index, c in enumerate(candidates):
                     c.page_meta = {**page_meta, "page_num": page_num}
+                    if c.result_index < 0:
+                        c.result_index = page_index
                     dedupe_key = self._candidate_dedupe_key(c)
                     if dedupe_key in seen_keys:
+                        duplicate_count += 1
+                        c.page_meta["duplicate_in_search"] = True
+                        if dedupe_key in historical_keys:
+                            c.page_meta["seen_in_previous_round"] = True
                         continue
                     seen_keys.add(dedupe_key)
-                    c.result_index = len(all_candidates) + len(new_candidates)
-                    new_candidates.append(c)
+                    new_unique_candidates.append(c)
 
-                all_candidates.extend(new_candidates)
+                # Return the raw page cards, including historical/cross-page
+                # duplicates. Runtime persists those occurrences as candidate
+                # sources while pagination yield only counts first-seen keys.
+                all_candidates.extend(candidates)
 
-                if page_num < max_pages:
+                potential_count = 0
+                validate_count = 0
+                for candidate in new_unique_candidates:
+                    bucket = self._pagination_candidate_bucket(
+                        candidate, candidate_classifier
+                    )
+                    if bucket == "potential":
+                        potential_count += 1
+                    elif bucket == "validate":
+                        validate_count += 1
+                stats = PageYieldStats(
+                    page_num=page_num,
+                    raw_count=len(candidates),
+                    new_unique=len(new_unique_candidates),
+                    duplicate_count=duplicate_count,
+                    potential_count=potential_count,
+                    validate_count=validate_count,
+                )
+                page_history.append(stats)
+                logger.info("search pagination page=%s", stats.to_dict())
+                if on_page is not None:
+                    try:
+                        on_page(stats)
+                    except Exception as exc:
+                        logger.warning("search: on_page callback failed: %s", exc)
+
+                if active_policy is not None:
+                    pagination_decision = active_policy.assess(page_history)
+                    logger.info(
+                        "search pagination decision continue=%s reason=%s",
+                        pagination_decision.continue_paging,
+                        pagination_decision.reason,
+                    )
+                    if not pagination_decision.continue_paging:
+                        break
+
+                if page_num < page_cap:
                     next_ok = self.go_to_next_result_page()
                     if not next_ok:
                         logger.warning(
@@ -111,14 +183,45 @@ class _ExecutorMixin:
     def _candidate_dedupe_key(candidate: LiepinSearchCandidate) -> str:
         url = (candidate.profile_url or "").strip()
         if url:
-            if url.startswith("/") and not url.startswith("//"):
-                url = "https://h.liepin.com" + url
-            return url
-        return "|".join([
-            (candidate.name or "").strip(),
-            (candidate.current_company or "").strip(),
-            (candidate.current_title or "").strip(),
-        ])
+            return normalize_profile_url(url)
+        return "|".join(
+            value
+            for value in (
+                normalize_text(candidate.name),
+                normalize_text(candidate.current_company),
+                normalize_text(candidate.current_title),
+            )
+            if value
+        )
+
+    @staticmethod
+    def _normalize_candidate_key(value: object) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if "://" in raw or raw.startswith("/"):
+            return normalize_profile_url(raw)
+        return normalize_text(raw)
+
+    @staticmethod
+    def _pagination_candidate_bucket(
+        candidate: LiepinSearchCandidate,
+        classifier: Optional[Callable[[LiepinSearchCandidate], str]],
+    ) -> str:
+        # Without a classifier, unique cards stay in the validation pool. This
+        # preserves recall and lets quantity/duplicate signals drive the policy.
+        if classifier is None:
+            return "validate"
+        try:
+            value = str(classifier(candidate) or "").strip().lower()
+        except Exception as exc:
+            logger.warning("search: pagination classifier failed: %s", exc)
+            return "validate"
+        if value in {"potential", "must_fetch", "fetch", "high"}:
+            return "potential"
+        if value in {"validate", "maybe", "uncertain", "explore"}:
+            return "validate"
+        return "other"
 
 
     def _execute_search(
@@ -137,6 +240,9 @@ class _ExecutorMixin:
         """
         self._apply_search_execution_options(page, match_mode=match_mode, scope=scope)
         self._dismiss_any_open_modal(page)
+        # Search pages are reused across rounds. Reconcile from a clean set of
+        # Agent-owned chips so removed filters do not silently survive.
+        self._clear_managed_filter_conditions(page)
         self._clear_search_inputs(page)
         controls = self._detect_search_controls(page)
         if controls.search_input is None:

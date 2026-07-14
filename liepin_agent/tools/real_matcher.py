@@ -3,12 +3,34 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import re
+import unicodedata
 from typing import Dict, Optional
 
+from pydantic import ValidationError
+
 from ..core.config import ConfigManager
+from ..domain.match_output import MatchOutput
 from ..domain.models import MatchResult
 from .llm_client import LLMClient
+
+
+logger = logging.getLogger(__name__)
+
+MATCH_PROMPT_VERSION = "match-contract-v3-20260714"
+MIN_GROUNDED_EVIDENCE_CHARS = 4
+MIN_A_SCORE = 70
+MIN_B_SCORE = 45
+
+
+class MatchOutputParseError(ValueError):
+    """The model response did not contain one valid JSON object."""
+
+
+class MatchEvidenceValidationError(ValueError):
+    """Direct evidence could not be anchored to the captured resume."""
 
 
 MATCH_SYSTEM_PROMPT = """你是资深猎头顾问，判断候选人与岗位的匹配度。
@@ -48,20 +70,54 @@ B = 核心技能有但非近期，或行业有偏差但可迁移，或薪资/地
 C = 有相关背景但核心技能不明确，或薪资/地点/性别严重不匹配，需沟通确认
 D = 不相关或明显不符
 
-只输出 JSON，不要 Markdown。字段：
-tier: A/B/C/D
-summary: 一句话：为什么给这个档位
-evidence: 简历中的关键证据
-inferred: 合理推断的技能（如有）
-risks: 风险点
-questions: ["电话要确认的问题"]
-confidence: high/medium/low
+只输出一个 JSON 对象，不要 Markdown 或额外说明。必须使用以下字段：
+{
+  "tier": "A/B/C/D",
+  "summary": "一句话说明评级原因",
+  "core_met_count": 0,
+  "core_total": 0,
+  "dealbreaker_hit": false,
+  "matched_evidence": [
+    {"criterion": "岗位要求", "evidence": "简历原文证据", "strength": "strong/medium/weak"}
+  ],
+  "inferred_evidence": [
+    {"criterion": "推断能力", "evidence": "推断及其依据", "strength": "strong/medium/weak"}
+  ],
+  "missing_or_unclear": ["缺失或无法确认的信息"],
+  "risks": ["风险点"],
+  "questions_to_verify": ["电话要确认的问题"],
+  "recommendation": "后续建议",
+  "confidence": "high/medium/low"
+}
+
+matched_evidence 只能放简历中可直接引用的事实；推断必须单独放在
+inferred_evidence。matched_evidence.evidence 必须逐字引用简历中的连续原文，
+不要改写或概括。A/B 档必须至少包含一条可定位的直接证据，否则结果无法通过校验。
 """
 
 
 class RealMatchService:
     def __init__(self, llm_client: LLMClient):
         self.llm_client = llm_client
+        config_payload = {
+            "provider": getattr(llm_client, "provider", ""),
+            "model": getattr(llm_client, "model_name", ""),
+            "temperature": getattr(llm_client, "temperature", None),
+            "max_tokens": getattr(llm_client, "max_tokens", None),
+        }
+        self.prompt_version = MATCH_PROMPT_VERSION
+        self.model_config_hash = hashlib.sha256(
+            json.dumps(
+                config_payload, ensure_ascii=False, sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @property
+    def cache_identity(self) -> Dict[str, str]:
+        return {
+            "prompt_version": self.prompt_version,
+            "model_config_hash": self.model_config_hash,
+        }
 
     @classmethod
     def from_config(cls, config_manager: Optional[ConfigManager] = None) -> "RealMatchService":
@@ -78,6 +134,9 @@ class RealMatchService:
                 model_name=backend_model,
                 timeout=config.timeout,
                 provider=config.backend_llm_provider or "openai",
+                max_retries=config.llm_max_retries,
+                max_tokens=config.llm_max_tokens,
+                temperature=config.backend_llm_temperature,
             )
         )
 
@@ -88,39 +147,218 @@ class RealMatchService:
         candidate_id: str,
         resume_text: str,
         criteria: Dict[str, object],
+        structured_facts: Optional[Dict[str, object]] = None,
+        capture_quality: Optional[Dict[str, object]] = None,
     ) -> MatchResult:
-        prompt = self._build_prompt(criteria, resume_text)
-        raw = self.llm_client.chat(prompt, system_message=MATCH_SYSTEM_PROMPT)
-        payload = self._parse_json(raw)
-        tier = self._normalize_tier(payload.get("tier"))
+        criteria = criteria or {}
+        prompt = self._build_prompt(
+            criteria,
+            resume_text,
+            structured_facts=structured_facts,
+            capture_quality=capture_quality,
+        )
+        try:
+            raw = self.llm_client.chat(prompt, system_message=MATCH_SYSTEM_PROMPT)
+        except Exception as exc:
+            logger.exception("Candidate match request failed: candidate=%s", candidate_id)
+            result = self._technical_failure_result(
+                session_id=session_id,
+                round_id=round_id,
+                candidate_id=candidate_id,
+                criteria=criteria,
+                error=exc,
+            )
+            return self._attach_audit_metadata(result, prompt, resume_text)
+
+        try:
+            payload = self._parse_json(raw)
+            output = MatchOutput.model_validate(payload)
+            self._validate_direct_evidence(output, resume_text)
+            match_score = output.deterministic_score()
+            resolved_tier, score_risk = self._resolve_tier(
+                output.tier, match_score
+            )
+        except (
+            MatchOutputParseError,
+            MatchEvidenceValidationError,
+            ValidationError,
+        ) as exc:
+            logger.warning(
+                "Candidate match output needs review: candidate=%s error=%s",
+                candidate_id,
+                self._validation_message(exc),
+            )
+            result = self._review_result(
+                session_id=session_id,
+                round_id=round_id,
+                candidate_id=candidate_id,
+                criteria=criteria,
+                raw=raw,
+                error=exc,
+            )
+            return self._attach_audit_metadata(result, prompt, resume_text)
+
+        result = MatchResult(
+            candidate_id=candidate_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier=resolved_tier,
+            core_met_count=output.core_met_count,
+            core_total=output.core_total,
+            dealbreaker_hit=output.dealbreaker_hit,
+            summary=output.summary,
+            risks="；".join(
+                [*output.risks, *([score_risk] if score_risk else [])]
+            ),
+            recommendation=output.recommendation,
+            detail=output.detail or output.canonical_json(),
+            raw_response=raw,
+            status="completed",
+            criteria_version_id=str(criteria.get("criteria_version_id") or ""),
+            matched_evidence=output.evidence_for_match_result(),
+            missing_or_unclear=output.missing_or_unclear,
+            questions_to_verify=output.questions_to_verify,
+            confidence=output.confidence,
+            match_score=match_score,
+        )
+        return self._attach_audit_metadata(result, prompt, resume_text)
+
+    @classmethod
+    def _validate_direct_evidence(
+        cls, output: MatchOutput, resume_text: str
+    ) -> None:
+        """Require every claimed direct quote to exist in the captured resume."""
+        normalized_resume = cls._normalize_evidence_text(resume_text)
+        unsupported = []
+        for item in output.matched_evidence:
+            quote = cls._normalize_evidence_text(item.evidence)
+            if (
+                len(quote) < MIN_GROUNDED_EVIDENCE_CHARS
+                or quote not in normalized_resume
+            ):
+                unsupported.append(item.evidence)
+        if unsupported:
+            raise MatchEvidenceValidationError(
+                "直接证据无法在简历原文定位：{}".format(
+                    "；".join(unsupported[:3])
+                )
+            )
+
+    @staticmethod
+    def _normalize_evidence_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return "".join(
+            character for character in normalized if character.isalnum()
+        )
+
+    @staticmethod
+    def _resolve_tier(tier: str, match_score: int) -> tuple[str, str]:
+        if tier == "A" and match_score < MIN_A_SCORE:
+            if match_score >= MIN_B_SCORE:
+                return "B", "证据分不足以支持 A 档，已按确定性规则降为 B 档"
+            raise MatchEvidenceValidationError(
+                "证据分 {} 低于 A/B 自动评级门槛".format(match_score)
+            )
+        if tier == "B" and match_score < MIN_B_SCORE:
+            raise MatchEvidenceValidationError(
+                "证据分 {} 低于 B 档自动评级门槛".format(match_score)
+            )
+        return tier, ""
+
+    def _attach_audit_metadata(
+        self, result: MatchResult, prompt: str, resume_text: str
+    ) -> MatchResult:
+        result.prompt_version = self.prompt_version
+        result.model_name = str(getattr(self.llm_client, "model_name", "") or "")
+        result.model_config_hash = self.model_config_hash
+        result.input_hash = hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()
+        result.resume_hash = hashlib.sha256(
+            (resume_text or "").strip().encode("utf-8")
+        ).hexdigest()
+        return result
+
+    @classmethod
+    def _review_result(
+        cls,
+        session_id: str,
+        round_id: str,
+        candidate_id: str,
+        criteria: Dict[str, object],
+        raw: str,
+        error: Exception,
+    ) -> MatchResult:
+        reason = cls._validation_message(error)
         return MatchResult(
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier=tier,
-            core_met_count=int(payload.get("core_met_count") or 0),
-            core_total=int(payload.get("core_total") or 0),
-            dealbreaker_hit=bool(payload.get("dealbreaker_hit")),
-            summary=str(payload.get("summary") or ""),
-            risks=str(payload.get("risks") or ""),
-            recommendation=str(payload.get("recommendation") or ""),
-            detail=str(payload.get("detail") or raw),
+            tier="",
+            summary="模型匹配结果无法可靠校验，需人工复核。",
+            risks="匹配结果校验失败：{}".format(reason),
+            recommendation="人工复核后再决定是否推进。",
+            detail=raw,
             raw_response=raw,
+            status="needs_review",
             criteria_version_id=str(criteria.get("criteria_version_id") or ""),
-            matched_evidence=self._list_of_dicts(payload.get("matched_evidence")),
-            missing_or_unclear=self._string_list(payload.get("missing_or_unclear")),
-            questions_to_verify=self._string_list(payload.get("questions_to_verify")),
-            confidence=str(payload.get("confidence") or "medium"),
+            missing_or_unclear=["模型输出未通过匹配契约校验"],
+            questions_to_verify=["请人工复核该候选人与岗位要求的匹配度"],
+            confidence="low",
         )
 
     @staticmethod
-    def _build_prompt(criteria: Dict[str, object], resume_text: str) -> str:
+    def _technical_failure_result(
+        session_id: str,
+        round_id: str,
+        candidate_id: str,
+        criteria: Dict[str, object],
+        error: Exception,
+    ) -> MatchResult:
+        return MatchResult(
+            candidate_id=candidate_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier="",
+            summary="模型匹配请求失败，未产生业务评级。",
+            risks=str(error),
+            recommendation="排查模型服务后重试，或转人工复核。",
+            detail=str(error),
+            raw_response="",
+            status="failed",
+            criteria_version_id=str(criteria.get("criteria_version_id") or ""),
+            missing_or_unclear=["模型匹配请求失败"],
+            questions_to_verify=["请在模型服务恢复后重新匹配"],
+            confidence="low",
+        )
+
+    @staticmethod
+    def _validation_message(error: Exception) -> str:
+        if isinstance(error, ValidationError):
+            messages = []
+            for item in error.errors(include_input=False):
+                location = ".".join(str(part) for part in item.get("loc", ()))
+                message = str(item.get("msg") or "invalid value")
+                messages.append("{}: {}".format(location or "output", message))
+            return "; ".join(messages) or "输出未通过校验"
+        return str(error) or "输出无法解析"
+
+    @staticmethod
+    def _build_prompt(
+        criteria: Dict[str, object],
+        resume_text: str,
+        structured_facts: Optional[Dict[str, object]] = None,
+        capture_quality: Optional[Dict[str, object]] = None,
+    ) -> str:
+        compact_criteria = {
+            key: value
+            for key, value in (criteria or {}).items()
+            if key not in {"jd_text", "user_notes", "source_jd_text", "source_user_notes"}
+        }
         jd_section = ""
         jd_text = str(criteria.get("jd_text") or "").strip()
         if jd_text:
             # JD 薪资信息通常在后半部分，不要简单截断前 N 字。
             # 如果过长，保留头部（职位描述）+ 尾部（薪资、要求、福利）。
-            max_len = 4000
+            max_len = 3000
             if len(jd_text) > max_len:
                 head = jd_text[:1500]
                 tail = jd_text[-(max_len - 1500):]
@@ -148,11 +386,45 @@ class RealMatchService:
                 notes=user_notes[:2000]
             )
 
+        structured_section = ""
+        if structured_facts:
+            structured_section = """
+
+【已解析的结构化事实】
+{structured}
+
+这些字段来自抓取器。缺失字段只能判断为 unknown，不能判断为不符合。""".format(
+                structured=json.dumps(
+                    structured_facts, ensure_ascii=False, separators=(",", ":")
+                )
+            )
+
+        quality_section = ""
+        if capture_quality:
+            quality_section = """
+
+【抓取完整度】
+{quality}
+
+如果关键区段缺失，应降低 confidence 并写入 missing_or_unclear。""".format(
+                quality=json.dumps(
+                    capture_quality, ensure_ascii=False, separators=(",", ":")
+                )
+            )
+
+        resume = resume_text or ""
+        if len(resume) > 12000:
+            resume = "{}\n\n...（中间省略）...\n\n{}".format(
+                resume[:7000], resume[-4500:]
+            )
+
         return """【岗位匹配标准】
 {criteria}
 
 【候选人简历】
 {resume}
+{structured_section}
+{quality_section}
 {jd_section}
 {notes_section}
 
@@ -164,15 +436,19 @@ D = 不相关或明显不符
 
 要求：
 1. 判断必须围绕岗位匹配标准中的核心要求。
-2. evidence 尽量引用简历原文证据。
-3. 合理推断要有依据，不确定的放入 questions。
+2. matched_evidence 必须引用简历原文证据，不能把推断当作直接证据。
+   evidence 字段必须复制简历中的连续原句，不要改写或概括；每个核心条件分别给证据。
+3. 合理推断放入 inferred_evidence，不确定的信息放入 missing_or_unclear，
+   需要沟通的问题放入 questions_to_verify。
 4. A/B/C/D 只是标签，核心是证据、推断、风险和待确认问题。
 5. **薪资匹配：你必须自行从 JD 原文中读取岗位薪资范围，从简历中读取候选人薪资，然后判断。严重不匹配时必须在 risks 中明确标注，且不得给 A 档。**
 6. **地点匹配：你必须自行从简历中读取候选人的当前所在地和期望工作地，与岗位要求对比。严重不匹配时必须在 risks 中明确标注，且不得给 A 档。**
 7. **项目要点中的额外要求（如 CET4、211 硕士、背调接受度、经验区间等）必须重点评估，不符合的不得给 A 档。**
 """.format(
-            criteria=json.dumps(criteria or {}, ensure_ascii=False, indent=2),
-            resume=resume_text or "",
+            criteria=json.dumps(compact_criteria, ensure_ascii=False, indent=2),
+            resume=resume,
+            structured_section=structured_section,
+            quality_section=quality_section,
             jd_section=jd_section,
             notes_section=notes_section,
         )
@@ -180,54 +456,57 @@ D = 不相关或明显不符
     @staticmethod
     def _parse_json(raw: str) -> Dict[str, object]:
         text = (raw or "").strip()
-        block = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+        if not text:
+            raise MatchOutputParseError("模型返回为空")
+
+        block = re.search(
+            r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE
+        )
         if block:
             text = block.group(1)
-        elif not (text.startswith("{") and text.endswith("}")):
-            match = re.search(r"(\{.*\})", text, flags=re.DOTALL)
-            if match:
-                text = match.group(1)
+
         try:
             data = json.loads(text)
-        except ValueError:
-            data = {
-                "tier": "C",
-                "summary": "模型未返回标准 JSON，需人工复核。",
-                "risks": "解析失败",
-                "recommendation": "人工复核",
-                "detail": raw,
-                "matched_evidence": [],
-                "missing_or_unclear": ["模型输出无法解析"],
-                "questions_to_verify": ["请人工复核该候选人与岗位要求的匹配度"],
-                "confidence": "low",
-            }
-        return data if isinstance(data, dict) else {}
+        except (TypeError, ValueError):
+            decoder = json.JSONDecoder()
+            data = None
+            for index, character in enumerate(text):
+                if character != "{":
+                    continue
+                try:
+                    candidate, _ = decoder.raw_decode(text[index:])
+                except ValueError:
+                    continue
+                if isinstance(candidate, dict):
+                    data = candidate
+                    break
+        if not isinstance(data, dict):
+            raise MatchOutputParseError("模型未返回有效的 JSON 对象")
+        return data
 
     @staticmethod
     def _normalize_tier(value: object) -> str:
-        tier = str(value or "").strip().upper()
-        return tier if tier in {"A", "B", "C", "D"} else "C"
+        return MatchOutput.model_validate(
+            {"tier": value, "summary": "compatibility validation"}
+        ).tier
 
     @staticmethod
     def _string_list(value: object) -> list:
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        if isinstance(value, str) and value.strip():
-            return [value.strip()]
-        return []
+        return MatchOutput.model_validate(
+            {
+                "tier": "C",
+                "summary": "compatibility validation",
+                "missing_or_unclear": value,
+            }
+        ).missing_or_unclear
 
     @staticmethod
     def _list_of_dicts(value: object) -> list:
-        if not isinstance(value, list):
-            return []
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                result.append(
-                    {
-                        "criterion": str(item.get("criterion") or ""),
-                        "evidence": str(item.get("evidence") or ""),
-                        "strength": str(item.get("strength") or ""),
-                    }
-                )
-        return result
+        output = MatchOutput.model_validate(
+            {
+                "tier": "C",
+                "summary": "compatibility validation",
+                "matched_evidence": value,
+            }
+        )
+        return output.evidence_for_match_result()

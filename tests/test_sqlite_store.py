@@ -1,6 +1,13 @@
+import sqlite3
+
 from liepin_agent.storage.sqlite_store import SQLiteStore
 from liepin_agent.domain.states import SessionStatus
-from liepin_agent.domain.models import CandidateDetail, CandidateSummary, SearchPlan
+from liepin_agent.domain.models import (
+    CandidateDetail,
+    CandidateSummary,
+    MatchResult,
+    SearchPlan,
+)
 
 
 def test_create_and_list_session(tmp_path):
@@ -123,3 +130,283 @@ def test_session_diagnostic_summary_flags_pending_match(tmp_path):
     assert summary["pending_match_count"] == 1
     assert summary["card_decision_counts"]["noise"] == 1
     assert any("等待匹配结果回写" in item for item in summary["diagnostic_flags"])
+
+
+def test_current_criteria_uses_latest_result_and_distinct_detail_count(tmp_path):
+    store = SQLiteStore(str(tmp_path / "workbench.db"))
+    session_id = store.create_session("版本投影测试", "天然气销售")
+    criteria_v1 = store.create_criteria_version(
+        session_id, "天然气\n销售", "天然气销售经验", created_by="human"
+    )
+    store.confirm_criteria_version(criteria_v1)
+    round_id = store.create_round(
+        session_id,
+        1,
+        SearchPlan(query="天然气 销售"),
+        criteria_v1,
+    )
+    candidate_id = store.save_candidate_summary(
+        CandidateSummary(
+            session_id=session_id,
+            round_id=round_id,
+            profile_url="https://example.com/versioned",
+            name="候选人",
+        )
+    )
+    for text in ("第一份详情", "同一候选人的重复详情"):
+        store.save_candidate_detail(
+            CandidateDetail(
+                candidate_id=candidate_id,
+                resume_text=text,
+                capture_status="success",
+            )
+        )
+
+    store.save_match_result(
+        MatchResult(
+            candidate_id=candidate_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier="B",
+            status="completed",
+            criteria_version_id=criteria_v1,
+            matched_evidence=[{"criterion": "行业", "evidence": "天然气", "strength": "强"}],
+        )
+    )
+    store.save_match_result(
+        MatchResult(
+            candidate_id=candidate_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier="C",
+            status="completed",
+            criteria_version_id=criteria_v1,
+        )
+    )
+
+    assert store.list_candidates(session_id)[0]["match_tier"] == "C"
+    assert store.count_ab_matches(session_id) == 0
+    assert store.count_fetched_details(session_id) == 1
+
+    criteria_v2 = store.create_criteria_version(
+        session_id, "LNG\n销售", "必须有 LNG 销售证据", created_by="human"
+    )
+    store.confirm_criteria_version(criteria_v2)
+
+    assert store.list_candidates(session_id)[0]["match_tier"] is None
+    assert store.count_ab_matches(session_id) == 0
+
+    store.save_match_result(
+        MatchResult(
+            candidate_id=candidate_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier="A",
+            status="completed",
+            criteria_version_id=criteria_v2,
+            matched_evidence=[{"criterion": "LNG", "evidence": "LNG 销售", "strength": "强"}],
+        )
+    )
+    assert store.list_candidates(session_id)[0]["match_tier"] == "A"
+    assert store.count_ab_matches(session_id) == 1
+    assert store.list_sessions()[0]["ab_count"] == 1
+    assert store.session_efficiency_metrics(session_id)["matched_count"] == 1
+    assert store.session_efficiency_metrics(session_id)["ab_count"] == 1
+
+    store.save_match_result(
+        MatchResult(
+            candidate_id=candidate_id,
+            session_id=session_id,
+            round_id=round_id,
+            tier="",
+            status="needs_review",
+            criteria_version_id=criteria_v2,
+        )
+    )
+    assert store.list_candidates(session_id)[0]["match_tier"] == ""
+    assert store.count_ab_matches(session_id) == 0
+    assert store.list_sessions()[0]["ab_count"] == 0
+    metrics = store.session_efficiency_metrics(session_id)
+    diagnostic = store.session_diagnostic_summary(session_id)
+    assert metrics["matched_count"] == 1
+    assert metrics["ab_count"] == 0
+    assert diagnostic["match_status_counts"] == {"needs_review": 1}
+    assert diagnostic["tier_counts"] == {"": 1}
+
+
+def test_match_audit_fields_round_trip_and_cache_identity_is_conjunctive(tmp_path):
+    store = SQLiteStore(str(tmp_path / "workbench.db"))
+    session_id = store.create_session("缓存测试", "电机研发")
+    criteria_id = store.create_criteria_version(
+        session_id, "电机\n研发", "具备电机研发经验", created_by="human"
+    )
+    store.confirm_criteria_version(criteria_id)
+    round_id = store.create_round(
+        session_id, 1, SearchPlan(query="电机 研发"), criteria_id
+    )
+    candidate_id = store.save_candidate_summary(
+        CandidateSummary(
+            session_id=session_id,
+            round_id=round_id,
+            profile_url="https://example.com/cache",
+            name="候选人",
+        )
+    )
+    result = MatchResult(
+        candidate_id=candidate_id,
+        session_id=session_id,
+        round_id=round_id,
+        tier="A",
+        status="completed",
+        criteria_version_id=criteria_id,
+        matched_evidence=[
+            {
+                "criterion": "电机研发",
+                "evidence": "负责无刷电机研发",
+                "strength": "strong",
+                "source_type": "direct",
+            }
+        ],
+        missing_or_unclear=["薪资待确认"],
+        questions_to_verify=["期望薪资是多少？"],
+        confidence="high",
+        prompt_version="match-v2",
+        model_name="matcher-model",
+        model_config_hash="model-hash-v2",
+        input_hash="input-hash-v2",
+        resume_hash="resume-hash-v2",
+        match_score=93,
+    )
+
+    match_id = store.save_match_result(result)
+    rows = store.list_match_results(session_id)
+
+    assert rows[0]["id"] == match_id
+    assert rows[0]["match_score"] == 93
+    assert rows[0]["prompt_version"] == "match-v2"
+    assert rows[0]["model_name"] == "matcher-model"
+    assert rows[0]["model_config_hash"] == "model-hash-v2"
+    assert rows[0]["input_hash"] == "input-hash-v2"
+    assert rows[0]["resume_hash"] == "resume-hash-v2"
+    assert rows[0]["matched_evidence"] == result.matched_evidence
+    assert rows[0]["missing_or_unclear"] == ["薪资待确认"]
+    assert rows[0]["questions_to_verify"] == ["期望薪资是多少？"]
+
+    cached = store.find_match_result(
+        candidate_id,
+        criteria_id,
+        statuses=("completed",),
+        prompt_version="match-v2",
+        model_config_hash="model-hash-v2",
+        input_hash="input-hash-v2",
+        resume_hash="resume-hash-v2",
+    )
+    assert cached and cached["id"] == match_id
+    assert (
+        store.find_match_result(
+            candidate_id,
+            criteria_id,
+            statuses=("completed",),
+            prompt_version="match-v1",
+            model_config_hash="model-hash-v2",
+        )
+        is None
+    )
+    assert (
+        store.find_match_result(
+            candidate_id,
+            criteria_id,
+            statuses=("completed",),
+            prompt_version="match-v2",
+            model_config_hash="model-hash-v2",
+            resume_hash="changed-resume-hash",
+        )
+        is None
+    )
+
+
+def test_legacy_match_table_migrates_audit_columns_and_remains_writable(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE match_results (
+                id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                round_id TEXT NOT NULL,
+                tier TEXT,
+                core_met_count INTEGER,
+                core_total INTEGER,
+                dealbreaker_hit INTEGER,
+                summary TEXT,
+                risks TEXT,
+                recommendation TEXT,
+                detail TEXT,
+                raw_response TEXT,
+                status TEXT NOT NULL,
+                criteria_version_id TEXT,
+                evidence_json TEXT,
+                unknowns_json TEXT,
+                questions_json TEXT,
+                confidence TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO match_results (
+                id, candidate_id, session_id, round_id, tier, status,
+                criteria_version_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("legacy-match", "candidate-1", "session-1", "round-1", "B", "completed", "criteria-1", "2026-01-01 00:00:00"),
+        )
+
+    store = SQLiteStore(str(db_path))
+    with store.connect() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(match_results)")
+        }
+        indexes = {
+            row["name"] for row in connection.execute("PRAGMA index_list(match_results)")
+        }
+
+    assert {
+        "prompt_version",
+        "model_name",
+        "model_config_hash",
+        "input_hash",
+        "resume_hash",
+        "match_score",
+    }.issubset(columns)
+    assert "idx_match_results_current" in indexes
+    assert "idx_match_results_cache" in indexes
+    legacy = store.list_match_results("session-1")[0]
+    assert legacy["id"] == "legacy-match"
+    assert legacy["match_score"] == 0
+
+    new_id = store.save_match_result(
+        MatchResult(
+            candidate_id="candidate-1",
+            session_id="session-1",
+            round_id="round-1",
+            tier="C",
+            status="completed",
+            criteria_version_id="criteria-1",
+            prompt_version="match-v2",
+            model_name="matcher-model",
+            model_config_hash="model-hash-v2",
+            input_hash="input-hash-v2",
+            resume_hash="resume-hash-v2",
+            match_score=42,
+        )
+    )
+    saved = next(
+        item
+        for item in store.list_match_results("session-1")
+        if item["id"] == new_id
+    )
+    assert saved["match_score"] == 42
+    assert saved["prompt_version"] == "match-v2"

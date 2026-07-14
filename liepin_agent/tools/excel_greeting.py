@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import random
 import time
@@ -192,9 +193,11 @@ class ExcelGreetingService:
             if self._stop_event.is_set():
                 return {"status": "failed", "message": "", "error": "用户取消"}
             try:
-                response = self.liepin_tool.greet_candidate(
-                    payload, message_template=message_template, request_resume=request_resume
-                )
+                greet_candidate = self.liepin_tool.greet_candidate
+                kwargs = {"message_template": message_template}
+                if self._accepts_keyword(greet_candidate, "request_resume"):
+                    kwargs["request_resume"] = request_resume
+                response = greet_candidate(payload, **kwargs)
             except Exception as exc:
                 response = {"status": "failed", "message": "", "error": str(exc)}
             last_response = response
@@ -211,6 +214,20 @@ class ExcelGreetingService:
                 time.sleep(random.uniform(2.0, 4.0))
         return last_response
 
+    @staticmethod
+    def _accepts_keyword(callback: Callable[..., object], keyword: str) -> bool:
+        """Return whether a callable accepts a keyword without invoking it."""
+        try:
+            parameters = inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            # Some extension callables do not expose a signature. Preserve the
+            # modern API in that uncommon case instead of disabling features.
+            return True
+        return keyword in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
     @classmethod
     def write_greeting_result(
         cls,
@@ -221,6 +238,8 @@ class ExcelGreetingService:
         error: str = "",
         request_resume_status: str = "",
     ) -> None:
+        if status == "dry_run":
+            return
         import time as _time
         last_exc = None
         for attempt in range(3):
@@ -253,13 +272,18 @@ class ExcelGreetingService:
                 if attempt < 2:
                     _time.sleep(1.5)
                 continue
-            except Exception as exc:
+            except Exception:
                 raise
         raise last_exc
 
     @classmethod
     def _write_batch_results(cls, excel_path: str | Path, results: List[Dict[str, object]]) -> None:
         """将一批结果统一写入 Excel，用于补救中间因文件占用而失败的单条写入。"""
+        writable_results = [
+            item for item in results if str(item.get("status") or "") != "dry_run"
+        ]
+        if not writable_results:
+            return
         import time as _time
         for attempt in range(3):
             try:
@@ -278,7 +302,7 @@ class ExcelGreetingService:
                         "failed": cls.STATUS_FAILED,
                         "dry_run": cls.STATUS_DRY_RUN,
                     }
-                    for item in results:
+                    for item in writable_results:
                         row_index = int(item.get("row_index") or 0)
                         if row_index <= 0:
                             continue

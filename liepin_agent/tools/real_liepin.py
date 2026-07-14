@@ -8,13 +8,17 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from ..core.config import ConfigManager
 from ..core.liepin_browser import LiepinBrowserManager
 from ..core.liepin_resume_extractor import LiepinResumeExtractor
-from ..core.liepin_search_service import LiepinSearchCandidate, LiepinSearchService
+from ..core.liepin_search_service import (
+    AdaptivePaginationPolicy,
+    LiepinSearchCandidate,
+    LiepinSearchService,
+)
 from ..domain.models import CandidateDetail, CandidateSummary, SearchPlan
 
 logger = logging.getLogger(__name__)
@@ -70,42 +74,61 @@ class RealLiepinTool:
     def close_browser(self) -> None:
         self.browser_manager.close_browser()
 
-    # 猎聘城市弹窗对直辖市（北京/上海/天津/重庆）不稳定，直接合并到 query
-    _MUNICIPALITIES = ("北京", "上海", "天津", "重庆")
-
     def run_search_round(
-        self, session_id: str, round_id: str, plan: SearchPlan
+        self,
+        session_id: str,
+        round_id: str,
+        plan: SearchPlan,
+        known_candidate_keys: Optional[List[str]] = None,
     ) -> List[CandidateSummary]:
         """Run one real Liepin search and return only result-card summaries."""
         _ = session_id, round_id
         filters = self._map_filters(plan.filters or {})
 
-        # Workaround: 直辖市城市弹窗点击不稳定，把城市名合并到 query 中
         query = plan.query
-        original_cities = plan.filters.get("city") if plan.filters else None
-        if original_cities:
-            cities = (
-                original_cities
-                if isinstance(original_cities, list)
-                else [original_cities]
-            )
-            for city in cities:
-                city_str = str(city).strip()
-                if city_str and city_str in self._MUNICIPALITIES:
-                    if city_str not in query:
-                        query = "{} {}".format(query, city_str)
-                    filters.pop("目前城市", None)
-                    filters.pop("期望城市", None)
 
         max_pages = getattr(
-            self.config_manager.config, "search_max_pages_per_round", 3
+            self.config_manager.config, "search_max_pages_per_round", 10
         )
+        pagination_policy = None
+        candidate_classifier = None
+        if getattr(
+            self.config_manager.config, "search_adaptive_pagination_enabled", True
+        ):
+            pagination_policy = AdaptivePaginationPolicy(
+                min_pages=getattr(
+                    self.config_manager.config, "search_min_pages_per_round", 3
+                ),
+                max_pages=max_pages,
+                low_yield_patience=getattr(
+                    self.config_manager.config,
+                    "search_low_yield_page_patience",
+                    2,
+                ),
+                min_new_unique=getattr(
+                    self.config_manager.config,
+                    "search_min_new_unique_per_page",
+                    3,
+                ),
+                min_promising=getattr(
+                    self.config_manager.config,
+                    "search_min_promising_per_page",
+                    1,
+                ),
+                duplicate_rate_threshold=getattr(
+                    self.config_manager.config,
+                    "search_duplicate_rate_threshold",
+                    0.8,
+                ),
+            )
+            candidate_classifier = self._pagination_classifier(plan)
         logger.warning(
-            "RealLiepinTool search query=%s position=%s filters=%s max_pages=%s",
+            "RealLiepinTool search query=%s position=%s filters=%s max_pages=%s adaptive=%s",
             query,
             plan.position_filter,
             filters,
             max_pages,
+            pagination_policy is not None,
         )
         candidates = self.search_service.search(
             query,
@@ -114,11 +137,60 @@ class RealLiepinTool:
             scope=plan.scope,
             position_filter=plan.position_filter,
             max_pages=max_pages,
+            pagination_policy=pagination_policy,
+            candidate_classifier=candidate_classifier,
+            known_candidate_keys=known_candidate_keys,
         )
         return [
             self._to_candidate_summary(item, index)
             for index, item in enumerate(candidates or [])
         ]
+
+    @staticmethod
+    def _pagination_classifier(
+        plan: SearchPlan,
+    ) -> Callable[[LiepinSearchCandidate], str]:
+        """Build a local card classifier used only for pagination yield.
+
+        It never rejects a candidate or determines the final detail decision;
+        it only tells the bounded pagination policy whether another page is
+        likely to add signal. Empty card fields therefore remain unknown.
+        """
+        expected_terms = [
+            str(value).strip().lower()
+            for value in (plan.expected_signal or [])
+            if str(value).strip()
+        ]
+        position_filter = (plan.position_filter or "").strip().lower()
+        if not expected_terms:
+            expected_terms = [
+                value.strip().lower()
+                for value in (plan.query or "").split()
+                if value.strip() and not value.strip().startswith("-")
+            ]
+
+        def _classify(candidate: LiepinSearchCandidate) -> str:
+            text = "\n".join(
+                str(value or "").lower()
+                for value in (
+                    candidate.current_title,
+                    candidate.current_company,
+                    candidate.city,
+                    candidate.work_years,
+                    candidate.education,
+                    candidate.summary,
+                    candidate.raw_text,
+                )
+            )
+            hits = sum(1 for term in expected_terms if term and term in text)
+            position_hit = bool(position_filter and position_filter in text)
+            if hits >= 2 or (hits >= 1 and position_hit):
+                return "potential"
+            if hits >= 1 or position_hit or not expected_terms:
+                return "validate"
+            return "other"
+
+        return _classify
 
     def fetch_candidate_detail(self, candidate: Dict[str, object]) -> CandidateDetail:
         """Open a real candidate detail page and extract the normalized resume."""
@@ -693,9 +765,16 @@ class RealLiepinTool:
     @staticmethod
     def _map_filters(filters: Dict[str, object]) -> Dict[str, object]:
         mapped: Dict[str, object] = {}
-        cities = filters.get("city") or filters.get("目前城市")
-        if cities:
-            mapped["目前城市"] = cities
+        expected_cities = (
+            filters.get("expected_city")
+            or filters.get("期望城市")
+            or filters.get("city")
+        )
+        if expected_cities:
+            mapped["期望城市"] = expected_cities
+        current_cities = filters.get("current_city") or filters.get("目前城市")
+        if current_cities:
+            mapped["目前城市"] = current_cities
         work_years = filters.get("work_years") or filters.get("工作年限")
         if work_years:
             mapped["工作年限"] = work_years
@@ -706,13 +785,16 @@ class RealLiepinTool:
         if age:
             age_str = str(age).strip()
             # 如果是区间格式（如 25-35），按原样传递
-            if re.search(r"\d+\s*(?:-|~|至|到|,|，)\s*\d+", age_str):
+            if re.search(r"\d+\s*(?:-|~|至|到|,|，)\s*\d+", age_str) or re.search(
+                r"(?:以上|及以上|以下|以内|不超过|不低于|\+)", age_str
+            ):
                 mapped["年龄"] = age_str
             else:
-                # 提取单个数字作为上限，自动加 3 岁缓冲
+                # A single number is an explicit upper bound. Strategy-level
+                # relaxation must be recorded by the planner, not hidden here.
                 match = re.search(r"(\d+)", age_str)
                 if match:
-                    mapped["年龄"] = {"max": int(match.group(1)) + 3}
+                    mapped["年龄"] = {"max": int(match.group(1))}
                 else:
                     mapped["年龄"] = age_str
         active_days = filters.get("active_days") or filters.get("活跃度")
@@ -740,4 +822,11 @@ class RealLiepinTool:
         gender = filters.get("gender") or filters.get("性别")
         if gender:
             mapped["性别"] = str(gender).strip()
+        expected_salary = (
+            filters.get("expected_salary")
+            or filters.get("salary")
+            or filters.get("期望年薪")
+        )
+        if expected_salary:
+            mapped["期望年薪"] = expected_salary
         return mapped

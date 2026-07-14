@@ -17,12 +17,15 @@ from .search._detail_mixin import _DetailMixin
 from .search._remaining_mixin import _RemainingMixin
 
 from .search._models import (
+    AdaptivePaginationPolicy,
     LiepinSearchCandidate,
     LiepinSearchControls,
     LiepinFilterFieldSpec,
     LiepinSearchError,
     LiepinSearchPageChangedError,
     LiepinSearchNoResultsError,
+    PageYieldStats,
+    PaginationDecision,
 )
 
 from .liepin_browser import LiepinBrowserManager
@@ -46,6 +49,8 @@ class LiepinSearchService(
     """
 
     SEARCH_INPUT_SELECTORS = [
+        "div.search-auto-complete-box div.auto-input-wrap-v3 "
+        "input.ant-select-selection-search-input",
         "input.search-component-input",
         ".search-component-input input",
         'input[placeholder*="搜索"]',
@@ -115,11 +120,26 @@ class LiepinSearchService(
         ".loading",
         "[class*='loading']",
     ]
+    MANAGED_FILTER_TITLES = (
+        "职位名称",
+        "目前城市",
+        "期望城市",
+        "工作年限",
+        "教育经历",
+        "年龄",
+        "性别",
+        "活跃度",
+        "期望年薪",
+        "公司名称",
+    )
     FILTER_FIELD_SPECS = {
         "目前城市": LiepinFilterFieldSpec(
             title="目前城市",
             field_type="city_modal",
-            container_selector="div.search-item.sfilter-city",
+            container_selector=(
+                "div.search-item.sfilter-city:has("
+                "span.search-item-title:has-text('目前城市'))"
+            ),
             title_text="目前城市",
             fallback_container_selectors=(
                 "div.search-item.sfilter-city:has-text('目前城市')",
@@ -129,7 +149,10 @@ class LiepinSearchService(
         "期望城市": LiepinFilterFieldSpec(
             title="期望城市",
             field_type="city_modal",
-            container_selector="div.search-item.sfilter-city",
+            container_selector=(
+                "div.search-item.sfilter-city:has("
+                "span.search-item-title:has-text('期望城市'))"
+            ),
             title_text="期望城市",
             fallback_container_selectors=(
                 "div.search-item.sfilter-city:has-text('期望城市')",
@@ -160,7 +183,7 @@ class LiepinSearchService(
         "年龄": LiepinFilterFieldSpec(
             title="年龄",
             field_type="range",
-            container_selector="div.age-box",
+            container_selector="div.search-item.age-box:has(#ageLow):has(#ageHigh)",
             title_text="年龄",
             fallback_container_selectors=(
                 "div.search-item:has(#ageLow)",
@@ -168,7 +191,7 @@ class LiepinSearchService(
             ),
             low_input_selector="#ageLow, input.age-input[placeholder='岁']",
             high_input_selector="#ageHigh, input.age-input[placeholder='不限']",
-            confirm_selector=".age-shadow-box .shadow-box-submit-btn",
+            confirm_selector=".shadow-box-submit-btn",
             requires_expanded=True,
         ),
         "性别": LiepinFilterFieldSpec(
@@ -180,16 +203,25 @@ class LiepinSearchService(
                 "div.search-item:has-text('性别')",
                 "div.ant-select.ant-select-lg.h-select.sexSelectStyle.gray.ant-select-single.ant-select-show-arrow",
             ),
+            input_selector=(
+                ".sexSelectStyle input.ant-select-selection-search-input"
+            ),
             requires_expanded=True,
         ),
         "活跃度": LiepinFilterFieldSpec(
             title="活跃度",
             field_type="dropdown",
-            container_selector="div.search-item:has(.sfilter-other-select):has-text('活跃度')",
+            container_selector=(
+                "div.search-item:has(.sfilter-other-select):has("
+                "span.search-item-title:has-text('活跃度'))"
+            ),
             title_text="活跃度",
             fallback_container_selectors=(
                 "div.search-item:has-text('活跃度')",
                 "div.search-item:has-text('活跃度') div.ant-select",
+            ),
+            input_selector=(
+                ".sfilter-other-select input.ant-select-selection-search-input"
             ),
             requires_expanded=True,
         ),
@@ -219,7 +251,7 @@ class LiepinSearchService(
             fallback_container_selectors=("div.search-item:has-text('期望年薪')",),
             low_input_selector="#wantSalaryLow",
             high_input_selector="#wantSalaryHigh",
-            confirm_selector=".search-item:has(#wantSalaryLow) .shadow-box-submit-btn",
+            confirm_selector=".shadow-box-submit-btn",
             requires_expanded=True,
         ),
         "目前年薪": LiepinFilterFieldSpec(
@@ -230,7 +262,7 @@ class LiepinSearchService(
             fallback_container_selectors=("div.search-item:has-text('目前年薪')",),
             low_input_selector="#nowSalaryLow",
             high_input_selector="#nowSalaryHigh",
-            confirm_selector=".search-item:has(#nowSalaryLow) .shadow-box-submit-btn",
+            confirm_selector=".shadow-box-submit-btn",
             requires_expanded=True,
         ),
         "毕业院校": LiepinFilterFieldSpec(
@@ -256,6 +288,10 @@ class LiepinSearchService(
             title_text="公司名称",
             fallback_container_selectors=(
                 "div.search-item:has-text('公司名称')",
+            ),
+            input_selector=(
+                ".auto-select-comp-shadow-box .auto-select-base "
+                "input.ant-select-selection-search-input"
             ),
             confirm_selector="",
             requires_expanded=False,

@@ -3,7 +3,6 @@
 import json
 import os
 import sys
-from pathlib import Path
 from typing import Dict, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -62,6 +61,7 @@ class AppConfig(BaseModel):
     llm_max_retries: int = Field(default=2, ge=0, le=10)
     llm_max_tokens: int = Field(default=4096, ge=1, le=8192)
     llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    backend_llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
 
     # Agent 运行时参数
     match_queue_workers: int = Field(default=3, ge=1, le=20)
@@ -72,21 +72,29 @@ class AppConfig(BaseModel):
     consecutive_low_yield_threshold: int = Field(default=4, ge=1, le=10)
     jd_truncate_length: int = Field(default=800, ge=100, le=5000)
 
-    # 搜索参数
-    search_max_pages_per_round: int = Field(default=3, ge=1, le=10)
+    # 搜索参数：最多 10 页，并根据逐页边际收益提前停止。
+    search_adaptive_pagination_enabled: bool = True
+    search_min_pages_per_round: int = Field(default=3, ge=1, le=10)
+    search_max_pages_per_round: int = Field(default=10, ge=1, le=10)
+    search_low_yield_page_patience: int = Field(default=2, ge=1, le=5)
+    search_min_new_unique_per_page: int = Field(default=3, ge=1, le=50)
+    search_min_promising_per_page: int = Field(default=1, ge=0, le=50)
+    search_duplicate_rate_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
     # 浏览器自动化参数
     browser_task_timeout: int = Field(default=180, ge=30, le=600)
     detail_page_wait_seconds: float = Field(default=0.6, ge=0.0, le=10.0)
+    detail_min_resume_chars: int = Field(default=300, ge=50, le=5000)
     greeting_page_wait_seconds: float = Field(default=1.5, ge=0.0, le=10.0)
 
     # 详情抓取策略参数
-    sample_detail_limit: int = Field(default=999, ge=1, le=9999)
-    validate_detail_limit: int = Field(default=999, ge=1, le=9999)
-    harvest_detail_limit: int = Field(default=999, ge=1, le=9999)
+    sample_detail_limit: int = Field(default=10, ge=1, le=9999)
+    validate_detail_limit: int = Field(default=20, ge=1, le=9999)
+    harvest_detail_limit: int = Field(default=40, ge=1, le=9999)
     sample_detail_min_results: int = Field(default=3, ge=1, le=20)
     validate_detail_min_results: int = Field(default=8, ge=1, le=20)
     match_wait_timeout_seconds: int = Field(default=300, ge=30, le=1800)
+    candidate_skip_audit_rate: float = Field(default=0.08, ge=0.0, le=0.1)
 
     @field_validator("timeout", mode="before")
     @classmethod

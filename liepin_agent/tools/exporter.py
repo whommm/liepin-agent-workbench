@@ -93,6 +93,7 @@ class ExportService:
         "卡片判断",
         "详情状态",
         "匹配档位",
+        "证据分",
         "打招呼状态",
         "打招呼消息",
         "打招呼错误",
@@ -111,6 +112,7 @@ class ExportService:
     OVERVIEW_HEADERS = [
         "结论",
         "档位",
+        "证据分",
         "姓名",
         "公司",
         "职位",
@@ -200,8 +202,8 @@ class ExportService:
                 "conclusion": self._candidate_conclusion(item),
                 "tier": tier,
                 "is_qualified": tier in {"A", "B"},
-                "is_rejected": tier == "C",
-                "is_unmatched": tier not in {"A", "B", "C"},
+                "is_rejected": tier in {"C", "D"},
+                "is_unmatched": tier not in {"A", "B", "C", "D"},
                 "report_path": None,
             }
             rows.append(row)
@@ -218,6 +220,7 @@ class ExportService:
                 [
                     row["conclusion"],
                     row["tier"],
+                    item.get("match_score") or 0,
                     fields.get("name") or "",
                     fields.get("current_company") or "",
                     fields.get("current_title") or "",
@@ -265,6 +268,7 @@ class ExportService:
                     self._card_decision_label(item.get("card_decision") or ""),
                     item.get("detail_capture_status") or "",
                     item.get("match_tier") or "",
+                    item.get("match_score") or 0,
                     self._greeting_status_label(item.get("greeting_status") or ""),
                     item.get("greeting_message") or "",
                     item.get("greeting_error") or "",
@@ -416,7 +420,10 @@ class ExportService:
             for index, evidence in enumerate(row["evidence"], start=1):
                 paragraph(
                     "{}.".format(index),
-                    "{} - {} ({})".format(
+                    "[{}] {} - {} ({})".format(
+                        "推断"
+                        if evidence.get("source_type") == "inferred"
+                        else "原文",
                         evidence.get("criterion") or "",
                         evidence.get("evidence") or "",
                         evidence.get("strength") or "",
@@ -512,7 +519,10 @@ class ExportService:
     @staticmethod
     def _evidence_text(evidence: List[Dict[str, Any]]) -> str:
         return "\n".join(
-            "{}: {}".format(
+            "[{}] {}: {}".format(
+                "推断"
+                if evidence_item.get("source_type") == "inferred"
+                else "原文",
                 evidence_item.get("criterion") or "",
                 evidence_item.get("evidence") or "",
             )
@@ -526,7 +536,7 @@ class ExportService:
             return "强推荐"
         if tier == "B":
             return "可推荐"
-        if tier == "C":
+        if tier in {"C", "D"}:
             return "不推荐"
         if item.get("detail_capture_status"):
             return "待复核"
@@ -536,7 +546,7 @@ class ExportService:
     def _export_sort_key(cls, row: Dict[str, Any]) -> tuple[int, int, str]:
         tier = row["tier"]
         tier_order = {"A": 0, "B": 1, "C": 3}.get(tier, 2)
-        score = int(row["item"].get("pre_score") or 0)
+        score = int(row["item"].get("match_score") or 0)
         name = str(row["fields"].get("name") or "")
         return tier_order, -score, name
 

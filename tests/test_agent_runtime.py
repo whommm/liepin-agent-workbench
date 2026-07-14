@@ -39,7 +39,11 @@ class FakeLiepinTool:
     def fetch_candidate_detail(self, candidate):
         return CandidateDetail(
             candidate_id=candidate["id"],
-            resume_text="文创 潮玩 IP衍生品 量产 供应链 从0到1",
+            resume_text=(
+                "负责文创潮玩产品从0到1规划，推进IP衍生品量产并协同供应链。"
+                "覆盖用户研究、产品定义、打样、成本控制和上市复盘。"
+            )
+            * 8,
             resume_summary="测试简历",
             capture_status="success",
         )

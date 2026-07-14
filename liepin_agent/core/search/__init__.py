@@ -1,12 +1,15 @@
 """Liepin search sub-package with split responsibilities."""
 
 from ._models import (
+    AdaptivePaginationPolicy,
     LiepinFilterFieldSpec,
     LiepinSearchCandidate,
     LiepinSearchControls,
     LiepinSearchError,
     LiepinSearchNoResultsError,
     LiepinSearchPageChangedError,
+    PageYieldStats,
+    PaginationDecision,
 )
 
 __all__ = [
@@ -16,4 +19,7 @@ __all__ = [
     "LiepinSearchError",
     "LiepinSearchNoResultsError",
     "LiepinSearchPageChangedError",
+    "AdaptivePaginationPolicy",
+    "PageYieldStats",
+    "PaginationDecision",
 ]

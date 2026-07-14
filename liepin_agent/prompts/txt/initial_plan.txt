@@ -4,7 +4,7 @@
   "position_filter": "职位栏收口词。1-2个词，从JD真实岗位名称提取。没把握就留空。见下方双重过滤警告",
   "scope": "全部经历/目前职位/过往职位（第一轮默认全部经历）",
   "match_mode": "all/any",
-  "filters": {{"city": [], "active_days": 30, "education": "", "age": "", "company": ""}},
+  "filters": {{"city": [], "active_days": 30, "education": "", "company": ""}},
   "intent": "本轮搜索目的（第一轮目的通常是探测市场水深，不追求命中）",
   "expected_signal": ["先列出你为每个核心要求做的术语翻译，再列出期待在卡片中看到的具体信号，至少5条"],
   "risk": "本轮可能噪音及规避方式",
@@ -34,9 +34,7 @@ query 与 position_filter 是【叠加 AND】关系，两者同时填会让结�
 ### 4. 其他字段
 - 第一轮不设 city（留空 []），先看全国分布。
 - active_days 默认 30 天。
-- age：JD 写了年龄上限（如"40岁以内"）就填 filters.age="40"（系统自动加3岁缓冲）；
-  写了区间（如"25-35岁"）填"25-35"；没写就留空。
-- gender：匹配条件里有明确性别要求才填，否则留空。
+- 年龄、性别等受保护属性不得由模型自动转成平台硬筛选，只保留为待人工确认信息。
 - work_years 绝不填入 filters，由后续匹配模型判断。
 - position_filter 1-2 词，必须从 JD 真实岗位名提取，不要编造（如 JD 不是产品岗就别写"产品"）。
 

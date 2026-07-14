@@ -16,8 +16,10 @@ def pre_score_candidate(
     position_filter: str = "",
     negative_terms: Iterable[str] = DEFAULT_NEGATIVE_TERMS,
 ) -> Tuple[int, List[str]]:
-    """预打分已降级为信息聚合，不再做规则化评分，避免死程序误杀人才。
-    所有智能判断交由 LLM 在 observe_round / decide_fetch 中处理。
+    """聚合正向卡片信号，不在卡片层做淘汰判断。
+
+    下游 CandidatePicker 使用这些可解释信号做召回优先分桶；字段缺失
+    始终表示未知，不表示候选人不符合。
     """
     # 保留基础信息提取，但不再加减分
     reasons: List[str] = []
@@ -50,9 +52,10 @@ def classify_candidate_card(
     position_filter: str = "",
     negative_terms: Iterable[str] = DEFAULT_NEGATIVE_TERMS,
 ) -> Tuple[str, List[str], List[str], str]:
-    """卡片分类已降级为信息聚合，不再做规则化 fetch/maybe/noise 判定。
-    避免"客服"/"实习"等硬规则误杀真正有潜力的候选人。
-    所有去留决策交由 LLM 在 brain 层处理。
+    """提取卡片正向信号，不用通用负面词直接淘汰候选人。
+
+    明确硬冲突必须来自已确认条件并以结构化字段传给 CandidatePicker，
+    不能从卡片未展示某项信息推断。
     """
     text = "\n".join(
         [
@@ -71,5 +74,5 @@ def classify_candidate_card(
         if term and term in text and term not in signals:
             signals.append(term)
 
-    # 全部统一标记为 maybe，不让规则程序决定候选人生死
-    return "maybe", signals, [], "待LLM判断"
+    # 全部统一标记为 maybe，由召回优先的四桶策略决定详情抓取。
+    return "maybe", signals, [], "待详情策略判断"

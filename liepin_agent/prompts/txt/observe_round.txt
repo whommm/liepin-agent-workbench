@@ -7,36 +7,28 @@
   "noise_patterns": ["噪音类型"],
   "positive_signals": ["正向信号"],
   "recommended_round_type": "skip_detail/sample_detail/validate_detail/harvest_detail",
-  "reason": "判断依据，包含质量评估、噪音归因、策略建议"
+  "reason": "质量判断、噪音归因和下一步建议"
 }}
 
-## 质量分级标准
-- **empty**：搜索结果为空或仅0-2人。→ 关键词过窄或条件冲突。
-- **low**：结果数≥8但卡片无有效信号，或 relevant_count=0。→ 建议 skip_detail。
-- **uncertain**：有少量潜在信号，但不确定是真实匹配还是标题党。→ 建议 sample_detail。
-- **medium**：有多个有效信号，卡片层面出现目标行业/技能/公司。→ 建议 validate_detail。
-- **high**：大量强信号，目标人才密集。→ 建议 harvest_detail。
-
-> **注意**：以上分级仅用于推荐下一轮策略类型，不设任何抓取数量上限。用户明确要求"只要合适就全部抓取"。
-
-### 噪音类型识别（常见）
-1. 岗位错配、职级错配、行业错配
-2. 技能漂移（JD要算法，结果全是数据分析）
-3. 公司偏差、地域偏差
-
-### 正向信号识别
-- 目标行业/细分领域出现频率
-- 核心技能词在简历摘要中的出现率
-- 目标公司/竞品公司出现数量
+## 判断规则
+- 数量必须读取 pool_stats，不要把 representative_samples 的数量当成全池数量。
+- representative_samples 是确定性分层样本：strong_signal、uncertain、diversity。
+- 卡片没写某项要求表示 unknown，不能据此判定不匹配或建议跳过。
+- empty：全池为空；low：有足量卡片但样本几乎没有任何可验证信号；
+  uncertain：有潜在线索但详情不足；medium：多个样本出现目标行业/技能/公司；
+  high：强信号密集且跨样本重复出现。
+- 除空结果、预算耗尽或存在可由卡片直接证明的硬冲突外，优先 sample/validate，
+  不要因为信息不足直接 skip_detail。
+- estimated_relevant_count 是基于分层样本的保守估计，要说明不确定性。
 
 【本轮搜索计划】
 {plan}
 
-【匹配标准】
+【完整匹配标准（硬条件不得忽略）】
 {criteria}
 
-【页面信息】
+【页面聚合信息】
 {page_meta}
 
-【候选人卡片样本】
+【压缩结果池：全池统计 + 最多 12 个代表样本】
 {cards}

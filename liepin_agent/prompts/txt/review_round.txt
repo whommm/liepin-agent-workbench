@@ -1,10 +1,10 @@
 请复盘本轮猎聘寻访，并决定停止或下一轮搜索，输出 JSON：
 {{
   "action": "continue/stop",
-  "summary": "复盘结论：本轮产出评估、噪音归因、策略调整方向",
+  "summary": "本轮产出、证据缺口、根因和下一步只调整什么",
   "next_plan": {{
-    "query": "下一轮搜索栏关键词。零产出时优先换语义层，不要简单减词",
-    "position_filter": "职位栏收口词。query含职位词时必须留空（双重过滤警告）",
+    "query": "下一轮搜索关键词",
+    "position_filter": "职位栏收口词；query 含职位词时留空",
     "scope": "全部经历/目前职位/过往职位",
     "match_mode": "all/any",
     "filters": {{}},
@@ -12,94 +12,55 @@
     "expected_signal": [],
     "risk": "风险",
     "search_hypothesis_type": "core_background/target_company/transferable_scene/long_tail",
-    "search_hypothesis_text": "下一轮验证的搜索假设"
+    "search_hypothesis_text": "要验证的假设"
   }},
   "evidence": {{
-    "ab_count": "数字",
-    "match_count": "数字",
-    "noise_root_cause": "关键词太宽/关键词太窄/词不在简历出现/维度错误/行业误匹配/职级错配/区域过窄/正常噪音",
-    "iteration_strategy": "收紧/换语义层/换维度/定向公司/跨行业mapping/长尾狙击/放区域/停止"
+    "ab_count": 数字,
+    "match_count": 数字,
+    "noise_root_cause": "关键词太宽/关键词太窄/词不在简历出现/维度错误/行业误匹配/职级错配/区域过窄/正常噪音/结果待完成",
+    "iteration_strategy": "收紧/换语义层/换维度/定向公司/跨行业mapping/长尾狙击/放区域/保持验证/停止"
   }}
 }}
 
-## 复盘要求
+## 证据边界
+- matches.aggregate 是本轮完整计数；representative_matches 只是证据样本。
+- 不会提供 raw_response、简历 detail 或数据库原始行，不得臆造未提供的事实。
+- status_counts 出现 pending/failed，或 match_count 为 0 但本轮抓取已提交时，标为
+  “结果待完成”，不能算作零产出，也不能因此提前停止或大幅改策略。
+- 缺失字段是 unknown，不是未满足。优先从 top_evidence_gaps 提炼下一轮验证点。
 
-### 0. 重要区分
-- 【本轮匹配结果】仅反映本轮抓取后的匹配产出。如果本轮 match_results 为空，
-  可能是因为匹配尚未完成或超时，**不要据此推断"连续多轮零产出"**。
-- 历史各轮搜索效果请参考【已用 query】列表，不要混淆"本轮效果"与"历史累积效果"。
+## 历史隔离
+- strategy_history 只保留最近 query 和有界 RoundDigest；旧轮原文不会重复注入。
+- omitted_query_count/omitted_round_digest_count 表示还有更早历史。
+- 不要重复 recent_queries。完整重复校验由代码执行，不需要索取更早原文。
+- 每轮原则上只改变一个主要变量，并明确本轮假设如何被证实或证伪。
 
-### 1. 先判断本轮属于哪种情境（决策分叉点）
-
-#### 情境 A：本轮零产出或结果极少（raw_count < 5）
-根因几乎都是【词太窄 / 用了简历里不出现的词 / 市场稀疏】。
-按以下优先级调整，**不要停留在同一批词上反复微调**：
-1. 【换语义层】最优先。不要只减词，要把当前词换成品类词/行业词/公司词。
-   例：'潮玩 插画 渲染' 失败 → 不要减成 '潮玩 插画'，
-   而是换品类词 '盲盒' 或 '手办'，或换假设走 target_company（对标公司）。
-2. 【缩到 1 词】用最宽的核心品类词单独试水，先确认市场到底有没有人。
-3. 【换假设类型】core_background 连续失败就转：
-   - target_company：找对标/竞品公司的人（公司名走 filters.company，不进 query）
-   - transferable_scene：拆出核心技能，找有此技能的其他行业（如潮玩要插画 → 找动漫/广告/游戏插画师）
-   - long_tail：用细分专业工具词狙击（如 'ZBrush 手办'）
-
-#### 情境 B：结果量大但噪音高（raw_count ≥ 8 且 relevant 低）
-| 根因 | 表现 | 对策 |
-|------|------|------|
-| 某词被泛化 | 该词命中大量错配行业 | 删该词，或加 -排除词 |
-| 岗位/职级错配 | 结果都是错配岗位或层级 | 调 position_filter 或换 scope |
-| 行业占比低 | 目标行业候选人少 | 跨行业 mapping，用核心技能替代行业词 |
-| 长尾被淹没 | 少数目标人才混在大词里 | 长尾狙击，用细分技术词收紧 |
-
-#### 情境 C：区域过窄（结果少且 filters.city 非空）
-优先去掉 city 限制（设为空数组 []），保持 query 完全不变，扩大地理范围再搜一轮。
-只有去掉 city 后仍搜不到，才回退到情境 A 的换词策略。
-
-### 2. 假设类型与 query 构造法（每轮必须明确当前用哪种）
-- core_background：品类词 + 核心技能词。如 '盲盒 原画'。scope 用"全部经历"。
-- target_company：【公司名不进 query！】用 filters.company="对标公司名" +
-  scope="目前公司"或"过往公司"，query 放该公司的主营业务词。
-- transferable_scene：拆出 JD 的核心技能，找具备此技能的其他行业。
-  如潮玩要插画技能 → query '插画 包装设计' 找广告/快消的人。
-- long_tail：用细分专业词/工具词狙击。如 'ZBrush 潮玩'。
-
-### 3. 停止条件（如果 should_stop 为 true，必须 action=stop）
-- 已达到目标 A/B 数量
-- 连续多轮低产出且**完全没有任何改进迹象**（重复相同关键词、反复换词但噪音根因一致、策略明显僵化）
-- 预算耗尽
-- 已穷尽**所有**合理搜索假设（四大方向均已尝试）
-
-### 4. 鼓励多搜索（重要）
-- 默认允许最多搜索 20 轮，不要轻易停止。
-- 只要每一轮都在尝试不同的搜索维度（换词、换行业、换假设类型），就是有价值的探索。
-- 猎头寻访本来就是多轮试探，前 5-8 轮在摸清水下结构完全正常。
-- 只有连续低产出**且**策略明显僵化（一直在同一批词上微调）时才考虑停止。
-
-### 5. next_plan 字段要求
-- query：2-3 个词 AND 组合（稀疏市场可 1 词）。明确本轮是收紧/换语义层/换维度/定向。
-  **零产出时优先换语义层，不要简单减词。**
-- 双重过滤警告：query 含职位方向词时 position_filter 必须留空；
-  只有 query 是行业/品类宽词时才用 position_filter 收口。拿不准就留空。
-- filters：只保留 city / active_days / education / age / company / gender，**严禁 work_years**。
-- scope：target_company 用"目前/过往公司"；其余默认"全部经历"。
-- expected_signal：具体、可观察。
-- 不要重复 used_queries（包括词的顺序不同但词集合相同的组合）。
+## 下一轮策略
+- 结果少：优先换语义层（品类词、行业词、公司词）或放宽一个筛选，不要只做同义微调。
+- 结果多但噪音高：定位泛化词、岗位/职级错配或行业偏差，只收紧一个维度。
+- city 非空且结果稀少：优先只去掉 city，保持 query 不变。
+- target_company：公司名放 filters.company；query 写业务词，不把公司名重复放进 query。
+- query 通常 1-3 个简历中会出现的词。filters 仅允许 city、active_days、education、company，严禁 work_years；年龄和性别不得自动转成平台硬筛选。
+- 只有达到明确停止条件、预算耗尽或不同假设均已验证失败时才 stop。
 
 【should_stop】{should_stop}
 【stop_reason】{stop_reason}
 【target_met】{target_met}
+
 【上一轮计划】
 {plan}
-【已用 query】（历史搜索记录，按轮次顺序）
+
+【有界策略历史】
 {used_queries}
 
-【本轮匹配结果】（仅含本轮详情抓取后已完成匹配的候选人，不代表历史各轮产出）
+【本轮匹配聚合与代表证据】
 {matches}
 
-【噪音】
+【噪音摘要】
 {noise}
-【JD】
+
+【JD 摘要】
 {jd}
 
-【匹配条件】
+【完整匹配标准（硬条件不得截断）】
 {criteria}

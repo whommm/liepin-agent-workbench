@@ -118,6 +118,9 @@ class LLMClient:
                 api_key=self.api_key,
                 base_url=self.api_base_url,
                 timeout=self.timeout,
+                # Retries are owned by _execute_with_retry so the configured
+                # attempt count is predictable across providers.
+                max_retries=0,
             )
         return self._client
 
@@ -136,6 +139,7 @@ class LLMClient:
                 api_key=self.api_key,
                 base_url=self.api_base_url,
                 timeout=self.timeout,
+                max_retries=0,
             )
         return self._anthropic_client
 
@@ -152,10 +156,10 @@ class LLMClient:
         kwargs = {
             "model": self.model_name,
             "messages": messages,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         if not self._is_reasoning_model:
-            kwargs["temperature"] = 0.2
+            kwargs["temperature"] = self.temperature
         logger.debug("_chat_once_openai: calling create with model=%s", self.model_name)
         started = time.monotonic()
         response = self._get_openai_client().chat.completions.create(**kwargs)

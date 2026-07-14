@@ -81,6 +81,7 @@ class _RoundMixin:
         detail_fetch_count: Optional[int] = None,
         matched_count: Optional[int] = None,
         ab_count: Optional[int] = None,
+        round_digest: Optional[Dict[str, Any]] = None,
         mark_finished: bool = False,
     ) -> None:
         fields = []
@@ -98,6 +99,9 @@ class _RoundMixin:
             if value is not None:
                 fields.append("{} = ?".format(column))
                 params.append(value)
+        if round_digest is not None:
+            fields.append("round_digest_json = ?")
+            params.append(to_json(round_digest))
         if mark_finished:
             fields.append("finished_at = ?")
             params.append(now_text())
@@ -122,5 +126,40 @@ class _RoundMixin:
                 (session_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+
+    def list_round_digests(
+        self, session_id: str, limit: int = 8
+    ) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 8), 20))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT round_digest_json
+                FROM search_rounds
+                WHERE session_id = ?
+                  AND round_digest_json IS NOT NULL
+                  AND round_digest_json != ''
+                ORDER BY round_index DESC
+                LIMIT ?
+                """,
+                (session_id, safe_limit),
+            ).fetchall()
+        result = [from_json(row["round_digest_json"], {}) or {} for row in rows]
+        result.reverse()
+        return result
+
+
+    def count_round_new_candidates(self, round_id: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM candidate_summaries
+                WHERE round_id = ?
+                """,
+                (round_id,),
+            ).fetchone()
+        return int(row["n"] if row else 0)
 
 

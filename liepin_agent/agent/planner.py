@@ -90,23 +90,20 @@ class Planner:
             query = domain_terms[0]
         else:
             query = position_filter or "产品"
-        filters = {
-            "city": self.extract_city_scope(text),
-            "active_days": 30,
-        }
-        # 工作年限和学历不自动填入搜索筛选，避免过滤掉潜在候选人，
-        # 由后续匹配模型根据简历内容判断。
-        education = self.extract_education(text)
-        if education:
-            filters["education"] = education
-        age = self.extract_age(text)
-        if age:
-            filters["age"] = age
-        gender = criteria.get("gender_requirement") if criteria else ""
-        if not gender:
-            gender = self.extract_gender_requirement(text)
-        if gender and gender != "不限":
-            filters["gender"] = gender
+        # Emergency fallback must preserve the same recall safeguards as the
+        # LLM plan path. Only a city scope carried by the confirmed criteria is
+        # eligible for a platform filter; education, age and gender remain
+        # matching facts rather than automatic search exclusions.
+        filters = {"active_days": 30}
+        confirmed_cities = [
+            str(item).strip()
+            for item in (criteria.get("city_scope") or [])
+            if str(item).strip()
+        ]
+        if confirmed_cities:
+            filters["city"] = confirmed_cities
+        if position_filter and position_filter in query:
+            position_filter = ""
         return SearchPlan(
             query=query,
             position_filter=position_filter,

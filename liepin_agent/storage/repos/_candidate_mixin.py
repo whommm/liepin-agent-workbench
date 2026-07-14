@@ -115,6 +115,7 @@ class _CandidateMixin:
         sql = """
             SELECT c.*,
                    mr.tier AS match_tier,
+                   mr.match_score AS match_score,
                    mr.summary AS match_summary,
                    mr.risks AS match_risks,
                    mr.evidence_json AS evidence_json,
@@ -134,15 +135,20 @@ class _CandidateMixin:
                   SELECT m2.id
                   FROM match_results m2
                   WHERE m2.candidate_id = c.id
+                    AND m2.criteria_version_id = COALESCE(
+                        (
+                            SELECT cv.id
+                            FROM match_criteria_versions cv
+                            WHERE cv.session_id = c.session_id
+                              AND cv.status = 'confirmed'
+                            ORDER BY cv.version DESC
+                            LIMIT 1
+                        ),
+                        ''
+                    )
                   ORDER BY
-                      CASE UPPER(COALESCE(m2.tier, ''))
-                          WHEN 'A' THEN 1
-                          WHEN 'B' THEN 2
-                          WHEN 'C' THEN 3
-                          WHEN 'D' THEN 4
-                          ELSE 5
-                      END,
-                      m2.created_at DESC
+                      m2.created_at DESC,
+                      m2.rowid DESC
                   LIMIT 1
               )
             LEFT JOIN candidate_details d
@@ -187,6 +193,19 @@ class _CandidateMixin:
             ).fetchall()
         by_id = {row["id"]: dict(row) for row in rows}
         return [by_id[item] for item in ids if item in by_id]
+
+
+    def list_candidate_dedupe_keys(self, session_id: str) -> List[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT dedupe_key
+                FROM candidate_summaries
+                WHERE session_id = ? AND dedupe_key IS NOT NULL AND dedupe_key != ''
+                """,
+                (session_id,),
+            ).fetchall()
+        return [str(row["dedupe_key"]) for row in rows]
 
 
     def save_candidate_source(
@@ -333,5 +352,45 @@ class _CandidateMixin:
                 (candidate_id,),
             ).fetchone()
         return dict(row) if row else None
+
+
+    def get_successful_candidate_detail(
+        self, candidate_id: str, min_resume_chars: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest reusable, non-empty detail for a candidate."""
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM candidate_details
+                WHERE candidate_id = ?
+                  AND capture_status = 'success'
+                  AND LENGTH(TRIM(COALESCE(resume_text, ''))) >= ?
+                ORDER BY fetched_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (candidate_id, max(1, int(min_resume_chars or 1))),
+            ).fetchone()
+        return dict(row) if row else None
+
+
+    def get_successful_detail_candidate_ids(
+        self, candidate_ids: Iterable[str], min_resume_chars: int = 1
+    ) -> set[str]:
+        ids = list(dict.fromkeys(str(item) for item in candidate_ids if item))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT candidate_id
+                FROM candidate_details
+                WHERE capture_status = 'success'
+                  AND LENGTH(TRIM(COALESCE(resume_text, ''))) >= ?
+                  AND candidate_id IN ({})
+                """.format(placeholders),
+                [max(1, int(min_resume_chars or 1)), *ids],
+            ).fetchall()
+        return {str(row["candidate_id"]) for row in rows}
 
 

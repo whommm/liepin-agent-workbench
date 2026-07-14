@@ -42,7 +42,7 @@ class _FiltersMixin:
 
 
     def _apply_filters_on_page(self, page: Page, filters: Dict[str, object]) -> None:
-        """Apply supported filters to an already-open result page."""
+        """Apply the complete desired filter state to an open result page."""
         self._dismiss_any_open_modal(page)
         normalized_filters = {
             (key or "").strip(): value
@@ -53,12 +53,18 @@ class _FiltersMixin:
             return
         if self._filters_need_more_conditions(normalized_filters):
             self._ensure_more_filter_conditions(page)
+        failures = []
         for title, value in normalized_filters.items():
             try:
                 self._apply_filter_with_retries(page, title, value)
             except Exception as exc:
-                logger.warning("skip filter apply: %s=%s reason=%s", title, value, exc)
+                failures.append("{}={} ({})".format(title, value, exc))
+                logger.warning("filter apply failed: %s=%s reason=%s", title, value, exc)
                 self._dismiss_any_open_modal(page)
+        if failures:
+            raise LiepinSearchError(
+                "筛选条件未完整生效，已停止本轮搜索: {}".format("; ".join(failures))
+            )
 
 
     def _filters_need_more_conditions(self, filters: Dict[str, object]) -> bool:
@@ -132,8 +138,12 @@ class _FiltersMixin:
         spec = self.FILTER_FIELD_SPECS.get(title)
         if spec is None:
             raise LiepinSearchError("暂不支持该筛选字段: {}".format(title))
+        self._clear_filter_condition(page, spec.title)
+        if self._filter_value_is_clear(value):
+            return
         if spec.field_type == "tag":
-            self._apply_tag_filter(page, spec, str(value))
+            for tag_value in self._normalize_tag_filter_values(spec, value):
+                self._apply_tag_filter(page, spec, tag_value)
             return
         if spec.field_type == "dropdown":
             self._apply_dropdown_filter(page, spec, str(value))
@@ -170,7 +180,7 @@ class _FiltersMixin:
                 count = containers.count()
             except Exception:
                 count = 0
-            if count and fallback is None:
+            if count and fallback is None and not title_text:
                 try:
                     fallback = containers.first
                 except Exception:
@@ -185,13 +195,15 @@ class _FiltersMixin:
                     )
                     if title_text and title_text in text:
                         return container
-                    if fallback is None:
+                    if fallback is None and not title_text:
                         fallback = container
                 except Exception:
                     continue
         if fallback is not None:
             return fallback
-        return page.locator(spec.container_selector).first
+        raise LiepinSearchPageChangedError(
+            "未找到筛选行或标题不匹配: {}".format(spec.title)
+        )
 
 
     def _apply_tag_filter(
@@ -209,6 +221,7 @@ class _FiltersMixin:
         self._dismiss_any_open_modal(page)
         locator.click(timeout=5000)
         self._wait_for_filter_apply(page, expected_text=normalized_value)
+        self._wait_for_condition_chip(page, spec.title, normalized_value)
 
 
     def _apply_dropdown_filter(
@@ -234,6 +247,7 @@ class _FiltersMixin:
         except Exception:
             self._select_dropdown_option_by_keyboard(page, normalized_value)
         self._wait_for_filter_apply(page, expected_text=normalized_value)
+        self._wait_for_condition_chip(page, spec.title, normalized_value)
 
 
     def _apply_range_filter(
@@ -248,26 +262,34 @@ class _FiltersMixin:
                 "未找到区间筛选控件: {}".format(spec.title)
             )
 
-        if low_value:
-            self._dismiss_any_open_modal(page)
-            low_input = self._resolve_filter_locator(
-                page,
-                container,
-                spec.low_input_selector,
-                "未找到{}最低值输入框".format(spec.title),
-            )
-            self._fill_filter_input(low_input, low_value)
-        if high_value:
-            self._dismiss_any_open_modal(page)
-            high_input = self._resolve_filter_locator(
-                page,
-                container,
-                spec.high_input_selector,
-                "未找到{}最高值输入框".format(spec.title),
-            )
-            self._fill_filter_input(high_input, high_value)
+        self._dismiss_any_open_modal(page)
+        low_input = self._resolve_filter_locator(
+            page,
+            container,
+            spec.low_input_selector,
+            "未找到{}最低值输入框".format(spec.title),
+        )
+        high_input = self._resolve_filter_locator(
+            page,
+            container,
+            spec.high_input_selector,
+            "未找到{}最高值输入框".format(spec.title),
+        )
+        # Always write both ends. This prevents an old upper/lower bound from
+        # surviving when a later round changes a closed range to a one-sided one.
+        self._fill_filter_input(low_input, low_value)
+        self._fill_filter_input(high_input, high_value)
 
         if spec.confirm_selector:
+            # The live page hides the submit button with display:none until the
+            # range wrapper is hovered. Filling inputs updates the condition chip
+            # locally but does not necessarily refresh result cards.
+            try:
+                container.hover(timeout=3000)
+            except Exception as exc:
+                raise LiepinSearchPageChangedError(
+                    "无法展开{}确认按钮: {}".format(spec.title, exc)
+                ) from exc
             confirm = self._resolve_filter_locator(
                 page,
                 container,
@@ -276,6 +298,11 @@ class _FiltersMixin:
             )
             confirm.click(timeout=5000)
         self._wait_for_filter_apply(page, expected_text=high_value or low_value)
+        self._wait_for_condition_chip(
+            page,
+            spec.title,
+            high_value or low_value,
+        )
 
 
     def _apply_city_filter(
@@ -283,10 +310,12 @@ class _FiltersMixin:
     ) -> None:
         cities = [
             item
-            for item in (value if isinstance(value, list) else [value])
+            for item in (
+                value if isinstance(value, (list, tuple, set)) else [value]
+            )
             if str(item).strip()
         ]
-        cities = [str(item).strip() for item in cities]
+        cities = list(dict.fromkeys(str(item).strip() for item in cities))
         if not cities:
             return
         if len(cities) == 1:
@@ -310,6 +339,8 @@ class _FiltersMixin:
             self._wait_for_city_modal_closed(page, modal, timeout=8000)
             page.wait_for_timeout(300)
             self._wait_for_filter_apply(page, expected_text=cities[0])
+            for city in cities:
+                self._wait_for_condition_chip(page, spec.title, city)
         except Exception:
             self._dismiss_any_open_modal(page)
             raise
@@ -330,10 +361,11 @@ class _FiltersMixin:
             page, container, spec.input_selector, "未找到{}输入框".format(spec.title)
         )
         self._write_keyword(input_locator, normalized_value)
-        try:
-            input_locator.press("Enter")
-        except Exception:
-            pass
+        if spec.title != "公司名称":
+            try:
+                input_locator.press("Enter")
+            except Exception:
+                pass
         if spec.confirm_selector:
             confirm = self._resolve_filter_locator(
                 page,
@@ -343,6 +375,7 @@ class _FiltersMixin:
             )
             confirm.click(timeout=5000)
         self._wait_for_filter_apply(page, expected_text=normalized_value)
+        self._wait_for_condition_chip(page, spec.title, normalized_value)
 
 
     def _apply_single_city_filter(
@@ -354,6 +387,7 @@ class _FiltersMixin:
             if hot_tag.is_visible(timeout=1200):
                 hot_tag.click(timeout=5000)
                 self._wait_for_filter_apply(page, expected_text=value)
+                self._wait_for_condition_chip(page, spec.title, value)
                 return
         except Exception:
             pass
@@ -374,9 +408,171 @@ class _FiltersMixin:
             self._wait_for_city_modal_closed(page, modal, timeout=8000)
             page.wait_for_timeout(300)
             self._wait_for_filter_apply(page, expected_text=value)
+            self._wait_for_condition_chip(page, spec.title, value)
         except Exception:
             self._dismiss_any_open_modal(page)
             raise
+
+
+    def _clear_managed_filter_conditions(self, page: Page) -> None:
+        """Reset all filter fields owned by the Agent before a new round."""
+        titles = getattr(
+            self,
+            "MANAGED_FILTER_TITLES",
+            (
+                "职位名称",
+                "期望城市",
+                "教育经历",
+                "年龄",
+                "性别",
+                "活跃度",
+                "期望年薪",
+                "公司名称",
+            ),
+        )
+        for title in dict.fromkeys(titles):
+            self._clear_filter_condition(page, title)
+
+
+    def _clear_filter_condition(self, page: Page, title: str) -> None:
+        """Remove every active chip for one field through its own close icon."""
+        chips = self._condition_chips(page, title)
+        while True:
+            try:
+                before = chips.count()
+            except Exception:
+                before = 0
+            if before <= 0:
+                return
+            close = chips.first.locator(".icon-close").first
+            try:
+                if close.count() <= 0:
+                    raise LiepinSearchPageChangedError(
+                        "{}条件标签缺少删除按钮".format(title)
+                    )
+                try:
+                    close.click(timeout=5000)
+                except Exception:
+                    close.click(timeout=3000, force=True)
+            except Exception as exc:
+                raise LiepinSearchPageChangedError(
+                    "无法删除旧{}筛选: {}".format(title, exc)
+                ) from exc
+
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                try:
+                    if chips.count() < before:
+                        break
+                except Exception:
+                    break
+                page.wait_for_timeout(100)
+            else:
+                raise LiepinSearchPageChangedError(
+                    "删除{}筛选后条件标签仍然存在".format(title)
+                )
+            self._wait_for_loading_cycle(page, timeout=8000)
+            self._soft_wait_for_results(page)
+
+
+    @staticmethod
+    def _condition_chips(page: Page, title: str):
+        safe_title = (title or "").replace("\\", "\\\\").replace('"', '\\"')
+        return page.locator('label[title="{}"]'.format(safe_title))
+
+
+    def _wait_for_condition_chip(
+        self,
+        page: Page,
+        title: str,
+        expected_text: str = "",
+        timeout: int = 5000,
+    ) -> None:
+        """Require the applied-condition chip instead of scanning body text."""
+        chips = self._condition_chips(page, title)
+        expected = self._normalize_filter_title_text(expected_text)
+        deadline = time.time() + timeout / 1000.0
+        observed = []
+        while time.time() < deadline:
+            observed = []
+            try:
+                count = chips.count()
+            except Exception:
+                count = 0
+            for index in range(count):
+                try:
+                    observed.append(chips.nth(index).inner_text(timeout=500) or "")
+                except Exception:
+                    continue
+            if observed and (
+                not expected
+                or any(
+                    expected in self._normalize_filter_title_text(text)
+                    for text in observed
+                )
+            ):
+                return
+            try:
+                page.wait_for_timeout(100)
+            except Exception:
+                break
+        raise LiepinSearchPageChangedError(
+            "{}筛选未生成有效条件标签，期望={}，实际={}".format(
+                title,
+                expected_text,
+                observed,
+            )
+        )
+
+
+    @staticmethod
+    def _filter_value_is_clear(value: object) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() in {"", "不限"}
+        if isinstance(value, dict):
+            return not value or all(item in (None, "", [], {}) for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            cleaned = [str(item).strip() for item in value if str(item).strip()]
+            return not cleaned or cleaned == ["不限"]
+        return False
+
+
+    def _normalize_tag_filter_values(
+        self, spec: LiepinFilterFieldSpec, value: object
+    ) -> List[str]:
+        if isinstance(value, (list, tuple, set)):
+            raw_values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            text = str(value or "").strip()
+            raw_values = [text] if text else []
+
+        if spec.title == "教育经历" and len(raw_values) == 1:
+            compact = re.sub(r"\s+", "", raw_values[0])
+            minimum_options = {
+                "大专及以上": ["大专", "本科", "硕士", "博士/博士后"],
+                "大专以上": ["大专", "本科", "硕士", "博士/博士后"],
+                "本科及以上": ["本科", "硕士", "博士/博士后"],
+                "本科以上": ["本科", "硕士", "博士/博士后"],
+                "硕士及以上": ["硕士", "博士/博士后"],
+                "硕士以上": ["硕士", "博士/博士后"],
+            }
+            if compact in minimum_options:
+                raw_values = minimum_options[compact]
+            elif re.search(r"[、,，/|]", compact):
+                raw_values = [
+                    item.strip()
+                    for item in re.split(r"[、,，/|]+", compact)
+                    if item.strip()
+                ]
+
+        normalized_values = []
+        for raw_value in raw_values:
+            normalized = self._normalize_tag_filter_value(spec, raw_value, None)
+            if normalized and normalized not in normalized_values:
+                normalized_values.append(normalized)
+        return normalized_values
 
 
     def _normalize_tag_filter_value(
@@ -801,10 +997,6 @@ class _FiltersMixin:
         city_input.click(timeout=3000)
         city_input.fill(value)
         try:
-            city_input.press("Enter")
-        except Exception:
-            pass
-        try:
             modal.page.wait_for_timeout(500)
         except Exception:
             pass
@@ -821,6 +1013,23 @@ class _FiltersMixin:
         normalized = (value or "").strip()
         if not normalized:
             return False
+        if normalized in ("北京", "上海", "天津", "重庆"):
+            whole_city = ["全{}".format(normalized), "全{}市".format(normalized)]
+            if self._click_exact_city_option(modal, whole_city):
+                return True
+            # The modal first drills into a municipality and only then exposes
+            # the selectable "全北京/全上海" tag.
+            if self._click_exact_city_option(
+                modal, [normalized, "{}市".format(normalized)]
+            ):
+                try:
+                    modal.page.wait_for_timeout(300)
+                except Exception:
+                    pass
+                return self._click_exact_city_option(modal, whole_city)
+
+        if self._click_exact_city_option(modal, [normalized]):
+            return True
         expected_texts = [normalized, "全{}".format(normalized)]
         # 直辖市常见变体（猎聘城市弹窗中可能显示为"上海市"等）
         if normalized in ("北京", "上海", "天津", "重庆"):
@@ -834,12 +1043,6 @@ class _FiltersMixin:
             "button",
             "div.suggest-list li",
             ".suggest-list li",
-            ".ant-city-menu-list li",
-            ".ant-city-menu-list span",
-            "[class*='city'] li",
-            "[class*='city'] span",
-            "li",
-            "span",
         ]
         for selector in selectors:
             try:
@@ -855,12 +1058,46 @@ class _FiltersMixin:
                     text = self._normalize_filter_title_text(
                         option.inner_text(timeout=500) or ""
                     )
-                    # Support both exact match and contains match
-                    # e.g., "上海" should match "中国 · 上海" or "全上海"
-                    is_match = text in expected_texts or any(
-                        expected in text for expected in expected_texts
+                    is_match = text in expected_texts or text.endswith(
+                        "·{}".format(normalized)
                     )
                     if not is_match:
+                        continue
+                    option.click(timeout=5000)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+
+    def _click_exact_city_option(self, modal, expected_texts: List[str]) -> bool:
+        expected = {
+            self._normalize_filter_title_text(text)
+            for text in expected_texts
+            if str(text or "").strip()
+        }
+        selectors = (
+            "span.ant-tag.ant-tag-checkable",
+            "div.suggest-list li",
+            ".suggest-list li",
+            "label.tag-item",
+            "button",
+        )
+        for selector in selectors:
+            try:
+                options = modal.locator(selector)
+                count = options.count()
+            except Exception:
+                continue
+            for index in range(count):
+                option = options.nth(index)
+                try:
+                    if not option.is_visible(timeout=250):
+                        continue
+                    text = self._normalize_filter_title_text(
+                        option.inner_text(timeout=500) or ""
+                    )
+                    if text not in expected:
                         continue
                     option.click(timeout=5000)
                     return True

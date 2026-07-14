@@ -22,7 +22,8 @@ def test_real_matcher_parse_failure_returns_review_package():
         criteria={"criteria_version_id": "v1", "keywords_text": "LNG"},
     )
 
-    assert result.tier == "C"
+    assert result.tier == ""
+    assert result.status == "needs_review"
     assert result.criteria_version_id == "v1"
     assert result.confidence == "low"
     assert result.missing_or_unclear
@@ -146,15 +147,23 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     assert "结论" in overview_headers
     assert "候选人档案" in overview_headers
     assert workbook["推荐总览"]["A2"].value == "可推荐"
-    assert workbook["合格A_B"]["C2"].value == "候选人"
-    assert workbook["待复核_未匹配"]["C2"].value == "待复核候选人"
-    assert workbook["不合格C"]["C2"].value == "不合格候选人"
+    name_column = overview_headers.index("姓名") + 1
+    assert workbook["合格A_B"].cell(row=2, column=name_column).value == "候选人"
+    assert (
+        workbook["待复核_未匹配"].cell(row=2, column=name_column).value
+        == "待复核候选人"
+    )
+    assert (
+        workbook["不合格C"].cell(row=2, column=name_column).value
+        == "不合格候选人"
+    )
     headers = [cell.value for cell in workbook["候选人"][1]]
     assert "命中证据" in headers
     assert "基准版本" in headers
     assert "简历链接" in headers
     assert "金领" in headers
     assert "打招呼状态" in headers
+    evidence_column = headers.index("命中证据") + 1
     link_column = headers.index("简历链接") + 1
     gold_column = headers.index("金领") + 1
     greeting_column = headers.index("打招呼状态") + 1
@@ -162,6 +171,9 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     assert workbook["候选人"].cell(row=2, column=link_column).hyperlink.target == "https://example.com/a"
     assert workbook["候选人"].cell(row=2, column=gold_column).value == "是"
     assert workbook["候选人"].cell(row=2, column=greeting_column).value == "已发送"
+    assert workbook["候选人"].cell(
+        row=2, column=evidence_column
+    ).value.startswith("[原文]")
     assert workbook["寻访基准"]["B2"].value == "天然气\nLNG"
     diagnostics_values = [cell.value for cell in workbook["运行诊断"]["A"]]
     assert "待回写匹配数" in diagnostics_values
@@ -256,3 +268,5 @@ def test_export_field_display_repairs_truncated_legacy_fields(tmp_path):
     assert fields["current_title"] == "销售经理"
     assert fields["city"] == "Zhuzhou"
     assert fields["education"] == "MBA/EMBA"
+def test_export_conclusion_treats_completed_d_as_rejected():
+    assert ExportService._candidate_conclusion({"match_tier": "D"}) == "不推荐"

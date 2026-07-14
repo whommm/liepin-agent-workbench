@@ -213,13 +213,44 @@ class _BaseMixin:
 
 
     def _clear_search_inputs(self, page: Page) -> None:
-        """Clear all candidate search inputs before a new attempt."""
-        for locator in self._find_candidate_search_inputs(page):
+        """Clear the primary keyword field without touching secondary filters."""
+        locator = self._find_primary_search_input(page)
+        if locator is None:
+            return
+        try:
+            locator.click(timeout=1500, force=True)
+        except Exception:
             try:
-                locator.click(timeout=1000)
+                locator.focus()
+            except Exception:
+                return
+
+        # Liepin's controlled AutoComplete can restore its previous value after
+        # fill(""). A real select-all/delete keyboard sequence reliably updates
+        # both the DOM input and React state.
+        try:
+            locator.press("Control+A")
+            locator.press("Backspace")
+        except Exception:
+            try:
                 locator.fill("")
             except Exception:
-                continue
+                return
+
+        try:
+            value = locator.input_value(timeout=1000)
+        except Exception:
+            try:
+                value = locator.get_attribute("value") or ""
+            except Exception:
+                value = ""
+        if value:
+            try:
+                locator.fill("")
+                locator.press("Control+A")
+                locator.press("Backspace")
+            except Exception:
+                pass
 
 
     def _write_keyword(self, locator, keyword: str, force_focus: bool = False) -> None:
@@ -322,16 +353,26 @@ class _BaseMixin:
 
         deadline = time.time() + timeout / 1000.0
         saw_loading = False
+        quiet_polls = 0
         while time.time() < deadline:
             loading = self._is_loading(page)
             if loading:
                 saw_loading = True
+                quiet_polls = 0
             if saw_loading and not loading:
                 return
+            if not saw_loading and not loading:
+                quiet_polls += 1
+                # Loading overlays usually appear immediately. A short stable
+                # window avoids paying the full timeout when no refresh starts.
+                if quiet_polls >= 3:
+                    return
             try:
                 page.wait_for_timeout(250)
             except Exception:
-                break
+                return
+        if saw_loading:
+            raise LiepinSearchPageChangedError("猎聘结果区加载超时")
 
 
     def _is_loading(self, page: Page) -> bool:

@@ -33,29 +33,24 @@ class _PositionFilterMixin:
             return
         input_locator = self._find_position_name_input(page)
         if input_locator is None:
-            logger.warning(
-                "position filter skipped: position input not found value=%s", value
+            raise LiepinSearchPageChangedError(
+                "未找到职位名称输入框，无法应用职位筛选: {}".format(value)
             )
-            return
         try:
             self._write_keyword(input_locator, value, force_focus=True)
-            try:
-                input_locator.press("Enter")
-            except Exception:
-                pass
-            confirm = self._find_position_name_confirm_button(page)
-            if confirm is not None:
-                confirm.click(timeout=3000)
-                try:
-                    page.wait_for_timeout(300)
-                except Exception:
-                    pass
+            self._wait_for_condition_chip(page, "职位名称", value, timeout=3000)
         except Exception as exc:
-            logger.warning("position filter skipped: value=%s reason=%s", value, exc)
+            raise LiepinSearchPageChangedError(
+                "职位名称筛选未生效: {} ({})".format(value, exc)
+            ) from exc
 
 
     def _find_position_name_input(self, page: Page):
         selectors = [
+            ".auto-select-job-shadow-box .auto-select-base "
+            "input.ant-select-selection-search-input",
+            "div.search-item:has(span.search-item-title:has-text('职位名称')) "
+            ".auto-select-base input.ant-select-selection-search-input",
             "xpath=//*[contains(normalize-space(.), '职位名称')]/following::input[contains(@class,'ant-select-selection-search-input')][1]",
             "xpath=//*[contains(normalize-space(.), '当前职位')]/following::input[contains(@class,'search-component-input') or contains(@class,'ant-select-selection-search-input')][1]",
             "xpath=//*[contains(normalize-space(.), '当前职位')]/following::input[not(@readonly)][1]",

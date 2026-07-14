@@ -271,7 +271,7 @@ class MainWindow(QMainWindow):
         table_title = QLabel("候选人池")
         table_title.setObjectName("SectionTitle")
         table_layout.addWidget(table_title)
-        self.candidate_table = QTableWidget(0, 12)
+        self.candidate_table = QTableWidget(0, 13)
         self.candidate_table.setHorizontalHeaderLabels(
             [
                 "姓名",
@@ -283,6 +283,7 @@ class MainWindow(QMainWindow):
                 "金领",
                 "卡片判断",
                 "匹配",
+                "证据分",
                 "打招呼",
                 "状态",
                 "摘要",
@@ -306,7 +307,8 @@ class MainWindow(QMainWindow):
         self.candidate_table.setColumnWidth(7, 70)
         self.candidate_table.setColumnWidth(8, 45)
         self.candidate_table.setColumnWidth(9, 60)
-        self.candidate_table.setColumnWidth(10, 50)
+        self.candidate_table.setColumnWidth(10, 60)
+        self.candidate_table.setColumnWidth(11, 50)
         self._candidate_table_initialized = False
         table_layout.addWidget(self.candidate_table, 1)
 
@@ -1582,20 +1584,23 @@ class MainWindow(QMainWindow):
                 "是" if int(candidate.get("is_gold_collar") or 0) == 1 else "否",
                 self._card_decision_label(candidate.get("card_decision") or ""),
                 candidate.get("match_tier") or "",
+                candidate.get("match_score")
+                if candidate.get("match_tier")
+                else "",
                 self._greeting_status_label(candidate.get("greeting_status") or ""),
                 candidate.get("status") or "",
                 candidate.get("summary_text") or "",
             ]
             for column, value in enumerate(values):
                 str_value = str(value)
-                is_color_column = column in {8, 9}
+                is_color_column = column in {8, 10}
                 existing = self.candidate_table.item(row, column)
                 if existing is not None and existing.text() == str_value and not is_color_column:
                     continue  # skip unchanged cells
                 table_item = QTableWidgetItem(str_value)
                 if column == 0:
                     table_item.setData(Qt.UserRole, candidate_id)
-                if column in {6, 7, 9}:
+                if column in {6, 7, 8, 9, 10}:
                     table_item.setTextAlignment(Qt.AlignCenter)
 
                 # 匹配等级 Badge 着色
@@ -1615,7 +1620,7 @@ class MainWindow(QMainWindow):
                         table_item.setForeground(QBrush(QColor("#ffffff")))
 
                 # 打招呼状态 Badge 着色
-                elif column == 9:
+                elif column == 10:
                     greeting = str(value).strip()
                     color_map = {
                         "已发送": ("#5a9a5a", "#ffffff"),
@@ -1719,7 +1724,8 @@ class MainWindow(QMainWindow):
         sources = self.store.list_candidate_sources(candidate_id)
         evidence = match.get("matched_evidence") or []
         evidence_html = "".join(
-            "<li><b>{}</b>：{} <span style='color:#8a8070'>{}</span></li>".format(
+            "<li><b>[{}] {}</b>：{} <span style='color:#8a8070'>{}</span></li>".format(
+                "推断" if item.get("source_type") == "inferred" else "原文",
                 self._html(item.get("criterion") or ""),
                 self._html(item.get("evidence") or ""),
                 self._html(item.get("strength") or ""),

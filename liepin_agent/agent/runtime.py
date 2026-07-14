@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import inspect
+import json
 import threading
 import time
 from concurrent.futures import Future
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from ..domain.models import CandidateDetail, CandidateSummary, MatchResult, SearchPlan
 from ..domain.pre_score import classify_candidate_card, pre_score_candidate
@@ -26,6 +29,7 @@ from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
 from ..tools.web_search import WebSearchTool
 from .brain import LLMAgentBrain
+from .context import build_match_review_context
 
 
 logger = logging.getLogger(__name__)
@@ -61,10 +65,18 @@ class AgentRuntime:
         self.matcher = matcher or RealMatchService.from_config()
         self.brain = agent_brain or LLMAgentBrain.from_config()
         self.web_search_tool = web_search_tool or WebSearchTool()
+        self.config = (
+            getattr(getattr(self.liepin_tool, "config_manager", None), "config", None)
+            or getattr(self.store, "config", None)
+        )
         self._threads: Dict[str, threading.Thread] = {}
         self._cancel_events: Dict[str, threading.Event] = {}
         self._pause_events: Dict[str, threading.Event] = {}
         self._web_search_count: Dict[str, int] = {}
+        self._pending_match_keys: Set[Tuple[str, str]] = set()
+        self._pending_match_keys_lock = threading.Lock()
+        self._session_match_futures: Dict[str, List[Future]] = {}
+        self._round_match_futures: Dict[Tuple[str, str], List[Future]] = {}
 
     def start_session(self, session_id: str) -> None:
         if session_id in self._threads and self._threads[session_id].is_alive():
@@ -185,17 +197,41 @@ class AgentRuntime:
                     "正在基于已完成轮次和匹配结果生成下一轮计划。",
                     {"used_queries": used_queries},
                 )
-                recovery_review = self.brain.review_round(
-                    previous_plan=previous_plan,
-                    jd_text=jd_text,
-                    used_queries=used_queries,
-                    match_results=match_results,
-                    noise_patterns=[],
-                    target_met=False,
-                    should_stop=False,
-                    stop_reason="",
-                    criteria=criteria,
-                )
+                recovery_kwargs = {
+                    "previous_plan": previous_plan,
+                    "jd_text": jd_text,
+                    "used_queries": used_queries,
+                    "match_results": match_results,
+                    "noise_patterns": [],
+                    "target_met": False,
+                    "should_stop": False,
+                    "stop_reason": "",
+                    "criteria": criteria,
+                }
+                recovery_parameters = inspect.signature(
+                    self.brain.review_round
+                ).parameters
+                if "used_query_signatures" in recovery_parameters:
+                    recovery_kwargs["used_query_signatures"] = used_query_signatures
+                if "round_digest" in recovery_parameters:
+                    recovery_kwargs["round_digest"] = self.store.list_round_digests(
+                        session_id
+                    )
+                recovery_review = self.brain.review_round(**recovery_kwargs)
+                if recovery_review.action == "stop" and not recovery_review.next_plan:
+                    self.store.update_session_status(
+                        session_id, SessionStatus.COMPLETED.value
+                    )
+                    self._event(
+                        session_id,
+                        existing_rounds[-1]["id"],
+                        AgentEventType.SESSION_COMPLETED.value,
+                        "恢复检查后结束寻访",
+                        recovery_review.summary,
+                        recovery_review.to_dict(),
+                    )
+                    self._notify(session_id)
+                    return
                 plan = recovery_review.next_plan or self.brain.initial_plan(
                     jd_text, user_notes, criteria
                 )
@@ -322,12 +358,20 @@ class AgentRuntime:
                 )
                 search_started = time.monotonic()
                 try:
+                    search_kwargs = {}
+                    if "known_candidate_keys" in inspect.signature(
+                        self.liepin_tool.run_search_round
+                    ).parameters:
+                        search_kwargs["known_candidate_keys"] = (
+                            self.store.list_candidate_dedupe_keys(session_id)
+                        )
                     raw_candidates = self.browser_queue.run(
                         self.liepin_tool.run_search_round,
                         session_id,
                         round_id,
                         plan,
                         cancel_event=cancel_event,
+                        **search_kwargs,
                     )
                 except Exception as exc:
                     if not self._is_no_results_error(exc):
@@ -386,9 +430,16 @@ class AgentRuntime:
                     {"candidate_count": len(candidates)},
                 )
                 page_meta = candidates[0].page_meta if candidates else {}
-                observation = self.brain.observe_round(
-                    candidates=candidates, plan=plan, criteria=criteria, page_meta=page_meta
-                )
+                observe_kwargs = {
+                    "candidates": candidates,
+                    "plan": plan,
+                    "criteria": criteria,
+                }
+                if "page_meta" in inspect.signature(
+                    self.brain.observe_round
+                ).parameters:
+                    observe_kwargs["page_meta"] = page_meta
+                observation = self.brain.observe_round(**observe_kwargs)
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 if (
                     observation.recommended_round_type == RoundType.HARVEST_DETAIL.value
@@ -405,7 +456,14 @@ class AgentRuntime:
                     AgentEventType.RESULT_OBSERVED.value,
                     "结果池观察",
                     observation.reason,
-                    observation.to_dict(),
+                    {
+                        **observation.to_dict(),
+                        "prompt_metrics": dict(
+                            getattr(self.brain, "last_prompt_metrics", {}).get(
+                                "observe_round", {}
+                            )
+                        ),
+                    },
                 )
 
                 remaining_budget = max(
@@ -415,13 +473,28 @@ class AgentRuntime:
                     session_id,
                     round_id,
                     AgentEventType.DETAIL_DECISION.value,
-                    "AI 正在决定抓取策略",
-                    "正在调用模型决定跳过、抽样、验证或收割，并选择候选人。",
+                    "正在执行抓取策略",
+                    "正在按必抓、验证、探索和跳过抽查分层选择候选人。",
                     {"remaining_detail_budget": remaining_budget},
                 )
-                decision = self.brain.decide_fetch(
-                    observation, candidates, remaining_budget
-                )
+                decide_kwargs = {
+                    "observation": observation,
+                    "candidates": candidates,
+                    "remaining_detail_budget": remaining_budget,
+                }
+                if "already_fetched_ids" in inspect.signature(
+                    self.brain.decide_fetch
+                ).parameters:
+                    decide_kwargs["already_fetched_ids"] = sorted(
+                        self.store.get_successful_detail_candidate_ids(
+                            (item.id for item in candidates),
+                            min_resume_chars=int(
+                                getattr(self.config, "detail_min_resume_chars", 300)
+                                or 300
+                            ),
+                        )
+                    )
+                decision = self.brain.decide_fetch(**decide_kwargs)
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 self.store.update_round(
                     round_id, status=RoundStatus.DETAIL_DECISION_MADE.value
@@ -478,9 +551,14 @@ class AgentRuntime:
                     self.store.update_round(round_id, status=RoundStatus.SKIPPED.value)
 
                 match_results = self.store.list_match_results(session_id, round_id)
+                valid_match_results = [
+                    item
+                    for item in match_results
+                    if str(item.get("status") or "") == "completed"
+                ]
                 round_ab_count = sum(
                     1
-                    for item in match_results
+                    for item in valid_match_results
                     if str(item.get("tier") or "").upper() in ("A", "B")
                 )
                 self.store.update_round(
@@ -491,9 +569,15 @@ class AgentRuntime:
 
                 fetched_count = self.store.count_fetched_details(session_id)
                 total_ab_count = self.store.count_ab_matches(session_id)
-                if decision.action == "fetch_details" and round_ab_count == 0:
+                pending_match_count = sum(1 for future in futures if not future.done())
+                if (
+                    decision.action == "fetch_details"
+                    and valid_match_results
+                    and round_ab_count == 0
+                    and pending_match_count == 0
+                ):
                     consecutive_low_yield_rounds += 1
-                elif decision.action == "fetch_details":
+                elif decision.action == "fetch_details" and round_ab_count > 0:
                     consecutive_low_yield_rounds = 0
 
                 stop = evaluate_stop_conditions(
@@ -517,6 +601,15 @@ class AgentRuntime:
                     {"matched_count": len(match_results)},
                 )
                 review_criteria = dict(criteria or {})
+                if pending_match_count:
+                    pending_hint = (
+                        "本轮仍有 {} 个匹配任务在后台执行，不能把当前暂时为 0 的 A/B "
+                        "视为低产出，也不要据此停止或大幅改变策略。"
+                    ).format(pending_match_count)
+                    current_hint = str(review_criteria.get("_strategy_hint") or "").strip()
+                    review_criteria["_strategy_hint"] = " ".join(
+                        item for item in (current_hint, pending_hint) if item
+                    )
                 if (
                     plan.filters
                     and plan.filters.get("city")
@@ -529,31 +622,90 @@ class AgentRuntime:
                             "、".join(str(c) for c in plan.filters.get("city") if c)
                         )
                     )
-                review = self.brain.review_round(
-                    previous_plan=plan,
-                    jd_text=jd_text,
-                    used_queries=used_queries,
-                    match_results=match_results,
-                    noise_patterns=observation.noise_patterns,
-                    target_met=total_ab_count >= target_ab_count,
-                    should_stop=stop.should_stop,
-                    stop_reason=stop.reason,
-                    criteria=review_criteria,
-                    used_query_signatures=used_query_signatures,
-                )
+                review_kwargs = {
+                    "previous_plan": plan,
+                    "jd_text": jd_text,
+                    "used_queries": used_queries,
+                    "match_results": match_results,
+                    "noise_patterns": observation.noise_patterns,
+                    "target_met": total_ab_count >= target_ab_count,
+                    "should_stop": stop.should_stop,
+                    "stop_reason": stop.reason,
+                    "criteria": review_criteria,
+                }
+                if "used_query_signatures" in inspect.signature(
+                    self.brain.review_round
+                ).parameters:
+                    review_kwargs["used_query_signatures"] = used_query_signatures
+                if "round_digest" in inspect.signature(
+                    self.brain.review_round
+                ).parameters:
+                    review_kwargs["round_digest"] = self.store.list_round_digests(
+                        session_id
+                    )
+                review = self.brain.review_round(**review_kwargs)
                 self._respect_control_flags(session_id, cancel_event, pause_event)
+                tier_counts: Dict[str, int] = {}
+                for item in valid_match_results:
+                    tier = str(item.get("tier") or "").upper()
+                    tier_counts[tier] = tier_counts.get(tier, 0) + 1
+                observed_pages = sorted(
+                    {
+                        int(item.page_meta.get("page_num") or 1)
+                        for item in candidates
+                        if isinstance(item.page_meta, dict)
+                    }
+                )
+                new_candidate_count = self.store.count_round_new_candidates(round_id)
+                round_digest = {
+                    "round_index": round_index,
+                    "stage": decision.round_type,
+                    "query": plan.query,
+                    "search_hypothesis_type": plan.search_hypothesis_type,
+                    "filters": dict(plan.filters or {}),
+                    "page_count": max(observed_pages) if observed_pages else 0,
+                    "raw_count": len(raw_candidates),
+                    "new_count": new_candidate_count,
+                    "duplicate_rate": round(
+                        max(0, len(raw_candidates) - new_candidate_count)
+                        / len(raw_candidates),
+                        3,
+                    )
+                    if raw_candidates
+                    else 0,
+                    "selection_counts": {
+                        key: len(value or [])
+                        for key, value in (decision.selection_buckets or {}).items()
+                    },
+                    "detail_fetch_count": len(futures),
+                    "matched_count": len(valid_match_results),
+                    "pending_match_count": pending_match_count,
+                    "tier_counts": {
+                        tier: tier_counts.get(tier, 0)
+                        for tier in ("A", "B", "C", "D")
+                    },
+                    "a_count": tier_counts.get("A", 0),
+                    "b_count": tier_counts.get("B", 0),
+                    "ab_count": round_ab_count,
+                    "conclusion": review.summary,
+                }
                 self.store.update_round(
                     round_id,
                     status=RoundStatus.REVIEWED.value,
+                    round_digest=round_digest,
                     mark_finished=True,
                 )
+                # A no-wait future may have completed while the review snapshot
+                # was being assembled. Reconcile the persisted digest once more
+                # so resume context never carries a stale pending count.
+                self._refresh_round_match_metrics(session_id, round_id)
                 self.store.save_decision(
                     session_id,
                     round_id,
                     "round_review",
                     review.action,
                     {
-                        "match_results": match_results,
+                        "match_results": build_match_review_context(match_results),
                         "observation": observation.to_dict(),
                     },
                     review.to_dict(),
@@ -565,7 +717,15 @@ class AgentRuntime:
                     AgentEventType.ROUND_REVIEW.value,
                     "本轮复盘",
                     review.summary,
-                    review.to_dict(),
+                    {
+                        **review.to_dict(),
+                        "prompt_metrics": dict(
+                            getattr(self.brain, "last_prompt_metrics", {}).get(
+                                "review_round", {}
+                            )
+                        ),
+                        "round_digest": round_digest,
+                    },
                 )
 
                 # Web Search 增强：联网查询补充情报
@@ -700,6 +860,11 @@ class AgentRuntime:
                 )
                 self._notify(session_id)
                 return
+            self._drain_session_matches(
+                session_id,
+                cancel_event,
+                pause_event,
+            )
             self.store.update_session_status(session_id, SessionStatus.COMPLETED.value)
             self._event(
                 session_id,
@@ -791,36 +956,11 @@ class AgentRuntime:
 
     @staticmethod
     def _query_signature_from_round(row: Dict[str, object]) -> str:
-        query = str(row.get("query") or "").strip()
-        position_filter = str(row.get("position_filter") or "").strip()
-        scope = str(row.get("scope") or "全部经历").strip()
-        from ..storage.sqlite_store import from_json
-
-        filters = from_json(row.get("filters_json"), {}) or {}
-        parts = [query]
-        if position_filter:
-            parts.append("pos={}".format(position_filter))
-        if scope and scope != "全部经历":
-            parts.append("scope={}".format(scope))
-        if filters.get("city"):
-            parts.append("city={}".format(",".join(str(c) for c in filters["city"] if c)))
-        if filters.get("company"):
-            parts.append("company={}".format(filters["company"]))
-        return " | ".join(parts)
+        return LLMAgentBrain._plan_signature(AgentRuntime._plan_from_round(row))
 
     @staticmethod
     def _plan_signature(plan: SearchPlan) -> str:
-        parts = [plan.query]
-        if plan.position_filter:
-            parts.append("pos={}".format(plan.position_filter))
-        if plan.scope and plan.scope != "全部经历":
-            parts.append("scope={}".format(plan.scope))
-        filters = plan.filters or {}
-        if filters.get("city"):
-            parts.append("city={}".format(",".join(str(c) for c in filters["city"] if c)))
-        if filters.get("company"):
-            parts.append("company={}".format(filters["company"]))
-        return " | ".join(parts)
+        return LLMAgentBrain._plan_signature(plan)
 
     def _fetch_and_match_candidates(
         self,
@@ -832,98 +972,359 @@ class AgentRuntime:
         pause_event: threading.Event,
     ) -> List[Future]:
         futures: List[Future] = []
-        candidates = self.store.get_candidates_by_ids(candidate_ids)
+        unique_candidate_ids = list(dict.fromkeys(item for item in candidate_ids if item))
+        candidates = self.store.get_candidates_by_ids(unique_candidate_ids)
+        criteria_version_id = str(criteria.get("criteria_version_id") or "")
+        cache_identity = getattr(self.matcher, "cache_identity", {})
+        if not isinstance(cache_identity, dict):
+            cache_identity = {}
+        detail_min_chars = int(
+            getattr(self.config, "detail_min_resume_chars", 300) or 300
+        )
         for candidate in candidates:
             self._respect_control_flags(session_id, cancel_event, pause_event)
             candidate_id = str(candidate.get("id"))
-            self.store.update_candidate_status(
-                candidate_id, CandidateStatus.DETAIL_FETCHING.value
-            )
-            detail_started = time.monotonic()
-            try:
-                detail = self.browser_queue.run(
-                    self.liepin_tool.fetch_candidate_detail,
-                    candidate,
-                    cancel_event=cancel_event,
-                )
-            except Exception as exc:
-                detail = CandidateDetail(
-                    candidate_id=candidate_id,
-                    resume_text="",
-                    resume_summary="",
-                    capture_status="failed",
-                    error_message=str(exc),
-                )
-                self.store.save_candidate_detail(detail)
-                self._event(
-                    session_id,
-                    round_id,
-                    AgentEventType.ERROR.value,
-                    "简历详情抓取失败",
-                    "{}：{}".format(candidate.get("name") or "候选人", exc),
-                    {
-                        "candidate_id": candidate_id,
-                        "duration_ms": int((time.monotonic() - detail_started) * 1000),
-                    },
-                )
-                continue
-            self.store.save_candidate_detail(detail)
-            profile_url = ""
-            if isinstance(detail.raw_payload, dict):
-                profile_url = str(detail.raw_payload.get("profile_url") or "")
-            if profile_url:
-                self.store.update_candidate_profile_url(candidate_id, profile_url)
-            self._event(
-                session_id,
-                round_id,
-                AgentEventType.DETAIL_FETCHED.value,
-                "简历详情已抓取",
-                "{} / {}".format(
-                    candidate.get("name") or "候选人",
-                    candidate.get("current_title") or "",
-                ),
-                {"candidate_id": candidate_id},
-            )
-            self.store.update_candidate_status(
-                candidate_id, CandidateStatus.MATCH_QUEUED.value
-            )
-            # 匹配并发控制：未完成的匹配任务不超过阈值，超出的放进下一批次
-            concurrency_limit = 10
-            active_count = sum(1 for f in futures if not f.done())
-            if active_count >= concurrency_limit:
-                logger.info(
-                    "_fetch_and_match_candidates: throttling match submission, "
-                    "active=%s, total_queued=%s, waiting for slot",
-                    active_count,
-                    len(futures),
-                )
+            match_key = (candidate_id, criteria_version_id)
+            if not self._reserve_match_key(match_key):
                 self._event(
                     session_id,
                     round_id,
                     AgentEventType.MATCH_RESULT.value,
-                    "匹配批次控制",
-                    "当前有 {} 个匹配任务在进行中，等待空位后再提交下一批。".format(
-                        active_count
-                    ),
-                    {"active_matches": active_count, "total_queued": len(futures)},
+                    "跳过重复任务",
+                    "该候选人的当前基准匹配已在后台执行。",
+                    {"candidate_id": candidate_id},
                 )
-            while active_count >= concurrency_limit:
-                self._respect_control_flags(session_id, cancel_event, pause_event)
-                time.sleep(0.3)
+                continue
+
+            future_submitted = False
+            try:
+                stored_detail = self.store.get_successful_candidate_detail(
+                    candidate_id, min_resume_chars=detail_min_chars
+                )
+                if stored_detail:
+                    resume_text = str(stored_detail.get("resume_text") or "")
+                    detail_payload = self._json_dict(
+                        stored_detail.get("raw_payload_json")
+                    )
+                    capture_status = str(
+                        stored_detail.get("capture_status") or "success"
+                    )
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.DETAIL_FETCHED.value,
+                        "复用已抓取详情",
+                        "该候选人已有完整详情，本轮不再重复打开页面。",
+                        {"candidate_id": candidate_id, "reused": True},
+                    )
+                else:
+                    self.store.update_candidate_status(
+                        candidate_id, CandidateStatus.DETAIL_FETCHING.value
+                    )
+                    detail_started = time.monotonic()
+                    try:
+                        detail = self.browser_queue.run(
+                            self.liepin_tool.fetch_candidate_detail,
+                            candidate,
+                            cancel_event=cancel_event,
+                        )
+                    except Exception as exc:
+                        detail = CandidateDetail(
+                            candidate_id=candidate_id,
+                            resume_text="",
+                            resume_summary="",
+                            capture_status="failed",
+                            error_message=str(exc),
+                        )
+                        self.store.save_candidate_detail(detail)
+                        self._event(
+                            session_id,
+                            round_id,
+                            AgentEventType.ERROR.value,
+                            "简历详情抓取失败",
+                            "{}：{}".format(candidate.get("name") or "候选人", exc),
+                            {
+                                "candidate_id": candidate_id,
+                                "duration_ms": int(
+                                    (time.monotonic() - detail_started) * 1000
+                                ),
+                            },
+                        )
+                        continue
+
+                    profile_url = ""
+                    if isinstance(detail.raw_payload, dict):
+                        profile_url = str(detail.raw_payload.get("profile_url") or "")
+                    if profile_url:
+                        self.store.update_candidate_profile_url(candidate_id, profile_url)
+                    resume_text = str(detail.resume_text or "")
+                    detail_payload = dict(detail.raw_payload or {})
+                    if (
+                        detail.capture_status == "success"
+                        and len(resume_text.strip()) < detail_min_chars
+                    ):
+                        detail.capture_status = "partial"
+                        detail.error_message = (
+                            "详情正文仅 {} 字，低于自动匹配门槛 {} 字"
+                        ).format(len(resume_text.strip()), detail_min_chars)
+                    capture_status = detail.capture_status
+                    self.store.save_candidate_detail(detail)
+                    if detail.capture_status != "success" or not resume_text.strip():
+                        self._event(
+                            session_id,
+                            round_id,
+                            AgentEventType.ERROR.value,
+                            "简历详情不完整",
+                            "详情信息不足，已保留记录但不会进入自动匹配。",
+                            {
+                                "candidate_id": candidate_id,
+                                "capture_status": detail.capture_status,
+                                "resume_chars": len(resume_text.strip()),
+                            },
+                        )
+                        continue
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.DETAIL_FETCHED.value,
+                        "简历详情已抓取",
+                        "{} / {}".format(
+                            candidate.get("name") or "候选人",
+                            candidate.get("current_title") or "",
+                        ),
+                        {"candidate_id": candidate_id, "reused": False},
+                    )
+
+                prompt_version = str(
+                    cache_identity.get("prompt_version") or ""
+                )
+                model_config_hash = str(
+                    cache_identity.get("model_config_hash") or ""
+                )
+                strict_cache_identity = bool(
+                    prompt_version or model_config_hash
+                )
+                resume_hash = (
+                    hashlib.sha256(
+                        resume_text.strip().encode("utf-8")
+                    ).hexdigest()
+                    if strict_cache_identity
+                    else ""
+                )
+                existing_match = self.store.find_match_result(
+                    candidate_id,
+                    criteria_version_id,
+                    statuses=("completed", "needs_review"),
+                    prompt_version=prompt_version,
+                    model_config_hash=model_config_hash,
+                    resume_hash=resume_hash,
+                )
+                if existing_match:
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.MATCH_RESULT.value,
+                        "跳过重复匹配",
+                        "该候选人的简历、寻访基准和匹配配置均未变化，直接复用已有结果。",
+                        {
+                            "candidate_id": candidate_id,
+                            "criteria_version_id": criteria_version_id,
+                            "cached_status": existing_match.get("status") or "",
+                            "cached_tier": existing_match.get("tier") or "",
+                            "resume_hash": resume_hash,
+                        },
+                    )
+                    continue
+
+                self.store.update_candidate_status(
+                    candidate_id, CandidateStatus.MATCH_QUEUED.value
+                )
+                structured_facts, capture_quality = self._detail_match_context(
+                    detail_payload,
+                    resume_text,
+                    capture_status,
+                )
                 active_count = sum(1 for f in futures if not f.done())
-            future = self.match_queue.submit(
-                self._match_and_persist,
-                session_id,
-                round_id,
-                candidate_id,
-                detail.resume_text,
-                criteria,
-                cancel_event,
-                pause_event,
-            )
-            futures.append(future)
+                concurrency_limit = int(
+                    getattr(self.config, "match_concurrency_limit", 10) or 10
+                )
+                if active_count >= concurrency_limit:
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.MATCH_RESULT.value,
+                        "匹配批次控制",
+                        "当前有 {} 个匹配任务在进行中，等待空位后再提交下一批。".format(
+                            active_count
+                        ),
+                        {"active_matches": active_count, "total_queued": len(futures)},
+                    )
+                while active_count >= concurrency_limit:
+                    self._respect_control_flags(session_id, cancel_event, pause_event)
+                    time.sleep(0.3)
+                    active_count = sum(1 for f in futures if not f.done())
+                future = self.match_queue.submit(
+                    self._match_and_persist,
+                    session_id,
+                    round_id,
+                    candidate_id,
+                    resume_text,
+                    criteria,
+                    cancel_event,
+                    pause_event,
+                    structured_facts,
+                    capture_quality,
+                )
+                self._session_match_futures.setdefault(session_id, []).append(future)
+                self._round_match_futures.setdefault(
+                    (session_id, round_id), []
+                ).append(future)
+                future.add_done_callback(
+                    lambda _future,
+                    key=match_key,
+                    sid=session_id,
+                    rid=round_id: self._on_match_future_done(
+                        sid, rid, key
+                    )
+                )
+                futures.append(future)
+                future_submitted = True
+            finally:
+                if not future_submitted:
+                    self._release_match_key(match_key)
         self._notify(session_id)
         return futures
+
+    def _reserve_match_key(self, key: Tuple[str, str]) -> bool:
+        """Reserve a candidate/criteria pair so concurrent rounds cannot duplicate it."""
+        with self._pending_match_keys_lock:
+            if key in self._pending_match_keys:
+                return False
+            self._pending_match_keys.add(key)
+            return True
+
+    def _release_match_key(self, key: Tuple[str, str]) -> None:
+        with self._pending_match_keys_lock:
+            self._pending_match_keys.discard(key)
+
+    def _on_match_future_done(
+        self,
+        session_id: str,
+        round_id: str,
+        match_key: Tuple[str, str],
+    ) -> None:
+        self._release_match_key(match_key)
+        try:
+            self._refresh_round_match_metrics(session_id, round_id)
+        except Exception:
+            logger.exception(
+                "failed to reconcile round metrics after match completion: %s/%s",
+                session_id,
+                round_id,
+            )
+
+    @staticmethod
+    def _json_dict(value: object) -> Dict[str, object]:
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, str) or not value.strip():
+            return {}
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+
+    @classmethod
+    def _detail_match_context(
+        cls,
+        raw_payload: Dict[str, object],
+        resume_text: str,
+        capture_status: str,
+    ) -> Tuple[Dict[str, object], Dict[str, object]]:
+        payload = dict(raw_payload or {})
+        extracted_payload = cls._json_dict(payload.get("raw_payload_json"))
+        structured = payload.get("structured_facts")
+        if not isinstance(structured, dict):
+            structured = extracted_payload.get("_structured")
+        if not isinstance(structured, dict):
+            structured = {}
+
+        section_names = (
+            "basic_info",
+            "summary",
+            "experience",
+            "projects",
+            "education",
+            "job_intention",
+        )
+        present_sections = [
+            name
+            for name in section_names
+            if isinstance(extracted_payload.get(name), list)
+            and bool(extracted_payload.get(name))
+        ]
+        quality = {
+            "capture_status": capture_status or "",
+            "resume_chars": len((resume_text or "").strip()),
+            "present_sections": present_sections,
+            "missing_sections": [
+                name for name in section_names if name not in present_sections
+            ],
+        }
+        return dict(structured), quality
+
+    def _drain_session_matches(
+        self,
+        session_id: str,
+        cancel_event: threading.Event,
+        pause_event: threading.Event,
+    ) -> None:
+        """Settle background matches before a session is declared completed."""
+        futures = list(self._session_match_futures.get(session_id, []))
+        pending = [future for future in futures if not future.done()]
+        if not pending:
+            self._finalize_session_match_tracking(session_id)
+            return
+        timeout_seconds = int(
+            getattr(self.config, "match_wait_timeout_seconds", 300) or 300
+        )
+        self._event(
+            session_id,
+            None,
+            AgentEventType.MATCH_RESULT.value,
+            "正在收拢后台匹配",
+            "搜索已结束，等待剩余 {} 个候选人匹配完成后再结束任务。".format(
+                len(pending)
+            ),
+            {"pending_count": len(pending), "timeout_seconds": timeout_seconds},
+        )
+        self._wait_for_policy(
+            pending,
+            {"mode": "wait_all", "timeout_seconds": timeout_seconds},
+            cancel_event,
+            pause_event,
+            session_id,
+            None,
+        )
+        self._respect_control_flags(session_id, cancel_event, pause_event)
+        remaining = [future for future in pending if not future.done()]
+        if remaining:
+            raise RuntimeError(
+                "仍有 {} 个后台匹配任务超时未完成，任务不会被误标为已完成。".format(
+                    len(remaining)
+                )
+            )
+        self._finalize_session_match_tracking(session_id)
+
+    def _finalize_session_match_tracking(self, session_id: str) -> None:
+        round_keys = [
+            key for key in self._round_match_futures if key[0] == session_id
+        ]
+        for _, round_id in round_keys:
+            self._refresh_round_match_metrics(session_id, round_id)
+            self._round_match_futures.pop((session_id, round_id), None)
+        self._session_match_futures.pop(session_id, None)
 
     def _match_and_persist(
         self,
@@ -934,6 +1335,8 @@ class AgentRuntime:
         criteria: Dict[str, object],
         cancel_event: Optional[threading.Event] = None,
         pause_event: Optional[threading.Event] = None,
+        structured_facts: Optional[Dict[str, object]] = None,
+        capture_quality: Optional[Dict[str, object]] = None,
     ) -> MatchResult:
         logger.info(
             "_match_and_persist START: session=%s round=%s candidate=%s thread=%s",
@@ -949,13 +1352,21 @@ class AgentRuntime:
         match_started = time.monotonic()
         try:
             logger.info("_match_and_persist: calling match_candidate for %s", candidate_id)
-            result = self.matcher.match_candidate(
-                session_id=session_id,
-                round_id=round_id,
-                candidate_id=candidate_id,
-                resume_text=resume_text,
-                criteria=criteria,
-            )
+            match_kwargs = {
+                "session_id": session_id,
+                "round_id": round_id,
+                "candidate_id": candidate_id,
+                "resume_text": resume_text,
+                "criteria": criteria,
+            }
+            matcher_parameters = inspect.signature(
+                self.matcher.match_candidate
+            ).parameters
+            if "structured_facts" in matcher_parameters:
+                match_kwargs["structured_facts"] = structured_facts or {}
+            if "capture_quality" in matcher_parameters:
+                match_kwargs["capture_quality"] = capture_quality or {}
+            result = self.matcher.match_candidate(**match_kwargs)
             logger.info(
                 "_match_and_persist: match_candidate OK for %s in %.1fs tier=%s",
                 candidate_id,
@@ -975,7 +1386,7 @@ class AgentRuntime:
                 candidate_id=candidate_id,
                 session_id=session_id,
                 round_id=round_id,
-                tier="C",
+                tier="",
                 summary="匹配失败，需人工复核。",
                 risks=str(exc),
                 recommendation="人工复核后再决定是否推进。",
@@ -1003,21 +1414,49 @@ class AgentRuntime:
         if not self._session_allows_background_write(session_id):
             logger.warning("_match_and_persist: session %s cancelled after match, aborting save", session_id)
             raise RuntimeError("任务已取消，跳过后台匹配写入")
-        logger.info("_match_and_persist: saving match result for %s tier=%s", candidate_id, result.tier)
+        logger.info(
+            "_match_and_persist: saving match result for %s status=%s tier=%s",
+            candidate_id,
+            result.status,
+            result.tier,
+        )
         self.store.save_match_result(result)
         self._refresh_round_match_metrics(session_id, round_id)
-        self._event(
-            session_id,
-            round_id,
-            AgentEventType.MATCH_RESULT.value,
-            "匹配完成：{}档".format(result.tier),
-            result.summary,
-            {
-                "candidate_id": candidate_id,
-                "tier": result.tier,
-                "recommendation": result.recommendation,
-            },
-        )
+        if result.status == "completed":
+            self._event(
+                session_id,
+                round_id,
+                AgentEventType.MATCH_RESULT.value,
+                "匹配完成：{}档".format(result.tier),
+                result.summary,
+                {
+                    "candidate_id": candidate_id,
+                    "tier": result.tier,
+                    "recommendation": result.recommendation,
+                },
+            )
+        elif result.status == "needs_review":
+            self._event(
+                session_id,
+                round_id,
+                AgentEventType.MATCH_RESULT.value,
+                "匹配结果待人工复核",
+                result.summary or "模型结果证据不足，未生成业务档位。",
+                {
+                    "candidate_id": candidate_id,
+                    "status": result.status,
+                    "questions": list(result.questions_to_verify or []),
+                },
+            )
+        else:
+            self._event(
+                session_id,
+                round_id,
+                AgentEventType.ERROR.value,
+                "候选人匹配失败",
+                result.risks or result.summary or "模型调用失败。",
+                {"candidate_id": candidate_id, "status": result.status},
+            )
         self._notify(session_id)
         logger.info("_match_and_persist DONE (success): %s", candidate_id)
         return result
@@ -1129,16 +1568,66 @@ class AgentRuntime:
 
     def _refresh_round_match_metrics(self, session_id: str, round_id: str) -> None:
         match_results = self.store.list_match_results(session_id, round_id)
+        completed_results = [
+            item
+            for item in match_results
+            if str(item.get("status") or "") == "completed"
+        ]
         ab_count = sum(
             1
-            for item in match_results
+            for item in completed_results
             if str(item.get("tier") or "").upper() in ("A", "B")
         )
-        self.store.update_round(
-            round_id,
-            matched_count=len(match_results),
-            ab_count=ab_count,
+        update_kwargs: Dict[str, object] = {
+            "matched_count": len(match_results),
+            "ab_count": ab_count,
+        }
+        round_row = next(
+            (
+                item
+                for item in self.store.list_rounds(session_id)
+                if str(item.get("id") or "") == round_id
+            ),
+            None,
         )
+        digest = self._json_dict((round_row or {}).get("round_digest_json"))
+        if digest:
+            tier_counts: Dict[str, int] = {}
+            for item in completed_results:
+                tier = str(item.get("tier") or "").upper()
+                tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            pending_count = sum(
+                1
+                for future in self._round_match_futures.get(
+                    (session_id, round_id), []
+                )
+                if not future.done()
+            )
+            digest.update(
+                {
+                    "matched_count": len(completed_results),
+                    "pending_match_count": pending_count,
+                    "tier_counts": {
+                        tier: tier_counts.get(tier, 0)
+                        for tier in ("A", "B", "C", "D")
+                    },
+                    "a_count": tier_counts.get("A", 0),
+                    "b_count": tier_counts.get("B", 0),
+                    "ab_count": ab_count,
+                    "needs_review_count": sum(
+                        1
+                        for item in match_results
+                        if str(item.get("status") or "") == "needs_review"
+                    ),
+                    "failed_count": sum(
+                        1
+                        for item in match_results
+                        if str(item.get("status") or "") == "failed"
+                    ),
+                }
+            )
+            update_kwargs["round_digest"] = digest
+        self.store.update_round(round_id, **update_kwargs)
 
     def _session_status(self, session_id: str) -> str:
         session = self.store.get_session(session_id) or {}

@@ -173,6 +173,12 @@ class _BaseMixin:
                     unknowns_json TEXT,
                     questions_json TEXT,
                     confidence TEXT,
+                    prompt_version TEXT,
+                    model_name TEXT,
+                    model_config_hash TEXT,
+                    input_hash TEXT,
+                    resume_hash TEXT,
+                    match_score INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -275,6 +281,9 @@ class _BaseMixin:
 
                 CREATE INDEX IF NOT EXISTS idx_candidate_sources_candidate
                 ON candidate_sources(candidate_id, created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_details_status
+                ON candidate_details(candidate_id, capture_status, fetched_at DESC);
                 """
             )
             self._ensure_column(connection, "search_rounds", "criteria_version_id", "TEXT")
@@ -289,12 +298,38 @@ class _BaseMixin:
             self._ensure_column(connection, "match_results", "unknowns_json", "TEXT")
             self._ensure_column(connection, "match_results", "questions_json", "TEXT")
             self._ensure_column(connection, "match_results", "confidence", "TEXT")
+            self._ensure_column(connection, "match_results", "prompt_version", "TEXT")
+            self._ensure_column(connection, "match_results", "model_name", "TEXT")
+            self._ensure_column(connection, "match_results", "model_config_hash", "TEXT")
+            self._ensure_column(connection, "match_results", "input_hash", "TEXT")
+            self._ensure_column(connection, "match_results", "resume_hash", "TEXT")
+            self._ensure_column(
+                connection, "match_results", "match_score", "INTEGER NOT NULL DEFAULT 0"
+            )
             self._ensure_column(connection, "candidate_details", "is_gold_collar", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "search_sessions", "pending_user_command", "TEXT")
             self._ensure_column(connection, "candidate_details", "greeting_status", "TEXT")
             self._ensure_column(connection, "candidate_details", "greeting_message", "TEXT")
             self._ensure_column(connection, "candidate_details", "greeting_error", "TEXT")
             self._ensure_column(connection, "candidate_details", "greeted_at", "TEXT")
+            self._ensure_column(connection, "search_rounds", "round_digest_json", "TEXT")
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_match_results_current
+                ON match_results(
+                    session_id, criteria_version_id, candidate_id, created_at DESC
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_match_results_cache
+                ON match_results(
+                    candidate_id, criteria_version_id, prompt_version,
+                    model_config_hash, status, created_at DESC
+                )
+                """
+            )
 
 
     @staticmethod
