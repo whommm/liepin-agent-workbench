@@ -212,6 +212,9 @@ class LLMAgentBrain:
                 max_retries=config.llm_max_retries,
                 max_tokens=config.llm_max_tokens,
                 temperature=config.llm_temperature,
+rpm_limit=config.llm_rpm_limit,
+                rpm_burst=config.llm_rpm_burst,
+                rpm_cooldown_seconds=config.llm_rpm_cooldown_seconds,
             ),
             candidate_picker=CandidatePicker(strategies),
         )

@@ -2,6 +2,7 @@
 
 import pytest
 
+from liepin_agent.core.liepin_search_service import LiepinSearchService
 from liepin_agent.core.search._base_mixin import _BaseMixin
 from liepin_agent.core.search._filters_mixin import _FiltersMixin
 from liepin_agent.core.search._executor_mixin import _ExecutorMixin
@@ -39,6 +40,12 @@ def test_map_filters_routes_city_current_city_and_expected_salary():
         "目前城市": ["杭州"],
         "期望年薪": {"min": 30, "max": 50},
         "年龄": "35岁以内",
+    }
+
+
+def test_map_filters_maps_active_days_to_activity_filter():
+    assert RealLiepinTool._map_filters({"active_days": 30}) == {
+        "活跃度": "30天内活跃"
     }
 
 
@@ -206,6 +213,45 @@ def test_range_filter_hovers_container_before_clicking_confirm():
     assert harness.low.value == "30"
     assert harness.high.value == "50"
     assert harness.events.index("hover") < harness.events.index("confirm")
+
+
+class _DropdownOption:
+    def __init__(self, text):
+        self.text = text
+        self.clicked = False
+
+    def inner_text(self, timeout=0):
+        return self.text
+
+    def click(self, timeout=0):
+        self.clicked = True
+
+
+class _DropdownOptions:
+    def __init__(self, texts):
+        self.options = [_DropdownOption(text) for text in texts]
+
+    def count(self):
+        return len(self.options)
+
+    def nth(self, index):
+        return self.options[index]
+
+
+def test_activity_dropdown_matches_live_30_day_option_text():
+    options = _DropdownOptions(["7天", "30天", "最近三个月"])
+
+    _FilterHarness()._select_dropdown_option(options, "30天内活跃")
+
+    assert [option.clicked for option in options.options] == [False, True, False]
+
+
+def test_activity_dropdown_normalizes_rendered_whitespace():
+    options = _DropdownOptions(["7天", "30 天内\n活跃", "最近三个月"])
+
+    _FilterHarness()._select_dropdown_option(options, "30天内活跃")
+
+    assert [option.clicked for option in options.options] == [False, True, False]
 
 
 class _FailingApplyHarness(_FilterHarness):
@@ -385,5 +431,49 @@ def test_loading_wait_returns_after_short_stable_no_loading_window():
     page = _WaitPage()
 
     _LoadingHarness([False, False, False])._wait_for_loading_cycle(page)
+
+    assert page.waits == 2
+
+
+class _ServiceLoadingHarness(_BaseMixin):
+    LOADING_SELECTORS = LiepinSearchService.LOADING_SELECTORS
+
+
+class _LoadingLocator:
+    def __init__(self, visible):
+        self.visible = visible
+        self.first = self
+
+    def count(self):
+        return int(self.visible)
+
+    def is_visible(self, timeout=0):
+        return self.visible
+
+
+class _LoadingPage:
+    def __init__(self, visible_selectors):
+        self.visible_selectors = set(visible_selectors)
+
+    def locator(self, selector):
+        return _LoadingLocator(selector in self.visible_selectors)
+
+
+def test_static_loading_class_is_not_treated_as_result_loading():
+    page = _LoadingPage({".loading", ".resume-spin-box"})
+
+    assert _ServiceLoadingHarness()._is_loading(page) is False
+
+
+def test_spinning_result_overlay_is_detected_as_loading():
+    page = _LoadingPage({".resume-spin-box .ant-spin-spinning"})
+
+    assert _ServiceLoadingHarness()._is_loading(page) is True
+
+
+def test_loading_wait_returns_after_spinner_disappears():
+    page = _WaitPage()
+
+    _LoadingHarness([True, True, False])._wait_for_loading_cycle(page)
 
     assert page.waits == 2

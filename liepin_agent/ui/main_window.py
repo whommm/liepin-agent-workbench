@@ -94,6 +94,7 @@ class MainWindow(QMainWindow):
             liepin_tool=RealLiepinTool(self.config_manager),
             matcher=RealMatchService.from_config(self.config_manager),
             agent_brain=LLMAgentBrain.from_config(self.config_manager),
+            config=self.config_manager.config,
         )
 
     def _rebuild_runtime_tools(self) -> None:
@@ -1703,6 +1704,17 @@ class MainWindow(QMainWindow):
         )
         self.strategy_view.setHtml(html)
 
+    @staticmethod
+    def _evidence_source_label(item: Dict[str, object]) -> str:
+        if item.get("source_type") == "inferred":
+            return "推断"
+        grounding_status = item.get("grounding_status")
+        if grounding_status == "exact":
+            return "原文证据"
+        if grounding_status == "model_summary":
+            return "模型概括"
+        return "匹配证据"
+
     def _greeting_policy_text(self) -> str:
         config = self.config_manager.config
         if config.greeting_template:
@@ -1725,7 +1737,7 @@ class MainWindow(QMainWindow):
         evidence = match.get("matched_evidence") or []
         evidence_html = "".join(
             "<li><b>[{}] {}</b>：{} <span style='color:#8a8070'>{}</span></li>".format(
-                "推断" if item.get("source_type") == "inferred" else "原文",
+                self._evidence_source_label(item),
                 self._html(item.get("criterion") or ""),
                 self._html(item.get("evidence") or ""),
                 self._html(item.get("strength") or ""),

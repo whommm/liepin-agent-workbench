@@ -19,7 +19,7 @@ from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-MATCH_PROMPT_VERSION = "match-contract-v3-20260714"
+MATCH_PROMPT_VERSION = "match-contract-v4-20260715"
 MIN_GROUNDED_EVIDENCE_CHARS = 4
 MIN_A_SCORE = 70
 MIN_B_SCORE = 45
@@ -90,9 +90,9 @@ D = 不相关或明显不符
   "confidence": "high/medium/low"
 }
 
-matched_evidence 只能放简历中可直接引用的事实；推断必须单独放在
-inferred_evidence。matched_evidence.evidence 必须逐字引用简历中的连续原文，
-不要改写或概括。A/B 档必须至少包含一条可定位的直接证据，否则结果无法通过校验。
+matched_evidence 只放简历中明确提供的事实，允许忠实概括或汇总，但不得新增或
+改变姓名、公司、技术、数字、日期、薪资、职责范围和管理层级等关键信息。推断必须
+单独放在 inferred_evidence。A/B 档必须至少包含一条直接事实证据，否则结果无法通过校验。
 """
 
 
@@ -136,7 +136,10 @@ class RealMatchService:
                 provider=config.backend_llm_provider or "openai",
                 max_retries=config.llm_max_retries,
                 max_tokens=config.llm_max_tokens,
-                temperature=config.backend_llm_temperature,
+temperature=config.backend_llm_temperature,
+                rpm_limit=config.llm_rpm_limit,
+                rpm_burst=config.llm_rpm_burst,
+                rpm_cooldown_seconds=config.llm_rpm_cooldown_seconds,
             )
         )
 
@@ -173,7 +176,8 @@ class RealMatchService:
         try:
             payload = self._parse_json(raw)
             output = MatchOutput.model_validate(payload)
-            self._validate_direct_evidence(output, resume_text)
+            summary_count = self._assess_direct_evidence(output, resume_text)
+            grounding_risk = self._apply_grounding_confidence(output, summary_count)
             match_score = output.deterministic_score()
             resolved_tier, score_risk = self._resolve_tier(
                 output.tier, match_score
@@ -208,7 +212,11 @@ class RealMatchService:
             dealbreaker_hit=output.dealbreaker_hit,
             summary=output.summary,
             risks="；".join(
-                [*output.risks, *([score_risk] if score_risk else [])]
+                [
+                    *output.risks,
+                    *([grounding_risk] if grounding_risk else []),
+                    *([score_risk] if score_risk else []),
+                ]
             ),
             recommendation=output.recommendation,
             detail=output.detail or output.canonical_json(),
@@ -224,25 +232,37 @@ class RealMatchService:
         return self._attach_audit_metadata(result, prompt, resume_text)
 
     @classmethod
-    def _validate_direct_evidence(
+    def _assess_direct_evidence(
         cls, output: MatchOutput, resume_text: str
-    ) -> None:
-        """Require every claimed direct quote to exist in the captured resume."""
+    ) -> int:
+        """Annotate whether direct evidence is verbatim or a model summary."""
         normalized_resume = cls._normalize_evidence_text(resume_text)
-        unsupported = []
+        summary_count = 0
         for item in output.matched_evidence:
             quote = cls._normalize_evidence_text(item.evidence)
             if (
-                len(quote) < MIN_GROUNDED_EVIDENCE_CHARS
-                or quote not in normalized_resume
+                len(quote) >= MIN_GROUNDED_EVIDENCE_CHARS
+                and quote in normalized_resume
             ):
-                unsupported.append(item.evidence)
-        if unsupported:
-            raise MatchEvidenceValidationError(
-                "直接证据无法在简历原文定位：{}".format(
-                    "；".join(unsupported[:3])
-                )
-            )
+                item.grounding_status = "exact"
+            else:
+                item.grounding_status = "model_summary"
+                summary_count += 1
+        return summary_count
+
+    @staticmethod
+    def _apply_grounding_confidence(
+        output: MatchOutput, summary_count: int
+    ) -> str:
+        if summary_count <= 0:
+            return ""
+        if summary_count == len(output.matched_evidence):
+            output.confidence = "low"
+        elif output.confidence == "high":
+            output.confidence = "medium"
+        return "{} 条匹配证据为模型概括，未逐字定位，建议结合简历复核".format(
+            summary_count
+        )
 
     @staticmethod
     def _normalize_evidence_text(value: str) -> str:
@@ -436,8 +456,8 @@ D = 不相关或明显不符
 
 要求：
 1. 判断必须围绕岗位匹配标准中的核心要求。
-2. matched_evidence 必须引用简历原文证据，不能把推断当作直接证据。
-   evidence 字段必须复制简历中的连续原句，不要改写或概括；每个核心条件分别给证据。
+2. matched_evidence 只能写简历明确提供的事实，不能把推断当作直接证据。
+   允许忠实概括或跨段汇总，但不得新增或改变姓名、公司、技术、数字、日期、薪资、职责范围和管理层级等关键信息；每个核心条件分别给证据。
 3. 合理推断放入 inferred_evidence，不确定的信息放入 missing_or_unclear，
    需要沟通的问题放入 questions_to_verify。
 4. A/B/C/D 只是标签，核心是证据、推断、风险和待确认问题。

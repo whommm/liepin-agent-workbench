@@ -88,6 +88,21 @@ def test_candidate_table_supports_multi_selection_for_manual_greeting(tmp_path):
         app.processEvents()
 
 
+def test_evidence_source_labels_are_explicit_and_backward_compatible():
+    assert MainWindow._evidence_source_label(
+        {"source_type": "direct", "grounding_status": "exact"}
+    ) == "原文证据"
+    assert MainWindow._evidence_source_label(
+        {"source_type": "direct", "grounding_status": "model_summary"}
+    ) == "模型概括"
+    assert MainWindow._evidence_source_label(
+        {"source_type": "direct"}
+    ) == "匹配证据"
+    assert MainWindow._evidence_source_label(
+        {"source_type": "inferred"}
+    ) == "推断"
+
+
 def test_greeting_context_from_candidate_row():
     context = MainWindow._greeting_context_from_row(
         {

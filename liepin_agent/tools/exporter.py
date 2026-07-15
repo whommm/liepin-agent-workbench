@@ -421,9 +421,7 @@ class ExportService:
                 paragraph(
                     "{}.".format(index),
                     "[{}] {} - {} ({})".format(
-                        "推断"
-                        if evidence.get("source_type") == "inferred"
-                        else "原文",
+                        self._evidence_source_label(evidence),
                         evidence.get("criterion") or "",
                         evidence.get("evidence") or "",
                         evidence.get("strength") or "",
@@ -517,12 +515,21 @@ class ExportService:
         )
 
     @staticmethod
+    def _evidence_source_label(item: Dict[str, Any]) -> str:
+        if item.get("source_type") == "inferred":
+            return "推断"
+        grounding_status = item.get("grounding_status")
+        if grounding_status == "exact":
+            return "原文证据"
+        if grounding_status == "model_summary":
+            return "模型概括"
+        return "匹配证据"
+
+    @staticmethod
     def _evidence_text(evidence: List[Dict[str, Any]]) -> str:
         return "\n".join(
             "[{}] {}: {}".format(
-                "推断"
-                if evidence_item.get("source_type") == "inferred"
-                else "原文",
+                ExportService._evidence_source_label(evidence_item),
                 evidence_item.get("criterion") or "",
                 evidence_item.get("evidence") or "",
             )
@@ -817,9 +824,8 @@ class ExportService:
 
     @staticmethod
     def _safe_filename(value: str) -> str:
-        for ch in '\\/:*?"<>|':
-            value = value.replace(ch, "_")
-        return value.strip(" .")[:60] or "候选人"
+        value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", value)
+        return value.strip(" .")[:60].rstrip(" .") or "候选人"
 
     @staticmethod
     def _card_decision_label(value: object) -> str:

@@ -52,14 +52,14 @@ class AgentRuntime:
         matcher: Optional[object] = None,
         agent_brain: Optional[object] = None,
         web_search_tool: Optional[WebSearchTool] = None,
+        config: Optional[object] = None,
     ):
         self.store = store
         self.event_bus = event_bus or EventBus()
         self.browser_queue = browser_queue or BrowserQueue()
+        self._config = config or getattr(store, "config", None)
         self.match_queue = match_queue or MatchQueue(
-            max_workers=getattr(self.store, "config", None)
-            and getattr(self.store.config, "match_queue_workers", 3)
-            or 3
+            max_workers=getattr(self._config, "match_queue_workers", None) or 3
         )
         self.liepin_tool = liepin_tool or RealLiepinTool()
         self.matcher = matcher or RealMatchService.from_config()
@@ -1144,9 +1144,12 @@ class AgentRuntime:
                     resume_text,
                     capture_status,
                 )
+                # 匹配并发控制：未完成的匹配任务不超过阈值，超出的放进下一批次。
+                # 真正的限流由 LLMClient 的 RPM 令牌桶负责（实测 5 RPM），
+                # 这里只控制同时在跑的任务数，避免堆积。默认 3（可在 config 配 match_concurrency_limit）。
                 active_count = sum(1 for f in futures if not f.done())
                 concurrency_limit = int(
-                    getattr(self.config, "match_concurrency_limit", 10) or 10
+                    getattr(self.config, "match_concurrency_limit", None) or 3
                 )
                 if active_count >= concurrency_limit:
                     self._event(

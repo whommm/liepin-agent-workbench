@@ -116,9 +116,8 @@ class LiepinSearchService(
     ]
     LOADING_SELECTORS = [
         ".ant-spin.ant-spin-spinning",
-        ".resume-spin-box",
-        ".loading",
-        "[class*='loading']",
+        ".resume-spin-box.ant-spin-spinning",
+        ".resume-spin-box .ant-spin-spinning",
     ]
     MANAGED_FILTER_TITLES = (
         "职位名称",

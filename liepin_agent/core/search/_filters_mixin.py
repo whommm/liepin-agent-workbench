@@ -234,17 +234,29 @@ class _FiltersMixin:
             )
         input_locator = container.locator(spec.input_selector).first
         normalized_value = self._normalize_dropdown_filter_value(spec, value)
-        self._dismiss_any_open_modal(page)
+        # Do NOT call _dismiss_any_open_modal here — it presses Escape and
+        # runs JS that hides .ant-select-dropdown elements, which disrupts
+        # the Ant Select focus we are about to establish.  The caller
+        # (_apply_filter_with_retries) already dismisses modals before
+        # calling us.
         self._focus_dropdown_input(container, input_locator)
-        try:
-            input_locator.press("ArrowDown")
-        except Exception:
-            page.keyboard.press("ArrowDown")
-        page.wait_for_timeout(200)
         try:
             options = self._open_dropdown_options(page)
             self._select_dropdown_option(options, normalized_value)
         except Exception:
+            # Keyboard fallback: close any stale dropdown, re-focus the
+            # input to guarantee a known state, then navigate purely by
+            # keyboard per the mapping doc (focus input → ArrowDown opens
+            # dropdown → more ArrowDowns navigate → Enter selects).
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(150)
+            except Exception:
+                pass
+            try:
+                input_locator.focus()
+            except Exception:
+                pass
             self._select_dropdown_option_by_keyboard(page, normalized_value)
         self._wait_for_filter_apply(page, expected_text=normalized_value)
         self._wait_for_condition_chip(page, spec.title, normalized_value)
@@ -776,11 +788,26 @@ class _FiltersMixin:
 
     @staticmethod
     def _focus_dropdown_input(container, input_locator) -> None:
-        """Focus an Ant Select field without clicking through its display text."""
-        try:
-            container.click(timeout=3000)
-        except Exception:
-            pass
+        """Focus an Ant Select field by clicking its selector element.
+
+        Clicking the broad container often hits the title text (e.g.
+        ``活跃度：``) instead of the actual Ant Select, which neither opens
+        the dropdown nor focuses the input.  Targeting
+        ``.ant-select-selector`` directly is the reliable way to activate
+        the component.
+        """
+        for selector in (
+            ".ant-select-selector",
+            "div.ant-select",
+            ".sfilter-other-select",
+        ):
+            try:
+                target = container.locator(selector).first
+                if target.is_visible(timeout=1000):
+                    target.click(timeout=3000)
+                    break
+            except Exception:
+                continue
         try:
             input_locator.focus()
             return
@@ -811,21 +838,46 @@ class _FiltersMixin:
 
     def _select_dropdown_option(self, options, value: str) -> None:
         count = options.count()
+        normalized_value = self._normalize_dropdown_option_text(value)
+        fallback_option = None
         for index in range(count):
             option = options.nth(index)
             try:
-                text = (option.inner_text(timeout=1000) or "").strip()
+                text = option.inner_text(timeout=1000) or ""
             except Exception:
                 continue
-            if value == text or value in text:
+            normalized_text = self._normalize_dropdown_option_text(text)
+            if normalized_value == normalized_text:
                 option.click(timeout=5000)
                 return
+            if normalized_value in normalized_text and fallback_option is None:
+                fallback_option = option
+        if fallback_option is not None:
+            fallback_option.click(timeout=5000)
+            return
         raise LiepinSearchPageChangedError("未找到下拉选项: {}".format(value))
+
+
+    @classmethod
+    def _normalize_dropdown_option_text(cls, value: str) -> str:
+        normalized = cls._normalize_filter_title_text(value)
+        if normalized.endswith("内活跃"):
+            return normalized[: -len("内活跃")]
+        if normalized.endswith("活跃"):
+            return normalized[: -len("活跃")]
+        return normalized
 
 
     @staticmethod
     def _select_dropdown_option_by_keyboard(page: Page, value: str) -> None:
-        """Fallback for Ant Select fields where visible option locators are unstable."""
+        """Fallback for Ant Select fields where visible option locators are unstable.
+
+        Assumes the input is already focused and the dropdown is CLOSED.
+        The first ArrowDown opens the dropdown and highlights option 0;
+        each subsequent ArrowDown advances by one.  So ``steps`` total
+        ArrowDowns lands on option ``steps - 1`` (0-indexed), which matches
+        the ``steps_by_value`` mapping below.
+        """
         steps_by_value = {
             "不限": 1,
             "男": 2,
@@ -844,7 +896,7 @@ class _FiltersMixin:
         steps = steps_by_value.get((value or "").strip())
         if steps is None:
             raise LiepinSearchPageChangedError("未找到下拉选项: {}".format(value))
-        for _ in range(max(0, steps - 1)):
+        for _ in range(max(0, steps)):
             page.keyboard.press("ArrowDown")
             page.wait_for_timeout(120)
         page.keyboard.press("Enter")

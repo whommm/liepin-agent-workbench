@@ -7,7 +7,16 @@ import re
 import time
 from typing import Optional
 
-from openai import APIConnectionError, APIError, APITimeoutError, AuthenticationError, OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    RateLimitError,
+)
+
+from ..services.rate_limiter import get_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +37,11 @@ class TimeoutError(LLMClientError):
     pass
 
 
+class QuotaExceededError(LLMClientError):
+    """Upstream per-minute (RPM) quota exhausted — HTTP 429 rpm exhausted."""
+    pass
+
+
 class LLMClient:
     def __init__(
         self,
@@ -39,6 +53,9 @@ class LLMClient:
         max_retries: int = 2,
         max_tokens: int = 4096,
         temperature: float = 0.2,
+        rpm_limit: int = 5,
+        rpm_burst: int = 5,
+        rpm_cooldown_seconds: float = 12.0,
     ):
         self.api_base_url = (api_base_url or "").rstrip("/")
         self.api_key = api_key or ""
@@ -50,6 +67,14 @@ class LLMClient:
         self.temperature = float(temperature)
         self._client: Optional[OpenAI] = None
         self._anthropic_client = None
+        # Shared process-wide RPM limiter. SenseNova deepseek-v4-flash 实测 5 RPM
+        # (令牌桶容量 5，每 12s 补 1 个令牌)，超过即 429 rpm exhausted。
+        self._rate_limiter = get_rate_limiter()
+        self._rate_limiter.configure(
+            rpm=max(1, int(rpm_limit)),
+            burst=max(1, int(rpm_burst)),
+            cooldown_seconds=max(0.0, float(rpm_cooldown_seconds)),
+        )
 
     def chat(self, prompt: str, system_message: str = "") -> str:
         logger.info(
@@ -198,32 +223,55 @@ class LLMClient:
         return self._clean_content(response.content[0].text or "")
 
     def _execute_with_retry(self, func, *args, **kwargs):
+        # 两条独立的重试预算：
+        # - 普通错误：最多 self.max_retries 次（指数退避）
+        # - 429 限流：最多 max_429_retries 次，靠限流器冷却+令牌自然等待，
+        #   预算独立，避免被小的 max_retries 提前掐断。
+        max_429_retries = max(self.max_retries, 3)
+        rate_429_retries = 0
+        normal_retries = 0
         last_error = None
-        for attempt in range(self.max_retries + 1):
+        while True:
+            # 限流 gate：阻塞直到拿到令牌且冷却期结束，避免连续撞 429。
+            acquired = self._rate_limiter.acquire(timeout=float(self.timeout))
+            if not acquired:
+                logger.warning(
+                    "_execute_with_retry: rate limiter acquire timed out after %ss",
+                    self.timeout,
+                )
+                raise TimeoutError("等待 RPM 令牌超时，上游限流持续。")
             logger.debug(
-                "_execute_with_retry: attempt=%s/%s func=%s",
-                attempt + 1,
-                self.max_retries + 1,
-                getattr(func, "__name__", func),
+                "_execute_with_retry: token acquired, 429_retries=%s normal_retries=%s",
+                rate_429_retries,
+                normal_retries,
             )
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
                 translated = self._translate_exception(exc)
-                logger.warning(
-                    "_execute_with_retry: attempt %s failed: %s",
-                    attempt + 1,
-                    translated,
-                )
+                logger.warning("_execute_with_retry: failed: %s", translated)
                 if isinstance(translated, AuthError):
                     raise translated
                 last_error = translated
-                if attempt < self.max_retries:
-                    sleep_sec = 1.0 * (2 ** attempt)
-                    logger.info("_execute_with_retry: sleeping %.1fs before retry", sleep_sec)
-                    time.sleep(sleep_sec)
-        logger.error("_execute_with_retry: all attempts exhausted")
-        raise last_error or LLMClientError("请求失败")
+                if isinstance(translated, QuotaExceededError):
+                    if rate_429_retries >= max_429_retries:
+                        logger.error(
+                            "_execute_with_retry: 429 retries exhausted (%s)",
+                            rate_429_retries,
+                        )
+                        raise translated
+                    rate_429_retries += 1
+                    # 触发全局冷却，本线程和其他线程的下一次 acquire 都会等到冷却结束。
+                    self._rate_limiter.trigger_cooldown()
+                    continue
+                # 普通错误：指数退避
+                if normal_retries >= self.max_retries:
+                    logger.error("_execute_with_retry: normal retries exhausted (%s)", normal_retries)
+                    raise translated
+                normal_retries += 1
+                sleep_sec = 1.0 * (2 ** (normal_retries - 1))
+                logger.info("_execute_with_retry: sleeping %.1fs before retry", sleep_sec)
+                time.sleep(sleep_sec)
 
     @staticmethod
     def _clean_content(content: str) -> str:
@@ -233,6 +281,9 @@ class LLMClient:
     @staticmethod
     def _translate_exception(exc: Exception) -> LLMClientError:
         # OpenAI exceptions
+        if isinstance(exc, RateLimitError):
+            # 上游 RPM 配额耗尽（SenseNova 返回 429 + message:"rpm exhausted"）
+            return QuotaExceededError("API 请求被限流: {}".format(exc))
         if isinstance(exc, AuthenticationError):
             return AuthError("API 密钥无效或账户余额不足。")
         if isinstance(exc, APITimeoutError):
@@ -240,6 +291,12 @@ class LLMClient:
         if isinstance(exc, APIConnectionError):
             return NetworkError("无法连接到大模型服务。")
         if isinstance(exc, APIError):
+            # 兜底：按状态码识别 429（某些代理/SDK 分支可能不抛 RateLimitError）
+            status = getattr(exc, "status_code", None) or getattr(
+                getattr(exc, "response", None), "status_code", None
+            )
+            if status == 429:
+                return QuotaExceededError("API 请求被限流: {}".format(exc))
             return LLMClientError("API 请求失败: {}".format(exc))
         # Anthropic exceptions (best-effort via module names to avoid hard import)
         exc_module = type(exc).__module__
@@ -251,7 +308,12 @@ class LLMClient:
                 return TimeoutError("请求超时。")
             if exc_name == "APIConnectionError":
                 return NetworkError("无法连接到大模型服务。")
+            if exc_name == "RateLimitError":
+                return QuotaExceededError("API 请求被限流: {}".format(exc))
             if "APIError" in exc_name:
+                status = getattr(exc, "status_code", None)
+                if status == 429:
+                    return QuotaExceededError("API 请求被限流: {}".format(exc))
                 return LLMClientError("API 请求失败: {}".format(exc))
         if isinstance(exc, LLMClientError):
             return exc

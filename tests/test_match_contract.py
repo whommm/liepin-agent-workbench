@@ -60,6 +60,7 @@ def test_legacy_match_fields_are_translated_to_canonical_result():
             "evidence": "近三年负责电机结构设计",
             "strength": "medium",
             "source_type": "direct",
+            "grounding_status": "exact",
         },
         {
             "criterion": "",
@@ -216,7 +217,7 @@ def test_real_matcher_from_config_forwards_llm_runtime_settings(tmp_path):
     assert client.temperature == 0.0
 
 
-def test_ungrounded_direct_evidence_is_needs_review():
+def test_unlocated_direct_evidence_completes_with_low_confidence_warning():
     result = match_with(
         json.dumps(
             {
@@ -238,9 +239,70 @@ def test_ungrounded_direct_evidence_is_needs_review():
         resume_text="候选人一直从事餐饮门店运营工作。",
     )
 
-    assert result.status == "needs_review"
-    assert result.tier == ""
-    assert "无法在简历原文定位" in result.risks
+    assert result.status == "completed"
+    assert result.tier == "A"
+    assert result.confidence == "low"
+    assert "模型概括，未逐字定位" in result.risks
+    assert result.matched_evidence[0]["grounding_status"] == "model_summary"
+
+
+def test_partially_located_evidence_caps_high_confidence_at_medium():
+    response = json.dumps(
+        {
+            "tier": "B",
+            "summary": "存在直接事实和汇总判断",
+            "core_met_count": 2,
+            "core_total": 2,
+            "matched_evidence": [
+                {
+                    "criterion": "结构设计",
+                    "evidence": "近三年负责电机结构设计",
+                    "strength": "strong",
+                },
+                {
+                    "criterion": "项目经验",
+                    "evidence": "累计负责多个无刷电机项目",
+                    "strength": "medium",
+                },
+            ],
+            "confidence": "high",
+        },
+        ensure_ascii=False,
+    )
+
+    result = match_with(response)
+
+    assert result.status == "completed"
+    assert result.confidence == "medium"
+    assert [
+        item["grounding_status"] for item in result.matched_evidence
+    ] == ["exact", "model_summary"]
+    assert "1 条匹配证据为模型概括" in result.risks
+
+
+def test_model_cannot_self_report_grounding_status():
+    response = json.dumps(
+        {
+            "tier": "B",
+            "summary": "证据需要系统重新定位",
+            "core_met_count": 1,
+            "core_total": 1,
+            "matched_evidence": [
+                {
+                    "evidence": "模型自行编写的概括",
+                    "grounding_status": "exact",
+                }
+            ],
+            "confidence": "high",
+        },
+        ensure_ascii=False,
+    )
+
+    result = match_with(response)
+
+    assert result.status == "completed"
+    assert result.matched_evidence[0]["grounding_status"] == "model_summary"
+    assert result.confidence == "low"
 
 
 def test_low_evidence_score_cannot_remain_a_or_b():

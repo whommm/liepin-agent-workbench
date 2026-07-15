@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -13,6 +13,7 @@ Tier = Literal["A", "B", "C", "D"]
 Confidence = Literal["high", "medium", "low"]
 EvidenceStrength = Literal["strong", "medium", "weak"]
 EvidenceSource = Literal["direct", "inferred"]
+EvidenceGrounding = Literal["exact", "model_summary"]
 
 
 class MatchEvidence(BaseModel):
@@ -24,6 +25,7 @@ class MatchEvidence(BaseModel):
     evidence: str = Field(min_length=1)
     strength: EvidenceStrength = "medium"
     source_type: EvidenceSource = "direct"
+    grounding_status: Optional[EvidenceGrounding] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -46,6 +48,7 @@ class MatchEvidence(BaseModel):
             or data.get("value")
             or ""
         )
+        data.pop("grounding_status", None)
         return data
 
     @field_validator("strength", mode="before")
@@ -269,7 +272,7 @@ class MatchOutput(BaseModel):
         """Keep inferred evidence visible while preserving its source label."""
 
         return [
-            item.model_dump()
+            item.model_dump(exclude_none=True)
             for item in [*self.matched_evidence, *self.inferred_evidence]
         ]
 

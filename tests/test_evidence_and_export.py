@@ -30,6 +30,21 @@ def test_real_matcher_parse_failure_returns_review_package():
     assert result.questions_to_verify
 
 
+def test_evidence_labels_distinguish_exact_summary_and_legacy():
+    assert ExportService._evidence_source_label(
+        {"source_type": "direct", "grounding_status": "exact"}
+    ) == "原文证据"
+    assert ExportService._evidence_source_label(
+        {"source_type": "direct", "grounding_status": "model_summary"}
+    ) == "模型概括"
+    assert ExportService._evidence_source_label(
+        {"source_type": "direct"}
+    ) == "匹配证据"
+    assert ExportService._evidence_source_label(
+        {"source_type": "inferred"}
+    ) == "推断"
+
+
 def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     store = SQLiteStore(str(tmp_path / "workbench.db"))
     session_id = store.create_session("销售总监", "天然气销售")
@@ -93,6 +108,7 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
                     "criterion": "天然气",
                     "evidence": "负责天然气客户开发",
                     "strength": "strong",
+                    "grounding_status": "exact",
                 }
             ],
             missing_or_unclear=["压缩机经验未明"],
@@ -173,7 +189,7 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     assert workbook["候选人"].cell(row=2, column=greeting_column).value == "已发送"
     assert workbook["候选人"].cell(
         row=2, column=evidence_column
-    ).value.startswith("[原文]")
+    ).value.startswith("[原文证据]")
     assert workbook["寻访基准"]["B2"].value == "天然气\nLNG"
     diagnostics_values = [cell.value for cell in workbook["运行诊断"]["A"]]
     assert "待回写匹配数" in diagnostics_values
@@ -185,6 +201,24 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
         document_xml = archive.read("word/document.xml").decode("utf-8")
     assert "候选人" in document_xml
     assert "有天然气销售背景" in document_xml
+
+
+def test_export_sanitizes_control_characters_in_session_title(tmp_path):
+    store = SQLiteStore(str(tmp_path / "workbench.db"))
+    session_id = store.create_session(
+        "力传感器工程师\n\n1", "力传感器工程师"
+    )
+
+    exporter = ExportService(store, tmp_path)
+    path = exporter.export_session(session_id)
+
+    assert path.exists()
+    assert path.name.startswith("力传感器工程师_1_")
+    assert not any(ord(ch) < 32 for ch in path.name)
+    assert exporter.last_candidate_reports_dir.is_dir()
+    assert not any(
+        ord(ch) < 32 for ch in exporter.last_candidate_reports_dir.name
+    )
 
 
 def test_export_repairs_legacy_card_field_misalignment(tmp_path):

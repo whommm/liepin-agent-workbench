@@ -62,6 +62,10 @@ class AppConfig(BaseModel):
     llm_max_tokens: int = Field(default=4096, ge=1, le=8192)
     llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     backend_llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    # RPM 限流（实测 SenseNova deepseek-v4-flash 为 5 次/分钟，令牌桶容量 5）
+    llm_rpm_limit: int = Field(default=5, ge=1, le=600)
+    llm_rpm_burst: int = Field(default=5, ge=1, le=100)
+    llm_rpm_cooldown_seconds: float = Field(default=12.0, ge=0.0, le=300.0)
 
     # Agent 运行时参数
     match_queue_workers: int = Field(default=3, ge=1, le=20)
@@ -236,6 +240,12 @@ class ConfigManager:
             str(spec.get("model_name") or ""),
             int(spec.get("timeout") or 120),
             provider=str(spec.get("provider") or "openai"),
+            max_retries=self.config.llm_max_retries,
+            max_tokens=self.config.llm_max_tokens,
+            temperature=self.config.llm_temperature,
+            rpm_limit=self.config.llm_rpm_limit,
+            rpm_burst=self.config.llm_rpm_burst,
+            rpm_cooldown_seconds=self.config.llm_rpm_cooldown_seconds,
         )
         result = client.test_connection()
         result["profile"] = "backend" if profile == "backend" else "default"

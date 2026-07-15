@@ -265,6 +265,7 @@ def test_match_audit_fields_round_trip_and_cache_identity_is_conjunctive(tmp_pat
                 "evidence": "负责无刷电机研发",
                 "strength": "strong",
                 "source_type": "direct",
+                "grounding_status": "model_summary",
             }
         ],
         missing_or_unclear=["薪资待确认"],
