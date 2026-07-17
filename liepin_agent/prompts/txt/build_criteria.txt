@@ -5,7 +5,32 @@
   "search_direction": "一句话描述AI对本岗位寻访方向的理解，不是搜索关键词，是策略方向，用户可编辑修正",
   "target_companies": ["从JD或补充说明中提取的目标/对标公司名列表。如客户说'必须XX公司出身'或JD写'有XX公司背景优先'，则填入。无则留空数组"],
   "city_requirement": "从JD和补充说明中提取的城市/地点要求描述。如'必须base深圳'、'深圳/广州均可'、'接受远程'等。如果没有明确要求，写'无明确要求'",
-  "city_scope": ["从JD中提取的城市名列表，如深圳、广州、东莞。如果没有明确要求，留空数组"]
+  "city_scope": ["从JD中提取的城市名列表，必须是直辖市或地级市级别，如深圳、广州、东莞、杭州、金华。县级市/区要先映射到所属地级市：义乌→金华、昆山→苏州、晋江→泉州、顺德→佛山、慈溪→宁波。如果没有明确要求，留空数组"],
+  "criteria_items": [
+    {{
+      "type": "must/preferred/dealbreaker/verify",
+      "criterion": "单条、可独立判断的岗位要求",
+      "weight": 0.0,
+      "acceptable_alternatives": ["可接受的替代背景"],
+      "search_aliases": ["适合猎聘搜索的短词"],
+      "time_window_years": null,
+      "observability": "card/resume/conversation/background_check",
+      "evidence_policy": "什么简历事实才算满足",
+      "source_quote": "JD或补充说明中的依据原文",
+      "confidence": 0.0
+    }}
+  ],
+  "personas": [
+    {{
+      "name": "人才原型名称",
+      "description": "该类人才的背景描述",
+      "titles": ["可能的职位名称"],
+      "skills": ["核心技能或场景词"],
+      "company_patterns": ["目标公司或公司类型"],
+      "transfer_rationale": "为什么可直接匹配或可迁移",
+      "priority": 0.0
+    }}
+  ]
 }}
 
 要求：
@@ -15,6 +40,12 @@
 4. search_directions 是对岗位的理解方向，每方向一句话，给出不同切入角度（如收紧/放宽/跨行业）。
 5. target_companies 只在明确提到对标/目标公司时填写，不要凭空编造。
 6. city_requirement 必须准确反映 JD 中的地点要求。如果有多个城市，city_scope 填入所有城市名。
+7. 【猎聘城市筛选只支持直辖市和地级市】绝不能直接输出县级市、县、区名（如义乌、昆山、晋江、顺德、龙岗、宝安）。
+   发现这类地点时必须映射到所属地级市：义乌/东阳/永康/诸暨/慈溪/余姚/瑞安/乐清/桐乡/海宁 →所属地级市；昆山/张家港/常熟/太仓/江阴/宜兴 →苏州/无锡；晋江/石狮/南安 →泉州；顺德/南海 →佛山。
+   "浙江金华义乌"等带省市前缀的写法，取地级市那一层（金华），不要写到义乌。
+8. criteria_items 拆成 3-10 条可独立判断的条件。不要把所有要求塞进一条。must 只用于真正硬门槛；信息不足时应允许 unknown。
+9. observability 必须按实际可观察渠道填写。客户资源、出差意愿、离职动机等不能要求简历必须写，应该标为 conversation；学历真实性等需要背调的标为 background_check。
+10. personas 输出 2-5 类：至少包含直接对口和相邻可迁移，避免所有搜索只围绕一个人才画像。
 
 【JD】
 {jd}

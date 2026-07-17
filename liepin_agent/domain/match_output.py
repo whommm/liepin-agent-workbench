@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-Tier = Literal["A", "B", "C", "D"]
 Confidence = Literal["high", "medium", "low"]
 EvidenceStrength = Literal["strong", "medium", "weak"]
 EvidenceSource = Literal["direct", "inferred"]
 EvidenceGrounding = Literal["exact", "model_summary"]
+CriterionVerdict = Literal["met", "not_met", "unknown", "inferred"]
 
 
 class MatchEvidence(BaseModel):
@@ -25,6 +24,7 @@ class MatchEvidence(BaseModel):
     evidence: str = Field(min_length=1)
     strength: EvidenceStrength = "medium"
     source_type: EvidenceSource = "direct"
+    verdict: Optional[CriterionVerdict] = None
     grounding_status: Optional[EvidenceGrounding] = None
 
     @model_validator(mode="before")
@@ -91,6 +91,43 @@ class MatchEvidence(BaseModel):
             raise ValueError("evidence source_type must be direct/inferred")
         return aliases[normalized]
 
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def normalize_verdict(cls, value: Any) -> Any:
+        if value in (None, ""):
+            return None
+        normalized = str(value).strip().lower()
+        aliases = {
+            "met": "met",
+            "satisfied": "met",
+            "pass": "met",
+            "yes": "met",
+            "满足": "met",
+            "符合": "met",
+            "直接满足": "met",
+            "not_met": "not_met",
+            "unmet": "not_met",
+            "failed": "not_met",
+            "no": "not_met",
+            "不满足": "not_met",
+            "不符合": "not_met",
+            "违反": "not_met",
+            "冲突": "not_met",
+            "unknown": "unknown",
+            "unclear": "unknown",
+            "na": "unknown",
+            "n/a": "unknown",
+            "未知": "unknown",
+            "无法确认": "unknown",
+            "不确定": "unknown",
+            "inferred": "inferred",
+            "推断": "inferred",
+            "推断满足": "inferred",
+        }
+        if normalized not in aliases:
+            raise ValueError("evidence verdict must be met/not_met/unknown/inferred")
+        return aliases[normalized]
+
 
 class MatchOutput(BaseModel):
     """The sole accepted structured response from the matching model.
@@ -102,7 +139,9 @@ class MatchOutput(BaseModel):
 
     model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
-    tier: Tier
+    # Accepted only so cached responses using the retired contract still parse.
+    # It is discarded before validation and never reaches business decisions.
+    tier: str = Field(default="", exclude=True)
     summary: str = Field(min_length=1)
     core_met_count: int = Field(default=0, ge=0)
     core_total: int = Field(default=0, ge=0)
@@ -122,6 +161,7 @@ class MatchOutput(BaseModel):
         if not isinstance(value, dict):
             return value
         data = dict(value)
+        data.pop("tier", None)
 
         if "matched_evidence" not in data:
             data["matched_evidence"] = data.get("evidence")
@@ -151,6 +191,8 @@ class MatchOutput(BaseModel):
             if evidence_keys.intersection(value):
                 item = dict(value)
                 item["source_type"] = source_type
+                if source_type == "inferred":
+                    item.setdefault("verdict", "inferred")
                 return [item]
             return [
                 {
@@ -170,19 +212,12 @@ class MatchOutput(BaseModel):
             elif isinstance(item, dict):
                 entry = dict(item)
                 entry["source_type"] = source_type
+                if source_type == "inferred":
+                    entry.setdefault("verdict", "inferred")
                 normalized.append(entry)
             else:
                 normalized.append(item)
         return normalized
-
-    @field_validator("tier", mode="before")
-    @classmethod
-    def normalize_tier(cls, value: Any) -> Any:
-        text = str(value or "").strip().upper()
-        match = re.fullmatch(r"(?:TIER\s*[:：-]?\s*)?([ABCD])(?:档|级)?", text)
-        if not match:
-            raise ValueError("tier must be exactly A, B, C or D")
-        return match.group(1)
 
     @field_validator("dealbreaker_hit", mode="before")
     @classmethod
@@ -256,16 +291,6 @@ class MatchOutput(BaseModel):
     def validate_business_evidence(self) -> "MatchOutput":
         if self.core_met_count > self.core_total:
             raise ValueError("core_met_count cannot exceed core_total")
-        if self.tier in {"A", "B"} and not self.matched_evidence:
-            raise ValueError("A/B results require direct resume evidence")
-        if self.dealbreaker_hit and self.tier in {"A", "B"}:
-            raise ValueError("dealbreaker results cannot receive A/B tier")
-        if self.core_total > 0:
-            coverage = self.core_met_count / self.core_total
-            if self.tier == "A" and coverage < 0.8:
-                raise ValueError("A tier requires at least 80% core coverage")
-            if self.tier == "B" and coverage < 0.5:
-                raise ValueError("B tier requires at least 50% core coverage")
         return self
 
     def evidence_for_match_result(self) -> List[Dict[str, Any]]:
@@ -281,16 +306,21 @@ class MatchOutput(BaseModel):
 
     def deterministic_score(self) -> int:
         """Return a stable evidence score; it is a ranking aid, not a hiring verdict."""
+        scored_evidence = [
+            item
+            for item in self.matched_evidence
+            if item.verdict not in ("not_met", "unknown")
+        ]
         if self.core_total > 0:
             coverage = self.core_met_count / self.core_total
         else:
-            coverage = min(1.0, len(self.matched_evidence) / 2)
+            coverage = min(1.0, len(scored_evidence) / 2)
 
         strength_weight = {"strong": 1.0, "medium": 0.7, "weak": 0.4}
         evidence_quality = (
-            sum(strength_weight[item.strength] for item in self.matched_evidence)
-            / len(self.matched_evidence)
-            if self.matched_evidence
+            sum(strength_weight[item.strength] for item in scored_evidence)
+            / len(scored_evidence)
+            if scored_evidence
             else 0.0
         )
         confidence_weight = {"high": 1.0, "medium": 0.9, "low": 0.75}

@@ -2,20 +2,37 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from .schemas import ConfigUpdateRequest, CriteriaConfirmRequest, PoolReorderRequest, SessionCreateRequest
+from .schemas import (
+    CandidateFeedbackRequest,
+    CandidateOutcomeRequest,
+    ConfigUpdateRequest,
+    CriteriaConfirmRequest,
+    JobProfileUpdateRequest,
+    PoolReorderRequest,
+    RankingFeedbackRequest,
+    SearchHypothesisUpdateRequest,
+    SessionCreateRequest,
+)
 from .service import ApiError, WorkbenchService
-
-_service: WorkbenchService | None = None
 
 
 def create_app(workspace_root: str | None = None) -> FastAPI:
-    global _service
-    _service = WorkbenchService(workspace_root)
-    app = FastAPI(title="Liepin Agent Workbench API")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        service_instance = WorkbenchService(workspace_root)
+        app.state.service = service_instance
+        try:
+            yield
+        finally:
+            service_instance.close()
+
+    app = FastAPI(title="Liepin Agent Workbench API", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -39,8 +56,7 @@ def create_app(workspace_root: str | None = None) -> FastAPI:
         )
 
     def service() -> WorkbenchService:
-        assert _service is not None
-        return _service
+        return app.state.service
 
     @app.get("/health")
     def health(svc: WorkbenchService = Depends(service)):
@@ -63,20 +79,116 @@ def create_app(workspace_root: str | None = None) -> FastAPI:
         return svc.delete_session(session_id)
 
     @app.get("/sessions/{session_id}/candidates")
-    def list_candidates(session_id: str, svc: WorkbenchService = Depends(service)):
-        return svc.list_candidates(session_id)
+    def list_candidates(
+        session_id: str,
+        detail_only: bool = True,
+        svc: WorkbenchService = Depends(service),
+    ):
+        return svc.list_candidates(session_id, detail_only=detail_only)
 
     @app.get("/candidates/{candidate_id}")
     def get_candidate(candidate_id: str, svc: WorkbenchService = Depends(service)):
         return svc.get_candidate(candidate_id)
 
+    @app.get("/candidates/{candidate_id}/feedback")
+    def list_candidate_feedback(candidate_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.list_candidate_feedback(candidate_id)
+
+    @app.get("/candidates/{candidate_id}/facts")
+    def get_candidate_facts(candidate_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.get_candidate_facts(candidate_id)
+
+    @app.get("/candidates/{candidate_id}/evaluations")
+    def get_candidate_evaluations(candidate_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.get_candidate_evaluations(candidate_id)
+
+    @app.post("/candidates/{candidate_id}/reevaluate")
+    def reevaluate_candidate(candidate_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.reevaluate_candidate(candidate_id)
+
+    @app.post("/candidates/{candidate_id}/feedback")
+    def save_candidate_feedback(
+        candidate_id: str,
+        payload: CandidateFeedbackRequest,
+        svc: WorkbenchService = Depends(service),
+    ):
+        return svc.save_candidate_feedback(candidate_id, payload)
+
+    @app.get("/candidates/{candidate_id}/outcomes")
+    def list_candidate_outcomes(candidate_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.list_candidate_outcomes(candidate_id)
+
+    @app.post("/candidates/{candidate_id}/outcomes")
+    def save_candidate_outcome(
+        candidate_id: str,
+        payload: CandidateOutcomeRequest,
+        svc: WorkbenchService = Depends(service),
+    ):
+        return svc.save_candidate_outcome(candidate_id, payload)
+
     @app.get("/sessions/{session_id}/events")
     def list_events(session_id: str, svc: WorkbenchService = Depends(service)):
         return svc.list_events(session_id)
 
+    @app.get("/sessions/{session_id}/feedback-summary")
+    def feedback_summary(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.feedback_summary(session_id)
+
+    @app.post("/sessions/{session_id}/ranking-feedback")
+    def save_ranking_feedback(
+        session_id: str,
+        payload: RankingFeedbackRequest,
+        svc: WorkbenchService = Depends(service),
+    ):
+        return svc.save_ranking_feedback(session_id, payload)
+
+    @app.post("/sessions/{session_id}/reevaluate")
+    def reevaluate_session(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.reevaluate_session(session_id)
+
+    @app.get("/sessions/{session_id}/search-coverage")
+    def get_search_coverage(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.get_search_coverage(session_id)
+
+    @app.get("/sessions/{session_id}/ranking")
+    def get_ranking(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.get_ranking(session_id)
+
+    @app.post("/sessions/{session_id}/ranking/refresh")
+    def refresh_ranking(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.refresh_ranking(session_id)
+
+    @app.get("/sessions/{session_id}/quality-dashboard")
+    def quality_dashboard(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.quality_dashboard(session_id)
+
+    @app.get("/analytics/model-quality")
+    def model_quality(svc: WorkbenchService = Depends(service)):
+        return svc.model_quality()
+
+    @app.patch("/search-hypotheses/{hypothesis_id}")
+    def update_search_hypothesis(
+        hypothesis_id: str,
+        payload: SearchHypothesisUpdateRequest,
+        svc: WorkbenchService = Depends(service),
+    ):
+        return svc.update_search_hypothesis(hypothesis_id, payload)
+
     @app.get("/sessions/{session_id}/criteria")
     def get_criteria(session_id: str, svc: WorkbenchService = Depends(service)):
         return svc.get_criteria(session_id)
+
+    @app.get("/sessions/{session_id}/job-profile")
+    def get_job_profile(session_id: str, svc: WorkbenchService = Depends(service)):
+        return svc.get_job_profile(session_id)
+
+    @app.put("/sessions/{session_id}/job-profile")
+    def update_job_profile(
+        session_id: str,
+        payload: JobProfileUpdateRequest,
+        svc: WorkbenchService = Depends(service),
+    ):
+        return svc.update_job_profile(session_id, payload)
 
     @app.post("/sessions/{session_id}/criteria/draft")
     def generate_criteria_draft(session_id: str, svc: WorkbenchService = Depends(service)):

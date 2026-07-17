@@ -24,6 +24,7 @@ class LiepinSearchCandidate:
 
     name: str = ""
     age: str = ""
+    gender: str = ""
     current_title: str = ""
     current_company: str = ""
     city: str = ""

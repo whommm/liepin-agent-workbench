@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import zipfile
 from pathlib import Path
@@ -12,6 +13,14 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Font, PatternFill
 
+from ..domain.recommendation import (
+    EXPLICIT_MISMATCH,
+    HIGH_POTENTIAL_VERIFY,
+    INFORMATION_INSUFFICIENT,
+    PRIORITY_CONTACT,
+    TRANSFERABLE_EXPLORE,
+    recommendation_label,
+)
 from ..storage.sqlite_store import SQLiteStore, from_json, now_text
 
 
@@ -92,8 +101,16 @@ class ExportService:
         "来源",
         "卡片判断",
         "详情状态",
-        "匹配档位",
-        "证据分",
+        "建议状态",
+        "已知适配度",
+        "潜在上界",
+        "证据覆盖度",
+        "明确冲突数",
+        "综合排序分",
+        "校准概率",
+        "人工判断",
+        "人工原因",
+        "业务结果",
         "打招呼状态",
         "打招呼消息",
         "打招呼错误",
@@ -111,8 +128,15 @@ class ExportService:
 
     OVERVIEW_HEADERS = [
         "结论",
-        "档位",
-        "证据分",
+        "建议状态",
+        "已知适配度",
+        "潜在上界",
+        "证据覆盖度",
+        "明确冲突数",
+        "综合排序分",
+        "校准概率",
+        "人工判断",
+        "业务结果",
         "姓名",
         "公司",
         "职位",
@@ -155,16 +179,24 @@ class ExportService:
         workbook.active.title = "推荐总览"
         self._write_overview_sheet(workbook.active, candidates)
         self._write_overview_sheet(
-            workbook.create_sheet("合格A_B"),
-            [item for item in candidates if item["is_qualified"]],
+            workbook.create_sheet("优先沟通"),
+            [item for item in candidates if item["recommendation_state"] == PRIORITY_CONTACT],
         )
         self._write_overview_sheet(
-            workbook.create_sheet("待复核_未匹配"),
-            [item for item in candidates if item["is_unmatched"]],
+            workbook.create_sheet("高潜待确认"),
+            [item for item in candidates if item["recommendation_state"] == HIGH_POTENTIAL_VERIFY],
         )
         self._write_overview_sheet(
-            workbook.create_sheet("不合格C"),
-            [item for item in candidates if item["is_rejected"]],
+            workbook.create_sheet("可迁移探索"),
+            [item for item in candidates if item["recommendation_state"] == TRANSFERABLE_EXPLORE],
+        )
+        self._write_overview_sheet(
+            workbook.create_sheet("信息不足"),
+            [item for item in candidates if item["recommendation_state"] == INFORMATION_INSUFFICIENT],
+        )
+        self._write_overview_sheet(
+            workbook.create_sheet("明确不匹配"),
+            [item for item in candidates if item["recommendation_state"] == EXPLICIT_MISMATCH],
         )
         self._write_candidate_sheet(workbook.create_sheet("候选人"), candidates)
         self._write_criteria_sheet(workbook, session_id)
@@ -187,7 +219,25 @@ class ExportService:
                 for evidence_item in (item.get("matched_evidence") or [])
                 if isinstance(evidence_item, dict)
             ]
-            tier = str(item.get("match_tier") or "").upper()
+            recommendation_state = self._recommendation_state(item)
+            outcomes = self.store.list_candidate_outcomes(candidate_id)
+            evaluations = self.store.list_criterion_evaluations(candidate_id)
+            verification_questions = list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(question)
+                            for question in (item.get("questions_to_verify") or [])
+                            if str(question)
+                        ],
+                        *[
+                            str(evaluation.get("verification_question") or "")
+                            for evaluation in evaluations
+                            if str(evaluation.get("verification_question") or "")
+                        ],
+                    ]
+                )
+            )
             row = {
                 "item": item,
                 "detail": detail,
@@ -198,13 +248,19 @@ class ExportService:
                 "source_text": self._source_text(sources),
                 "evidence_text": self._evidence_text(evidence),
                 "missing_text": "\n".join(item.get("missing_or_unclear") or []),
-                "questions_text": "\n".join(item.get("questions_to_verify") or []),
+                "questions_text": "\n".join(verification_questions),
                 "conclusion": self._candidate_conclusion(item),
-                "tier": tier,
-                "is_qualified": tier in {"A", "B"},
-                "is_rejected": tier in {"C", "D"},
-                "is_unmatched": tier not in {"A", "B", "C", "D"},
+                "recommendation_state": recommendation_state,
                 "report_path": None,
+                "outcomes_text": "\n".join(
+                    "{} {} {}".format(
+                        outcome.get("occurred_at") or "",
+                        outcome.get("outcome") or "",
+                        outcome.get("note") or "",
+                    ).strip()
+                    for outcome in outcomes
+                ),
+                "evaluations": evaluations,
             }
             rows.append(row)
         return sorted(rows, key=self._export_sort_key)
@@ -219,8 +275,15 @@ class ExportService:
             sheet.append(
                 [
                     row["conclusion"],
-                    row["tier"],
-                    item.get("match_score") or 0,
+                    recommendation_label(row["recommendation_state"]),
+                    item.get("known_fit_score") or 0,
+                    item.get("potential_fit_score") or 0,
+                    item.get("evidence_coverage_score") or 0,
+                    item.get("conflict_count") or 0,
+                    item.get("rank_score") or 0,
+                    item.get("calibrated_probability"),
+                    self._feedback_label(item.get("feedback_label") or ""),
+                    row["outcomes_text"],
                     fields.get("name") or "",
                     fields.get("current_company") or "",
                     fields.get("current_title") or "",
@@ -267,8 +330,16 @@ class ExportService:
                     row["source_text"],
                     self._card_decision_label(item.get("card_decision") or ""),
                     item.get("detail_capture_status") or "",
-                    item.get("match_tier") or "",
-                    item.get("match_score") or 0,
+                    recommendation_label(row["recommendation_state"]),
+                    item.get("known_fit_score") or 0,
+                    item.get("potential_fit_score") or 0,
+                    item.get("evidence_coverage_score") or 0,
+                    item.get("conflict_count") or 0,
+                    item.get("rank_score") or 0,
+                    item.get("calibrated_probability"),
+                    self._feedback_label(item.get("feedback_label") or ""),
+                    "、".join(item.get("feedback_reason_codes") or []),
+                    row["outcomes_text"],
                     self._greeting_status_label(item.get("greeting_status") or ""),
                     item.get("greeting_message") or "",
                     item.get("greeting_error") or "",
@@ -365,9 +436,9 @@ class ExportService:
         fields = row["fields"]
         item = row["item"]
         name = fields.get("name") or "候选人"
-        title = fields.get("current_title") or item.get("match_tier") or "档案"
-        tier = row["tier"] or "未匹配"
-        filename = "{:02d}_{}_{}_{}.docx".format(index, tier, name, title)
+        title = fields.get("current_title") or "候选人档案"
+        state = recommendation_label(row["recommendation_state"])
+        filename = "{:02d}_{}_{}_{}.docx".format(index, state, name, title)
         return self._safe_filename(filename[:-5]) + ".docx"
 
     def _write_candidate_docx(
@@ -395,7 +466,16 @@ class ExportService:
         )
         lines.append(("title", title))
         paragraph("任务", session.get("title") or "")
-        paragraph("结论", "{} {}".format(row["conclusion"], row["tier"]).strip())
+        paragraph("结论", row["conclusion"])
+        paragraph(
+            "适配区间",
+            "已知适配 {} / 潜在上界 {} / 证据覆盖 {} / 明确冲突 {}".format(
+                item.get("known_fit_score") or 0,
+                item.get("potential_fit_score") or 0,
+                item.get("evidence_coverage_score") or 0,
+                item.get("conflict_count") or 0,
+            ),
+        )
         paragraph(
             "基本信息",
             "{} | {} | {} | {} | 金领：{}".format(
@@ -410,7 +490,7 @@ class ExportService:
         paragraph("候选人ID", item.get("id") or "")
 
         heading("匹配结论")
-        paragraph("匹配档位", row["tier"] or "未匹配")
+        paragraph("建议状态", recommendation_label(row["recommendation_state"]))
         paragraph("置信度", item.get("confidence") or "")
         paragraph("摘要", item.get("match_summary") or fields.get("summary_text") or "")
         paragraph("风险", item.get("match_risks") or "")
@@ -538,24 +618,27 @@ class ExportService:
 
     @classmethod
     def _candidate_conclusion(cls, item: Dict[str, Any]) -> str:
-        tier = str(item.get("match_tier") or "").upper()
-        if tier == "A":
-            return "强推荐"
-        if tier == "B":
-            return "可推荐"
-        if tier in {"C", "D"}:
-            return "不推荐"
-        if item.get("detail_capture_status"):
-            return "待复核"
-        return "未抓详情"
+        return recommendation_label(cls._recommendation_state(item))
+
+    @staticmethod
+    def _recommendation_state(item: Dict[str, Any]) -> str:
+        state = str(item.get("recommendation_state") or "")
+        if state:
+            return state
+        return INFORMATION_INSUFFICIENT
 
     @classmethod
     def _export_sort_key(cls, row: Dict[str, Any]) -> tuple[int, int, str]:
-        tier = row["tier"]
-        tier_order = {"A": 0, "B": 1, "C": 3}.get(tier, 2)
-        score = int(row["item"].get("match_score") or 0)
+        state_order = {
+            PRIORITY_CONTACT: 0,
+            HIGH_POTENTIAL_VERIFY: 1,
+            TRANSFERABLE_EXPLORE: 2,
+            INFORMATION_INSUFFICIENT: 3,
+            EXPLICIT_MISMATCH: 4,
+        }
+        score = int(row["item"].get("rank_score") or 0)
         name = str(row["fields"].get("name") or "")
-        return tier_order, -score, name
+        return state_order.get(row.get("recommendation_state"), 3), -score, name
 
     @staticmethod
     def _report_display_name(row: Dict[str, Any]) -> str:
@@ -750,6 +833,19 @@ class ExportService:
         sheet.append(["版本", criteria.get("version") or ""])
         sheet.append(["关键词", criteria.get("keywords_text") or ""])
         sheet.append(["岗位要求", criteria.get("requirements_text") or ""])
+        sheet.append([])
+        sheet.append(["类型", "条件", "权重", "证据渠道", "替代条件", "核实规则"])
+        for item in criteria.get("criteria_items") or []:
+            sheet.append(
+                [
+                    item.get("criterion_type") or "",
+                    item.get("criterion_text") or "",
+                    item.get("weight") or 0,
+                    item.get("observability") or "resume",
+                    "、".join(item.get("alternatives") or []),
+                    item.get("evidence_policy") or "",
+                ]
+            )
         sheet.column_dimensions["A"].width = 16
         sheet.column_dimensions["B"].width = 80
 
@@ -757,9 +853,11 @@ class ExportService:
         sheet = workbook.create_sheet("效率总结")
         metrics = self.store.session_efficiency_metrics(session_id)
         for key, value in metrics.items():
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True)
             sheet.append([key, value])
         sheet.append([])
-        sheet.append(["搜索假设", "描述", "轮次", "读卡片", "去重候选", "抓详情", "A/B", "噪音", "重复"])
+        sheet.append(["搜索假设", "描述", "轮次", "读卡片", "去重候选", "抓详情", "有效候选", "噪音", "重复"])
         for item in self.store.search_hypothesis_metrics(session_id):
             sheet.append(
                 [
@@ -769,7 +867,7 @@ class ExportService:
                     item.get("raw_count") or 0,
                     item.get("unique_count") or 0,
                     item.get("detail_fetch_count") or 0,
-                    item.get("ab_count") or 0,
+                    item.get("relevant_count") or 0,
                     item.get("noise_count") or 0,
                     item.get("duplicate_count") or 0,
                 ]
@@ -801,10 +899,6 @@ class ExportService:
         sheet.append(["匹配状态", "数量"])
         for key, value in (summary.get("match_status_counts") or {}).items():
             sheet.append([key, value])
-        sheet.append([])
-        sheet.append(["匹配档位", "数量"])
-        for key, value in (summary.get("tier_counts") or {}).items():
-            sheet.append([key or "未定档", value])
         sheet.append([])
         sheet.append(["最近错误", "消息", "时间"])
         for item in summary.get("recent_errors") or []:
@@ -844,3 +938,11 @@ class ExportService:
             "failed": "失败",
             "pending": "待处理",
         }.get(str(value or ""), "")
+
+    @staticmethod
+    def _feedback_label(value: object) -> str:
+        return {
+            "recommended": "推荐",
+            "uncertain": "待确认",
+            "not_suitable": "不合适",
+        }.get(str(value or "").strip().lower(), "")

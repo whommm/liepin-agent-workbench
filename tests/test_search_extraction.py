@@ -39,6 +39,7 @@ class _TestableExtractionMixin(_ExtractionMixin):
     _PERSONAL_TAGS = (
         "男", "女", "已婚", "未婚", "共青团员", "党员", "群众", "预备党员", "民主党派",
     )
+    _GENDER_TOKEN_PATTERN = re.compile(r"(?<![一-鿿A-Za-z])(男|女)(?![一-鿿A-Za-z])")
     _INVALID_CITY_WORDS = (
         "工作", "经验", "求职", "期望", "求职期望", "不限", "统招", "全日制",
         "MBA/EMBA", "EMBA", "MBA",
@@ -65,7 +66,7 @@ class TestExtractionMixin:
             "本科 | 8年经验",
             "北京",
         ]
-        cleaned, name, age, title, company, city, work_years, education = mixin._clean_candidate_lines(lines)
+        cleaned, name, age, title, company, city, work_years, education, gender = mixin._clean_candidate_lines(lines)
         assert name == "张三"
         assert age == "32岁"
         assert education == "本科"
@@ -80,7 +81,7 @@ class TestExtractionMixin:
             "立即沟通",
             "32岁",
         ]
-        cleaned, name, age, title, company, city, work_years, education = mixin._clean_candidate_lines(lines)
+        cleaned, name, age, title, company, city, work_years, education, gender = mixin._clean_candidate_lines(lines)
         assert name == "张三"
         assert "在线" not in cleaned
         assert "立即沟通" not in cleaned

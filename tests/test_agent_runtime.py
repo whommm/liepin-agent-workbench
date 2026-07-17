@@ -33,7 +33,7 @@ class FakeLiepinTool:
                 summary_text="{} IP衍生品 量产 供应链".format(" ".join(terms)),
                 result_index=index,
             )
-            for index in range(8)
+            for index in range(4)
         ]
 
     def fetch_candidate_detail(self, candidate):
@@ -55,6 +55,7 @@ def test_agent_runtime_completes_demo_session(tmp_path):
         title="文创产品经理",
         jd_text="岗位名称：文创产品经理\n深圳，本科，5年以上，负责文创、潮玩、IP衍生品、量产和供应链协同。",
         user_notes="不要纯内容运营，优先从0到1产品经验。",
+        mode="自动",
         max_rounds=2,
         max_detail_fetches=10,
         target_ab_count=4,

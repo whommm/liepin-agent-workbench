@@ -24,27 +24,11 @@ class RuleBasedMatchService:
         negative_hits = [term for term in negative_terms if term in (resume_text or "")]
         core_total = max(1, min(5, len(core_terms) or 5))
         core_met = min(core_total, len(core_hits))
-        if negative_hits:
-            tier = "D"
-        elif core_met >= 4:
-            tier = "A"
-        elif core_met >= 2:
-            tier = "B"
-        elif core_met == 1:
-            tier = "C"
-        else:
-            tier = "D"
         summary = "命中核心词：{}".format("、".join(core_hits[:5]) if core_hits else "未明显命中")
         risks = "命中排除词：{}".format("、".join(negative_hits)) if negative_hits else ""
-        recommendation = {
-            "A": "优先推进",
-            "B": "建议沟通",
-            "C": "备选观察",
-            "D": "暂不推荐",
-        }.get(tier, "待判断")
+        recommendation = "结合逐条件证据评估决定后续动作"
         detail = "\n".join(
             [
-                "匹配档位：{}".format(tier),
                 "核心命中：{}/{}".format(core_met, core_total),
                 summary,
                 "风险：{}".format(risks or "未见明显硬伤"),
@@ -55,7 +39,7 @@ class RuleBasedMatchService:
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier=tier,
+            tier="",
             core_met_count=core_met,
             core_total=core_total,
             dealbreaker_hit=bool(negative_hits),

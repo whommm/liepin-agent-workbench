@@ -18,6 +18,7 @@ class SearchPlan:
     risk: str = ""
     search_hypothesis_type: str = "core_background"
     search_hypothesis_text: str = ""
+    search_hypothesis_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -31,6 +32,7 @@ class SearchPlan:
             "risk": self.risk,
             "search_hypothesis_type": self.search_hypothesis_type,
             "search_hypothesis_text": self.search_hypothesis_text,
+            "search_hypothesis_id": self.search_hypothesis_id,
         }
 
 

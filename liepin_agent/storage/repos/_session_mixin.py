@@ -87,24 +87,7 @@ class _SessionMixin:
                 """
                 SELECT s.*,
                        COALESCE((SELECT COUNT(*) FROM candidate_summaries c WHERE c.session_id = s.id), 0) AS candidate_count,
-                       COALESCE((SELECT COUNT(DISTINCT d.candidate_id) FROM candidate_details d JOIN candidate_summaries c ON c.id = d.candidate_id WHERE c.session_id = s.id AND d.capture_status = 'success'), 0) AS detail_count,
-                       COALESCE((
-                           SELECT COUNT(*) FROM match_results m
-                           WHERE m.session_id = s.id
-                             AND m.status = 'completed'
-                             AND UPPER(COALESCE(m.tier, '')) IN ('A', 'B')
-                             AND m.criteria_version_id = COALESCE((
-                                 SELECT cv.id FROM match_criteria_versions cv
-                                 WHERE cv.session_id = s.id AND cv.status = 'confirmed'
-                                 ORDER BY cv.version DESC LIMIT 1
-                             ), '')
-                             AND m.id = (
-                                 SELECT m2.id FROM match_results m2
-                                 WHERE m2.candidate_id = m.candidate_id
-                                   AND m2.criteria_version_id = m.criteria_version_id
-                                 ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
-                             )
-                       ), 0) AS ab_count
+                       COALESCE((SELECT COUNT(DISTINCT d.candidate_id) FROM candidate_details d JOIN candidate_summaries c ON c.id = d.candidate_id WHERE c.session_id = s.id AND d.capture_status = 'success'), 0) AS detail_count
                 FROM search_sessions s
                 ORDER BY s.updated_at DESC, s.created_at DESC
                 """

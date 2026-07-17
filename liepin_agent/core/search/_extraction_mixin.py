@@ -59,7 +59,7 @@ class _ExtractionMixin:
                 continue
 
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            cleaned, name, age, title, company, city, work_years, education = (
+            cleaned, name, age, title, company, city, work_years, education, gender = (
                 self._clean_candidate_lines(lines)
             )
             if not name:
@@ -71,6 +71,7 @@ class _ExtractionMixin:
             candidate = LiepinSearchCandidate(
                 name=name,
                 age=age,
+                gender=gender,
                 current_title=title,
                 current_company=company,
                 city=city,
@@ -282,7 +283,7 @@ class _ExtractionMixin:
             lines = row.get("lines") or []
             if not lines:
                 continue
-            cleaned, name, age, title, company, city, work_years, education = (
+            cleaned, name, age, title, company, city, work_years, education, gender = (
                 self._clean_candidate_lines(lines)
             )
             if not name:
@@ -295,6 +296,7 @@ class _ExtractionMixin:
                 LiepinSearchCandidate(
                     name=name,
                     age=age,
+                    gender=gender,
                     current_title=title,
                     current_company=company,
                     city=city,
@@ -334,7 +336,8 @@ class _ExtractionMixin:
     def _clean_candidate_lines(self, lines: List[str]) -> tuple:
         """Remove UI noise and extract structured fields from result-card text.
 
-        Returns (cleaned_lines, name, age, title, company, city, work_years, education).
+        Returns (cleaned_lines, name, age, title, company, city, work_years,
+        education, gender).
         """
         cleaned = []
         for line in lines:
@@ -348,7 +351,7 @@ class _ExtractionMixin:
             cleaned.append(line)
 
         if not cleaned:
-            return [], "", "", "", "", "", "", ""
+            return [], "", "", "", "", "", "", "", ""
 
         name = cleaned[0]
         age = ""
@@ -359,6 +362,13 @@ class _ExtractionMixin:
         company = ""
 
         full_text = " ".join(cleaned)
+
+        gender = ""
+        for line in cleaned:
+            m = self._GENDER_TOKEN_PATTERN.search(line)
+            if m:
+                gender = m.group(1)
+                break
 
         # Extract age / education / work_years globally
         m = self._AGE_PATTERN.search(full_text)
@@ -480,7 +490,7 @@ class _ExtractionMixin:
                     title = line.strip()
                     break
 
-        return cleaned, name, age, title, company, city, work_years, education
+        return cleaned, name, age, title, company, city, work_years, education, gender
 
 
     def _split_company_title(self, line: str) -> tuple[str, str]:

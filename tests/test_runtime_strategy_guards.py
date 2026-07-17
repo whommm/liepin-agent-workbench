@@ -82,15 +82,14 @@ class _CountingMatcher:
                 "resume_text": resume_text,
             }
         )
-        tier = self.tiers.get(candidate_id, "B")
         return MatchResult(
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier=tier,
+            tier="",
             status="completed",
             criteria_version_id=str(criteria.get("criteria_version_id") or ""),
-            summary=f"{tier} 档测试结果",
+            summary="证据测试结果",
             matched_evidence=[{"evidence": "测试证据"}],
         )
 
@@ -433,13 +432,11 @@ class _DigestBrain:
         return RoundReview(action="stop", summary="单轮 digest 回归完成")
 
 
-def test_round_digest_persists_strategy_funnel_and_full_tier_distribution(tmp_path):
+def test_round_digest_persists_strategy_funnel_and_recommendation_distribution(tmp_path):
     store = SQLiteStore(str(tmp_path / "runtime.db"))
     session_id, _criteria_id = _create_confirmed_session(store, max_rounds=1)
     tool = _DigestTool()
-    matcher = _CountingMatcher(
-        {"candidate-a": "A", "candidate-b": "B", "candidate-c": "C"}
-    )
+    matcher = _CountingMatcher()
     runtime = _runtime(store, tool, matcher, brain=_DigestBrain())
 
     runtime.run_session(session_id)
@@ -464,10 +461,12 @@ def test_round_digest_persists_strategy_funnel_and_full_tier_distribution(tmp_pa
     assert digest["duplicate_rate"] == 0.25
     assert digest["matched_count"] == 3
     assert digest["pending_match_count"] == 0
-    assert digest["tier_counts"] == {"A": 1, "B": 1, "C": 1, "D": 0}
-    assert digest["a_count"] == 1
-    assert digest["b_count"] == 1
-    assert digest["ab_count"] == 2
+    assert digest["recommendation_state_counts"] == {
+        "information_insufficient": 3
+    }
+    assert digest["viable_count"] == 0
+    assert digest["effective_pool_score"] == 0
+    assert "tier_counts" not in digest
     assert digest["needs_review_count"] == 0
     assert digest["failed_count"] == 0
     assert digest["conclusion"] == "单轮 digest 回归完成"

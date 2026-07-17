@@ -16,6 +16,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from openpyxl import load_workbook
 
+from ..domain.greeting_policy import (
+    GREETING_SELECTABLE_STATES,
+    normalize_greeting_states,
+    parse_recommendation_state,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -24,7 +30,7 @@ class ExcelGreetingCandidate:
     row_index: int
     name: str
     profile_url: str
-    tier: str
+    recommendation_state: str
     is_gold_collar: bool
     greeting_status: str = ""
     contact_text: str = ""
@@ -53,19 +59,27 @@ class ExcelGreetingService:
         return self._stop_event.is_set()
 
     @classmethod
-    def load_greetable_candidates(cls, excel_path: str | Path, gold_only: bool = True) -> List[ExcelGreetingCandidate]:
+    def load_greetable_candidates(
+        cls,
+        excel_path: str | Path,
+        gold_only: bool = True,
+        recommendation_states: Optional[List[str] | tuple[str, ...]] = None,
+    ) -> List[ExcelGreetingCandidate]:
         workbook = load_workbook(excel_path)
         try:
             sheet = workbook["候选人"] if "候选人" in workbook.sheetnames else workbook.active
             headers = cls._header_map(sheet)
-            required = ["姓名", "匹配档位", "金领", "简历链接", "打招呼状态"]
+            required = ["姓名", "建议状态", "金领", "简历链接", "打招呼状态"]
             missing = [header for header in required if header not in headers]
             if missing:
                 raise ValueError("Excel 缺少必要列：{}".format("、".join(missing)))
             result: List[ExcelGreetingCandidate] = []
+            selected_states = set(normalize_greeting_states(recommendation_states))
             for row_index in range(2, sheet.max_row + 1):
-                tier = cls._cell_text(sheet, row_index, headers, "匹配档位").upper()
-                if tier not in {"A", "B"}:
+                recommendation_state = parse_recommendation_state(
+                    cls._cell_text(sheet, row_index, headers, "建议状态")
+                )
+                if recommendation_state not in selected_states:
                     continue
                 if gold_only and not cls._is_yes(cls._cell_text(sheet, row_index, headers, "金领")):
                     continue
@@ -85,7 +99,7 @@ class ExcelGreetingService:
                         row_index=row_index,
                         name=cls._cell_text(sheet, row_index, headers, "姓名") or "候选人",
                         profile_url=profile_url,
-                        tier=tier,
+                        recommendation_state=recommendation_state,
                         is_gold_collar=cls._is_yes(cls._cell_text(sheet, row_index, headers, "金领")),
                         greeting_status=greeting_status,
                         contact_text=contact_text,
@@ -109,10 +123,23 @@ class ExcelGreetingService:
         gold_only: bool = True,
         max_retries: int = 1,
         max_candidates: int = 0,
+        recommendation_states: Optional[List[str] | tuple[str, ...]] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> List[Dict[str, object]]:
-        candidates = self.load_greetable_candidates(excel_path, gold_only=gold_only)
-        candidates.sort(key=lambda c: (c.tier != "A", c.row_index))
+        candidates = self.load_greetable_candidates(
+            excel_path,
+            gold_only=gold_only,
+            recommendation_states=recommendation_states,
+        )
+        state_order = {
+            state: index for index, state in enumerate(GREETING_SELECTABLE_STATES)
+        }
+        candidates.sort(
+            key=lambda c: (
+                state_order.get(c.recommendation_state, len(state_order)),
+                c.row_index,
+            )
+        )
         if max_candidates > 0:
             candidates = candidates[:max_candidates]
         results: List[Dict[str, object]] = []
@@ -146,6 +173,7 @@ class ExcelGreetingService:
                 "profile_url": candidate.profile_url,
                 "current_company": candidate.current_company,
                 "current_title": candidate.current_title,
+                "recommendation_state": candidate.recommendation_state,
                 "is_gold_collar": candidate.is_gold_collar,
                 "skip_gold_check": not verify_gold_on_page,
             }

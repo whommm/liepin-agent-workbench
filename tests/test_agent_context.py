@@ -101,7 +101,12 @@ def test_fetch_context_has_compact_ranking_and_bounded_disputed_set():
 
 def test_match_review_context_aggregates_and_drops_raw_database_fields():
     matches = []
-    tiers = ["A", "B", "C", "D"]
+    states = [
+        "priority_contact",
+        "high_potential_verify",
+        "transferable_explore",
+        "information_insufficient",
+    ]
     for index in range(24):
         matches.append(
             {
@@ -109,7 +114,7 @@ def test_match_review_context_aggregates_and_drops_raw_database_fields():
                 "candidate_id": f"c{index}",
                 "session_id": "session-secret",
                 "round_id": "round-secret",
-                "tier": tiers[index % 4],
+                "recommendation_state": states[index % 4],
                 "status": "completed",
                 "core_met_count": 3,
                 "core_total": 4,
@@ -131,7 +136,10 @@ def test_match_review_context_aggregates_and_drops_raw_database_fields():
     rendered = json_text(context)
 
     assert context["aggregate"]["match_count"] == 24
-    assert context["aggregate"]["ab_count"] == 12
+    assert "ab_count" not in context["aggregate"]
+    assert context["aggregate"]["recommendation_state_counts"] == {
+        state: 6 for state in states
+    }
     assert len(context["representative_matches"]) <= REVIEW_REPRESENTATIVE_LIMIT
     assert len(rendered) <= REVIEW_CONTEXT_CHAR_BUDGET
     assert "RAW_MODEL_RESPONSE_SECRET" not in rendered
@@ -148,7 +156,7 @@ def test_strategy_history_keeps_only_recent_bounded_digests():
             "round_index": index,
             "query": queries[index],
             "raw_count": index * 2,
-            "ab_count": index % 3,
+            "viable_count": index % 3,
             "conclusion": "继续验证",
             "raw_response": "ROUND_RAW_SECRET" * 100,
         }

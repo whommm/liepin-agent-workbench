@@ -48,7 +48,8 @@ class _RoundMixin:
                     id, session_id, round_index, status, query, position_filter,
                     scope, match_mode, filters_json, intent, criteria_version_id,
                     search_hypothesis_type, search_hypothesis_text, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    , search_hypothesis_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     round_id,
@@ -65,6 +66,7 @@ class _RoundMixin:
                     plan.search_hypothesis_type,
                     plan.search_hypothesis_text,
                     now_text(),
+                    plan.search_hypothesis_id,
                 ),
             )
         return round_id

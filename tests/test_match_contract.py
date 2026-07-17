@@ -49,7 +49,7 @@ def test_legacy_match_fields_are_translated_to_canonical_result():
 
     result = match_with(response)
 
-    assert result.tier == "B"
+    assert result.tier == ""
     assert result.status == "completed"
     assert result.dealbreaker_hit is False
     assert result.risks == "薪资待确认"
@@ -98,7 +98,7 @@ def test_canonical_output_normalizes_counts_boolean_and_lists():
     result = match_with(response)
 
     assert result.status == "completed"
-    assert result.tier == "A"
+    assert result.tier == ""
     assert result.core_met_count == 2
     assert result.core_total == 2
     assert result.dealbreaker_hit is False
@@ -109,23 +109,9 @@ def test_canonical_output_normalizes_counts_boolean_and_lists():
 @pytest.mark.parametrize(
     "payload",
     [
-        {"tier": "maybe", "summary": "无法判断"},
         {"tier": "C", "summary": "信息不足", "dealbreaker_hit": "unknown"},
         {"tier": "C", "summary": "信息不足", "questions_to_verify": {"q": "x"}},
         {"tier": "C", "summary": "信息不足", "core_met_count": 2, "core_total": 1},
-        {
-            "tier": "A",
-            "summary": "存在硬冲突却给高档",
-            "dealbreaker_hit": True,
-            "matched_evidence": ["直接证据"],
-        },
-        {
-            "tier": "B",
-            "summary": "核心覆盖不足",
-            "core_met_count": 1,
-            "core_total": 3,
-            "matched_evidence": ["直接证据"],
-        },
     ],
 )
 def test_invalid_contract_is_needs_review_without_business_tier(payload):
@@ -137,8 +123,8 @@ def test_invalid_contract_is_needs_review_without_business_tier(payload):
     assert result.missing_or_unclear
 
 
-@pytest.mark.parametrize("tier", ["A", "B"])
-def test_ab_without_direct_evidence_is_needs_review(tier):
+@pytest.mark.parametrize("tier", ["A", "B", "C", "D", "maybe"])
+def test_retired_tier_is_ignored(tier):
     result = match_with(
         json.dumps(
             {
@@ -151,11 +137,11 @@ def test_ab_without_direct_evidence_is_needs_review(tier):
     )
 
     assert result.tier == ""
-    assert result.status == "needs_review"
-    assert "A/B results require direct resume evidence" in result.risks
+    assert result.status == "completed"
+    assert result.matched_evidence[0]["source_type"] == "inferred"
 
 
-def test_c_or_d_can_complete_without_positive_evidence():
+def test_evidence_contract_can_complete_without_positive_evidence():
     result = match_with(
         json.dumps(
             {"tier": "D", "summary": "经历与岗位无关", "risks": ["方向不符"]},
@@ -163,7 +149,7 @@ def test_c_or_d_can_complete_without_positive_evidence():
         )
     )
 
-    assert result.tier == "D"
+    assert result.tier == ""
     assert result.status == "completed"
 
 
@@ -240,7 +226,7 @@ def test_unlocated_direct_evidence_completes_with_low_confidence_warning():
     )
 
     assert result.status == "completed"
-    assert result.tier == "A"
+    assert result.tier == ""
     assert result.confidence == "low"
     assert "模型概括，未逐字定位" in result.risks
     assert result.matched_evidence[0]["grounding_status"] == "model_summary"
@@ -305,7 +291,7 @@ def test_model_cannot_self_report_grounding_status():
     assert result.confidence == "low"
 
 
-def test_low_evidence_score_cannot_remain_a_or_b():
+def test_low_evidence_score_remains_audit_only_without_tier_rejection():
     quote = "参与相关产品需求整理和会议记录"
     result = match_with(
         json.dumps(
@@ -333,9 +319,9 @@ def test_low_evidence_score_cannot_remain_a_or_b():
         resume_text="候选人{}。".format(quote),
     )
 
-    assert result.status == "needs_review"
+    assert result.status == "completed"
     assert result.tier == ""
-    assert "低于 A/B 自动评级门槛" in result.risks
+    assert result.match_score < 45
 
 
 def test_match_prompt_sends_raw_job_context_once_and_includes_capture_facts():
@@ -373,6 +359,8 @@ def test_match_prompt_sends_raw_job_context_once_and_includes_capture_facts():
     assert "已解析的结构化事实" in prompt
     assert "expected_salary" in prompt
     assert "抓取完整度" in prompt
+    assert "A/B/C/D" not in prompt
+    assert "匹配档位" not in prompt
 
 
 def test_match_result_attaches_stable_audit_and_cache_identity():

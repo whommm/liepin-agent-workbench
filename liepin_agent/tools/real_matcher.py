@@ -19,10 +19,8 @@ from .llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
-MATCH_PROMPT_VERSION = "match-contract-v4-20260715"
+MATCH_PROMPT_VERSION = "match-contract-v7-verdict-20260717"
 MIN_GROUNDED_EVIDENCE_CHARS = 4
-MIN_A_SCORE = 70
-MIN_B_SCORE = 45
 
 
 class MatchOutputParseError(ValueError):
@@ -36,7 +34,7 @@ class MatchEvidenceValidationError(ValueError):
 MATCH_SYSTEM_PROMPT = """你是资深猎头顾问，判断候选人与岗位的匹配度。
 
 ## 核心原则
-1. 抓重点：匹配条件里的核心技能是硬门槛
+1. 抓重点：只有人工确认的 must/dealbreaker 才是硬条件；简历未写只能算未知
 2. 合理推断：
    - 简历写"电机结构设计" → 可推断会用 CAD/SolidWorks
    - 简历写"无刷电机驱动开发" → 可推断懂 FOC/SVPWM
@@ -46,39 +44,33 @@ MATCH_SYSTEM_PROMPT = """你是资深猎头顾问，判断候选人与岗位的�
 
 ## 薪资匹配（重要）
 - **你必须自行从 JD 原文中读取岗位薪资范围，从简历中读取候选人目前/期望薪资，然后判断两者是否匹配。**
-- 如果 JD 中有明确薪资范围（如年薪 30-50万、月薪 25-35k 等），候选人期望/目前薪资严重超出该范围的，**不得评为 A 档**
-- 候选人薪资明显高于岗位上限的（如岗位 30-50万，候选人目前 80万+或期望 100万），应视为核心风险，至少降一档至 B 或 C
+- 如果 JD 中有明确薪资范围（如年薪 30-50万、月薪 25-35k 等），候选人期望/目前薪资严重超出该范围，必须记录为明确风险
+- 候选人薪资明显高于岗位上限的（如岗位 30-50万，候选人目前 80万+或期望 100万），应视为核心风险
 - 候选人薪资明显低于岗位下限的（如岗位 30-50万，候选人目前 15万），除非有明确理由（如转行、地域差异），否则也需标注风险
 - 如果 JD 中未提及具体薪资范围（或只有"面议""竞争力薪资"等模糊表述），不做薪资判断，正常评估其他维度
 
 ## 地点匹配（重要）
 - **你必须自行从简历中读取候选人的当前所在地和期望工作地**（通常在"求职期望""基本信息"部分）
-- **如果岗位有明确城市/地点要求，候选人当前城市或期望城市与岗位要求严重不符的，不得评为 A 档**
-- 例如：岗位在深圳，候选人当前在北京且期望城市也是北京 → 地点严重不匹配，至少降一档
-- 例如：岗位在深圳，候选人当前在广州但期望城市包含深圳 → 地点匹配，不影响评级
+- **如果岗位有明确城市/地点要求，候选人当前城市或期望城市与岗位要求严重不符，必须记录为明确风险**
+- 例如：岗位在深圳，候选人当前在北京且期望城市也是北京 → 地点严重不匹配
+- 例如：岗位在深圳，候选人当前在广州但期望城市包含深圳 → 地点匹配
 - 如果 JD 未明确地点要求（如"无明确要求""全国"），不做地点判断，正常评估其他维度
 - **地点不匹配是一个重要风险点，必须在 risks 中明确标注**
 
 ## 性别匹配（重要）
-- **如果岗位匹配标准中 gender_requirement 为"男"或"女"，候选人简历中显示的性别与之不符的，不得评为 A 档，必须在 risks 中明确标注"性别不符"。**
+- **如果岗位匹配标准中 gender_requirement 为"男"或"女"，候选人简历中显示的性别与之不符，必须在 risks 中明确标注"性别不符"。**
 - 如果 gender_requirement 为"不限"或未填写，不做性别判断。
 - 猎聘简历摘要中通常包含"男"或"女"标签，请据此判断。
-
-## 档位
-A = 核心技能明确 + 近期相关 + 薪资匹配 + 地点匹配 + 性别匹配（或岗位未限这些维度）
-B = 核心技能有但非近期，或行业有偏差但可迁移，或薪资/地点/性别略有不匹配但其他维度优秀
-C = 有相关背景但核心技能不明确，或薪资/地点/性别严重不匹配，需沟通确认
-D = 不相关或明显不符
+- 若【已解析的结构化事实】中 gender 为空且简历正文无性别信息，性别相关条件判 unknown，不得当作不符合。
 
 只输出一个 JSON 对象，不要 Markdown 或额外说明。必须使用以下字段：
 {
-  "tier": "A/B/C/D",
-  "summary": "一句话说明评级原因",
+  "summary": "一句话说明匹配证据和主要不确定性",
   "core_met_count": 0,
   "core_total": 0,
   "dealbreaker_hit": false,
   "matched_evidence": [
-    {"criterion": "岗位要求", "evidence": "简历原文证据", "strength": "strong/medium/weak"}
+    {"criterion": "岗位条件", "verdict": "met/not_met/unknown", "evidence": "简历事实依据", "strength": "strong/medium/weak"}
   ],
   "inferred_evidence": [
     {"criterion": "推断能力", "evidence": "推断及其依据", "strength": "strong/medium/weak"}
@@ -90,9 +82,16 @@ D = 不相关或明显不符
   "confidence": "high/medium/low"
 }
 
-matched_evidence 只放简历中明确提供的事实，允许忠实概括或汇总，但不得新增或
+matched_evidence 放简历中明确提供的事实，允许忠实概括或汇总，但不得新增或
 改变姓名、公司、技术、数字、日期、薪资、职责范围和管理层级等关键信息。推断必须
-单独放在 inferred_evidence。A/B 档必须至少包含一条直接事实证据，否则结果无法通过校验。
+单独放在 inferred_evidence。缺失信息只能写入 missing_or_unclear，不能当作不符合。
+
+verdict 是对 criterion 指向的岗位条件的判定，必须按实际证据如实填写：
+- met：简历事实明确满足该条件
+- not_met：简历事实明确不满足该条件（该条件必须同时写入 risks）
+- unknown：简历未提供该条件相关信息（该条件必须写入 missing_or_unclear）
+无论 met / not_met / unknown，evidence 都要写明你实际读到的简历事实
+（例如"年龄44岁，超过32岁要求"），禁止把不满足或未知标成 met。
 """
 
 
@@ -179,9 +178,6 @@ temperature=config.backend_llm_temperature,
             summary_count = self._assess_direct_evidence(output, resume_text)
             grounding_risk = self._apply_grounding_confidence(output, summary_count)
             match_score = output.deterministic_score()
-            resolved_tier, score_risk = self._resolve_tier(
-                output.tier, match_score
-            )
         except (
             MatchOutputParseError,
             MatchEvidenceValidationError,
@@ -206,7 +202,7 @@ temperature=config.backend_llm_temperature,
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier=resolved_tier,
+            tier="",
             core_met_count=output.core_met_count,
             core_total=output.core_total,
             dealbreaker_hit=output.dealbreaker_hit,
@@ -215,7 +211,6 @@ temperature=config.backend_llm_temperature,
                 [
                     *output.risks,
                     *([grounding_risk] if grounding_risk else []),
-                    *([score_risk] if score_risk else []),
                 ]
             ),
             recommendation=output.recommendation,
@@ -270,20 +265,6 @@ temperature=config.backend_llm_temperature,
         return "".join(
             character for character in normalized if character.isalnum()
         )
-
-    @staticmethod
-    def _resolve_tier(tier: str, match_score: int) -> tuple[str, str]:
-        if tier == "A" and match_score < MIN_A_SCORE:
-            if match_score >= MIN_B_SCORE:
-                return "B", "证据分不足以支持 A 档，已按确定性规则降为 B 档"
-            raise MatchEvidenceValidationError(
-                "证据分 {} 低于 A/B 自动评级门槛".format(match_score)
-            )
-        if tier == "B" and match_score < MIN_B_SCORE:
-            raise MatchEvidenceValidationError(
-                "证据分 {} 低于 B 档自动评级门槛".format(match_score)
-            )
-        return tier, ""
 
     def _attach_audit_metadata(
         self, result: MatchResult, prompt: str, resume_text: str
@@ -448,22 +429,17 @@ temperature=config.backend_llm_temperature,
 {jd_section}
 {notes_section}
 
-请判断候选人与岗位的匹配档位：
-A = 核心技能明确 + 近期相关 + 薪资匹配 + 地点匹配（或岗位未限薪资/地点）
-B = 核心技能有但非近期，或行业有偏差但可迁移，或薪资/地点略有不匹配但其他维度优秀
-C = 有相关背景但核心技能不明确，或薪资/地点严重不匹配，需沟通确认
-D = 不相关或明显不符
-
 要求：
 1. 判断必须围绕岗位匹配标准中的核心要求。
 2. matched_evidence 只能写简历明确提供的事实，不能把推断当作直接证据。
-   允许忠实概括或跨段汇总，但不得新增或改变姓名、公司、技术、数字、日期、薪资、职责范围和管理层级等关键信息；每个核心条件分别给证据。
+   允许忠实概括或跨段汇总，但不得新增或改变姓名、公司、技术、数字、日期、薪资、职责范围和管理层级等关键信息；
+   每个核心条件分别给出 verdict（met/not_met/unknown）和证据。
 3. 合理推断放入 inferred_evidence，不确定的信息放入 missing_or_unclear，
    需要沟通的问题放入 questions_to_verify。
-4. A/B/C/D 只是标签，核心是证据、推断、风险和待确认问题。
-5. **薪资匹配：你必须自行从 JD 原文中读取岗位薪资范围，从简历中读取候选人薪资，然后判断。严重不匹配时必须在 risks 中明确标注，且不得给 A 档。**
-6. **地点匹配：你必须自行从简历中读取候选人的当前所在地和期望工作地，与岗位要求对比。严重不匹配时必须在 risks 中明确标注，且不得给 A 档。**
-7. **项目要点中的额外要求（如 CET4、211 硕士、背调接受度、经验区间等）必须重点评估，不符合的不得给 A 档。**
+4. 简历没有写某项要求时只能标记为未知，禁止因为缺失信息写成明确不符合。
+5. **薪资匹配：必须从 JD 原文读取岗位薪资范围并与简历薪资对比，严重不匹配时写入 risks。**
+6. **地点匹配：必须对比候选人当前所在地、期望工作地与岗位要求，严重不匹配时写入 risks。**
+7. **项目要点中的额外要求（如 CET4、211 硕士、背调接受度、经验区间等）必须重点评估。**
 """.format(
             criteria=json.dumps(compact_criteria, ensure_ascii=False, indent=2),
             resume=resume,
@@ -505,16 +481,9 @@ D = 不相关或明显不符
         return data
 
     @staticmethod
-    def _normalize_tier(value: object) -> str:
-        return MatchOutput.model_validate(
-            {"tier": value, "summary": "compatibility validation"}
-        ).tier
-
-    @staticmethod
     def _string_list(value: object) -> list:
         return MatchOutput.model_validate(
             {
-                "tier": "C",
                 "summary": "compatibility validation",
                 "missing_or_unclear": value,
             }
@@ -524,7 +493,6 @@ D = 不相关或明显不符
     def _list_of_dicts(value: object) -> list:
         output = MatchOutput.model_validate(
             {
-                "tier": "C",
                 "summary": "compatibility validation",
                 "matched_evidence": value,
             }

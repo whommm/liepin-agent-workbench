@@ -28,6 +28,149 @@ def test_create_and_list_session(tmp_path):
     assert events[0]["event_type"] == "session_created"
 
 
+def test_store_configures_wal_once_and_foreign_keys_per_connection(tmp_path):
+    db_path = tmp_path / "connection-settings.db"
+    store = SQLiteStore(str(db_path))
+
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    with store.connect() as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_store_migrates_uncertainty_aware_ranking_columns(tmp_path):
+    store = SQLiteStore(str(tmp_path / "ranking-migration.db"))
+
+    with store.connect() as connection:
+        criterion_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(job_criteria_items)")
+        }
+        evaluation_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(criterion_evaluations)")
+        }
+        ranking_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(candidate_rank_snapshots)")
+        }
+        ranking_indexes = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA index_list(candidate_rank_snapshots)"
+            )
+        }
+
+    assert "observability" in criterion_columns
+    assert "verification_question" in evaluation_columns
+    assert {
+        "known_fit_score",
+        "potential_fit_score",
+        "evidence_coverage_score",
+        "recommendation_state",
+        "conflict_count",
+    }.issubset(ranking_columns)
+    assert "idx_rank_snapshots_candidate_latest" in ranking_indexes
+
+
+def test_rank_snapshot_refresh_replaces_previous_candidate_version(tmp_path):
+    store = SQLiteStore(str(tmp_path / "ranking-current.db"))
+    session_id = store.create_session("排序快照", "测试岗位")
+    criteria_id = store.create_criteria_version(
+        session_id, "测试", "测试条件", created_by="human"
+    )
+    store.confirm_criteria_version(criteria_id)
+    round_id = store.create_round(
+        session_id, 1, SearchPlan(query="测试"), criteria_id
+    )
+    candidate_id = store.save_candidate_summary(
+        CandidateSummary(
+            session_id=session_id,
+            round_id=round_id,
+            name="候选人",
+            profile_url="https://example.com/ranking-current",
+        )
+    )
+
+    for score, state in ((60, "transferable_explore"), (88, "priority_contact")):
+        store.save_rank_snapshots(
+            session_id,
+            criteria_id,
+            [
+                {
+                    "candidate_id": candidate_id,
+                    "known_fit_score": score,
+                    "potential_fit_score": score,
+                    "evidence_coverage_score": 80,
+                    "recommendation_state": state,
+                    "rank_score": score,
+                    "rank_position": 1,
+                }
+            ],
+        )
+
+    with store.connect() as connection:
+        count = connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM candidate_rank_snapshots
+            WHERE candidate_id = ? AND criteria_version_id = ?
+            """,
+            (candidate_id, criteria_id),
+        ).fetchone()["n"]
+
+    rankings = store.list_current_rankings(session_id, criteria_id)
+    assert count == 1
+    assert rankings[0]["recommendation_state"] == "priority_contact"
+    assert rankings[0]["rank_score"] == 88
+
+
+def test_list_candidates_detail_only_excludes_cards_without_resume(tmp_path):
+    store = SQLiteStore(str(tmp_path / "detail-only.db"))
+    session_id = store.create_session("详情预览", "产品经理")
+    round_id = store.create_round(session_id, 1, SearchPlan(query="产品经理"))
+    hidden_id = store.save_candidate_summary(
+        CandidateSummary(
+            id="card-only",
+            session_id=session_id,
+            round_id=round_id,
+            name="仅卡片",
+            profile_url="https://example.com/card-only",
+        )
+    )
+    visible_id = store.save_candidate_summary(
+        CandidateSummary(
+            id="with-detail",
+            session_id=session_id,
+            round_id=round_id,
+            name="有详情",
+            profile_url="https://example.com/with-detail",
+        )
+    )
+    store.save_candidate_detail(
+        CandidateDetail(
+            candidate_id=visible_id,
+            resume_text="完整简历正文",
+            capture_status="success",
+        )
+    )
+    store.save_candidate_detail(
+        CandidateDetail(
+            candidate_id=hidden_id,
+            resume_text="",
+            capture_status="failed",
+        )
+    )
+
+    assert {item["id"] for item in store.list_candidates(session_id)} == {
+        hidden_id,
+        visible_id,
+    }
+    assert [
+        item["id"] for item in store.list_candidates(session_id, detail_only=True)
+    ] == [visible_id]
+
+
 def test_recover_interrupted_sessions_and_delete(tmp_path):
     store = SQLiteStore(str(tmp_path / "workbench.db"))
     session_id = store.create_session(
@@ -167,7 +310,8 @@ def test_current_criteria_uses_latest_result_and_distinct_detail_count(tmp_path)
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier="B",
+            tier="",
+            summary="v1-first",
             status="completed",
             criteria_version_id=criteria_v1,
             matched_evidence=[{"criterion": "行业", "evidence": "天然气", "strength": "强"}],
@@ -178,14 +322,14 @@ def test_current_criteria_uses_latest_result_and_distinct_detail_count(tmp_path)
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier="C",
+            tier="",
+            summary="v1-latest",
             status="completed",
             criteria_version_id=criteria_v1,
         )
     )
 
-    assert store.list_candidates(session_id)[0]["match_tier"] == "C"
-    assert store.count_ab_matches(session_id) == 0
+    assert store.list_candidates(session_id)[0]["match_summary"] == "v1-latest"
     assert store.count_fetched_details(session_id) == 1
 
     criteria_v2 = store.create_criteria_version(
@@ -193,25 +337,22 @@ def test_current_criteria_uses_latest_result_and_distinct_detail_count(tmp_path)
     )
     store.confirm_criteria_version(criteria_v2)
 
-    assert store.list_candidates(session_id)[0]["match_tier"] is None
-    assert store.count_ab_matches(session_id) == 0
+    assert store.list_candidates(session_id)[0]["match_summary"] is None
 
     store.save_match_result(
         MatchResult(
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier="A",
+            tier="",
+            summary="v2-current",
             status="completed",
             criteria_version_id=criteria_v2,
             matched_evidence=[{"criterion": "LNG", "evidence": "LNG 销售", "strength": "强"}],
         )
     )
-    assert store.list_candidates(session_id)[0]["match_tier"] == "A"
-    assert store.count_ab_matches(session_id) == 1
-    assert store.list_sessions()[0]["ab_count"] == 1
+    assert store.list_candidates(session_id)[0]["match_summary"] == "v2-current"
     assert store.session_efficiency_metrics(session_id)["matched_count"] == 1
-    assert store.session_efficiency_metrics(session_id)["ab_count"] == 1
 
     store.save_match_result(
         MatchResult(
@@ -223,15 +364,12 @@ def test_current_criteria_uses_latest_result_and_distinct_detail_count(tmp_path)
             criteria_version_id=criteria_v2,
         )
     )
-    assert store.list_candidates(session_id)[0]["match_tier"] == ""
-    assert store.count_ab_matches(session_id) == 0
-    assert store.list_sessions()[0]["ab_count"] == 0
+    assert "match_tier" not in store.list_candidates(session_id)[0]
     metrics = store.session_efficiency_metrics(session_id)
     diagnostic = store.session_diagnostic_summary(session_id)
     assert metrics["matched_count"] == 1
-    assert metrics["ab_count"] == 0
     assert diagnostic["match_status_counts"] == {"needs_review": 1}
-    assert diagnostic["tier_counts"] == {"": 1}
+    assert "tier_counts" not in diagnostic
 
 
 def test_match_audit_fields_round_trip_and_cache_identity_is_conjunctive(tmp_path):

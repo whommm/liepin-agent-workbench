@@ -110,12 +110,13 @@ class _CandidateMixin:
 
 
     def list_candidates(
-        self, session_id: str, round_id: Optional[str] = None
+        self,
+        session_id: str,
+        round_id: Optional[str] = None,
+        detail_only: bool = False,
     ) -> List[Dict[str, Any]]:
         sql = """
             SELECT c.*,
-                   mr.tier AS match_tier,
-                   mr.match_score AS match_score,
                    mr.summary AS match_summary,
                    mr.risks AS match_risks,
                    mr.evidence_json AS evidence_json,
@@ -128,7 +129,22 @@ class _CandidateMixin:
                     COALESCE(d.greeting_status, '') AS greeting_status,
                     COALESCE(d.greeting_message, '') AS greeting_message,
                     COALESCE(d.greeting_error, '') AS greeting_error,
-                    COALESCE(d.greeted_at, '') AS greeted_at
+                    COALESCE(d.greeted_at, '') AS greeted_at,
+                    COALESCE(cf.feedback_label, '') AS feedback_label,
+                    COALESCE(cf.corrected_tier, '') AS corrected_tier,
+                    COALESCE(cf.reason_codes_json, '[]') AS feedback_reason_codes_json,
+                    COALESCE(cf.note, '') AS feedback_note,
+                    COALESCE(cf.created_at, '') AS feedback_created_at
+                    , COALESCE(cr.fit_score, 0) AS fit_score
+                    , COALESCE(cr.confidence_score, 0) AS confidence_score
+                    , COALESCE(cr.known_fit_score, cr.fit_score, 0) AS known_fit_score
+                    , COALESCE(cr.potential_fit_score, cr.fit_score, 0) AS potential_fit_score
+                    , COALESCE(cr.evidence_coverage_score, cr.confidence_score, 0) AS evidence_coverage_score
+                    , COALESCE(cr.recommendation_state, '') AS recommendation_state
+                    , COALESCE(cr.conflict_count, 0) AS conflict_count
+                    , COALESCE(cr.rank_score, 0) AS rank_score
+                    , cr.calibrated_probability AS calibrated_probability
+                    , COALESCE(cr.rank_position, 0) AS rank_position
             FROM candidate_summaries c
             LEFT JOIN match_results mr
               ON mr.id = (
@@ -159,13 +175,38 @@ class _CandidateMixin:
                   ORDER BY d2.fetched_at DESC, d2.id DESC
                   LIMIT 1
               )
+            LEFT JOIN candidate_feedback cf
+              ON cf.id = (
+                  SELECT f2.id
+                  FROM candidate_feedback f2
+                  WHERE f2.candidate_id = c.id
+                  ORDER BY f2.created_at DESC, f2.rowid DESC
+                  LIMIT 1
+              )
+            LEFT JOIN candidate_rank_snapshots cr
+              ON cr.id = (
+                  SELECT r2.id
+                  FROM candidate_rank_snapshots r2
+                  WHERE r2.candidate_id = c.id
+                    AND r2.criteria_version_id = COALESCE(
+                        (
+                            SELECT cv2.id FROM match_criteria_versions cv2
+                            WHERE cv2.session_id = c.session_id
+                              AND cv2.status = 'confirmed'
+                            ORDER BY cv2.version DESC LIMIT 1
+                        ), ''
+                    )
+                  ORDER BY r2.created_at DESC, r2.rowid DESC LIMIT 1
+              )
             WHERE c.session_id = ?
         """
         params: List[Any] = [session_id]
         if round_id:
             sql += " AND c.round_id = ?"
             params.append(round_id)
-        sql += " ORDER BY c.pre_score DESC, c.result_index ASC"
+        if detail_only:
+            sql += " AND d.id IS NOT NULL AND TRIM(COALESCE(d.resume_text, '')) <> ''"
+        sql += " ORDER BY COALESCE(cr.rank_position, 999999), c.pre_score DESC, c.result_index ASC"
         with self.connect() as connection:
             rows = connection.execute(sql, params).fetchall()
         result = []
@@ -177,6 +218,14 @@ class _CandidateMixin:
             item["matched_evidence"] = from_json(item.get("evidence_json"), [])
             item["missing_or_unclear"] = from_json(item.get("unknowns_json"), [])
             item["questions_to_verify"] = from_json(item.get("questions_json"), [])
+            item["feedback_reason_codes"] = from_json(
+                item.get("feedback_reason_codes_json"), []
+            )
+            if not str(item.get("recommendation_state") or ""):
+                item["recommendation_state"] = "information_insufficient"
+                item["known_fit_score"] = 0.0
+                item["potential_fit_score"] = 0.0
+                item["evidence_coverage_score"] = 0.0
             result.append(item)
         return result
 

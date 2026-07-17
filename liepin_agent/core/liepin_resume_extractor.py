@@ -222,7 +222,13 @@ class LiepinResumeExtractor:
             "expected_cities": expected_cities,
             "work_years": summary.work_years or "",
             "education": summary.education or "",
-            "gender": self._detect_gender(resume_text, basic_lines),
+            "gender": (
+                str(getattr(summary, "gender", "") or "")
+                or self._detect_gender(
+                    resume_text,
+                    basic_lines + [summary.summary or "", summary.raw_text or ""],
+                )
+            ),
         }
 
     @staticmethod
@@ -232,21 +238,21 @@ class LiepinResumeExtractor:
         m = re.search(r"(\d+)", age)
         return int(m.group(1)) if m else 0
 
-    @staticmethod
-    def _detect_gender(resume_text: str, basic_lines: List[str]) -> str:
+    _GENDER_TOKEN = re.compile(r"(?<![一-鿿A-Za-z])(男|女)(?![一-鿿A-Za-z])")
+    _GENDER_LABEL = re.compile(r"性别\s*[:：]?\s*(男|女)")
+
+    @classmethod
+    def _detect_gender(cls, resume_text: str, basic_lines: List[str]) -> str:
         """从基础信息行里识别性别。猎聘简历头部通常有 '男'/'女' 标签。"""
-        for line in basic_lines[:6]:
-            line = line.strip()
-            # 形如 "男 40岁" / "女/已婚" / "男 | 本科"
-            if re.match(r"^男", line) or "男 " in line[:6] or line.startswith("男"):
-                return "男"
-            if re.match(r"^女", line) or "女 " in line[:6] or line.startswith("女"):
-                return "女"
-        # 兜底：正文里找
+        for line in list(basic_lines or [])[:12]:
+            match = cls._GENDER_TOKEN.search(line.strip())
+            if match:
+                return match.group(1)
+        # 兜底：正文开头找显式“性别：男/女”标签
         if resume_text:
-            m = re.search(r"[基础信息摘要]*?[：:]\s*(男|女)", resume_text[:500])
-            if m:
-                return m.group(1)
+            match = cls._GENDER_LABEL.search(resume_text[:500])
+            if match:
+                return match.group(1)
         return ""
 
     SEARCH_PAGE_MARKERS = (

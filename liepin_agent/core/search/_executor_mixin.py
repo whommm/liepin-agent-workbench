@@ -396,6 +396,10 @@ class _ExecutorMixin:
     )
     _WORK_YEARS_PATTERN = re.compile(r"(?:工作)?(\d+年(?:经验)?)")
     _SALARY_PATTERN = re.compile(r"\d+k(?:-\d+k)?")
+    # Standalone 男/女 token on result cards; lookarounds avoid matching    # 子女/男士/男女不限 etc.
+    _GENDER_TOKEN_PATTERN = re.compile(
+        r"(?<![\u4e00-\u9fffA-Za-z])(男|女)(?![\u4e00-\u9fffA-Za-z])"
+    )
     _COMPANY_MARKERS = (
         "有限公司",
         "有限责任公司",

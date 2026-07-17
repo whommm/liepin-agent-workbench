@@ -5,14 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Dict
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
 )
 
@@ -20,16 +18,16 @@ if TYPE_CHECKING:
     from .main_window import MainWindow
 
 
-# 状态 → 色带/圆点颜色
+# Status colors are limited to states that need quick visual distinction.
 STATUS_COLORS: Dict[str, str] = {
-    "running": "#5a9a5a",
-    "waiting_approval": "#c4956a",
-    "paused": "#c4956a",
-    "criteria_draft": "#6a8aaa",
-    "criteria_confirmed": "#7cb87c",
-    "completed": "#8a8070",
-    "failed": "#c56a6a",
-    "cancelled": "#a09585",
+    "running": "#2f6b4f",
+    "waiting_approval": "#a96632",
+    "paused": "#667085",
+    "criteria_draft": "#a96632",
+    "criteria_confirmed": "#2f6b4f",
+    "completed": "#667085",
+    "failed": "#a33f3f",
+    "cancelled": "#98a2b3",
 }
 
 STATUS_LABELS: Dict[str, str] = {
@@ -44,17 +42,25 @@ STATUS_LABELS: Dict[str, str] = {
 }
 
 _MINI_BTN = (
-    "padding: 2px 8px; font-size: 11px; color: white; "
-    "border: none; border-radius: 4px; min-height: 20px; max-height: 20px;"
+    "padding: 2px 8px; font-size: 11px; font-weight: 600; "
+    "border-radius: 4px; min-height: 20px; max-height: 20px;"
 )
 
 
-def _mini_btn_style(bg: str, hover: str, pressed: str = "") -> str:
-    s = "QPushButton {" + _MINI_BTN + " background: " + bg + ";}"
-    s += "QPushButton:hover {" + _MINI_BTN + " background: " + hover + ";}"
-    if pressed:
-        s += "QPushButton:pressed {" + _MINI_BTN + " background: " + pressed + ";}"
-    return s
+def _mini_btn_style(role: str = "neutral") -> str:
+    colors = {
+        "neutral": ("#ffffff", "#344054", "#d0d5dd", "#f2f4f7"),
+        "primary": ("#a96632", "#ffffff", "#a96632", "#8f5429"),
+        "danger": ("#ffffff", "#a33f3f", "#d7a3a3", "#fff4f4"),
+    }
+    bg, fg, border, hover = colors.get(role, colors["neutral"])
+    base = _MINI_BTN + " background: {}; color: {}; border: 1px solid {};".format(
+        bg, fg, border
+    )
+    return (
+        "QPushButton {" + base + "}"
+        "QPushButton:hover {" + base + " background: " + hover + ";}"
+    )
 
 
 class SessionListItemWidget(QFrame):
@@ -66,21 +72,14 @@ class SessionListItemWidget(QFrame):
         self.setObjectName("SessionItem")
 
         status = str(session.get("status") or "")
-        status_color = STATUS_COLORS.get(status, "#b8a890")
+        status_color = STATUS_COLORS.get(status, "#98a2b3")
 
         root_layout = QHBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        stripe = QFrame()
-        stripe.setObjectName("StatusStripe")
-        stripe.setStyleSheet("background: {};".format(status_color))
-        stripe.setFixedWidth(3)
-        stripe.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        root_layout.addWidget(stripe)
-
         content = QVBoxLayout()
-        content.setContentsMargins(10, 8, 10, 8)
+        content.setContentsMargins(8, 8, 8, 8)
         content.setSpacing(6)
 
         # 标题行
@@ -97,17 +96,16 @@ class SessionListItemWidget(QFrame):
         dot = QLabel()
         dot.setObjectName("StatusDot")
         dot.setStyleSheet(
-            "background: {}; border-radius: 4px; min-width: 8px; max-width: 8px; "
-            "min-height: 8px; max-height: 8px;".format(status_color)
+            "background: {}; border-radius: 3px; min-width: 7px; max-width: 7px; "
+            "min-height: 7px; max-height: 7px;".format(status_color)
         )
         status_row.addWidget(dot)
 
         status_text = STATUS_LABELS.get(status, status)
         info = QLabel(
-            "{}  |  候选 {}  |  A/B {}".format(
+            "{}  |  候选 {}".format(
                 status_text,
                 session.get("candidate_count") or 0,
-                session.get("ab_count") or 0,
             )
         )
         info.setObjectName("SessionInfo")
@@ -125,10 +123,10 @@ class SessionListItemWidget(QFrame):
         self.export_btn = QPushButton("导出")
         self.delete_btn = QPushButton("删除")
 
-        self.continue_btn.setStyleSheet(_mini_btn_style("#d4a574", "#e0b584", "#b8865a"))
-        self.stop_btn.setStyleSheet(_mini_btn_style("#c56a6a", "#d97b7b", "#a85050"))
-        self.export_btn.setStyleSheet(_mini_btn_style("rgba(160,150,130,0.65)", "rgba(175,165,145,0.80)"))
-        self.delete_btn.setStyleSheet(_mini_btn_style("#c56a6a", "#d97b7b", "#a85050"))
+        self.continue_btn.setStyleSheet(_mini_btn_style())
+        self.stop_btn.setStyleSheet(_mini_btn_style("danger"))
+        self.export_btn.setStyleSheet(_mini_btn_style())
+        self.delete_btn.setStyleSheet(_mini_btn_style("danger"))
 
         btn_row.addWidget(self.continue_btn)
         btn_row.addWidget(self.stop_btn)
@@ -146,7 +144,7 @@ class SessionListItemWidget(QFrame):
         self.command_input.setFixedHeight(22)
         self.command_input.setStyleSheet("font-size: 11px; padding: 2px 6px;")
         self.send_cmd_btn = QPushButton("发送")
-        self.send_cmd_btn.setStyleSheet(_mini_btn_style("#7cb87c", "#8cc88c", "#6aa86a"))
+        self.send_cmd_btn.setStyleSheet(_mini_btn_style("primary"))
         self.send_cmd_btn.setFixedHeight(22)
         cmd_layout.addWidget(self.command_input, 1)
         cmd_layout.addWidget(self.send_cmd_btn)
@@ -184,19 +182,14 @@ class SessionListItemWidget(QFrame):
         """增量更新状态，避免重建 widget 导致焦点丢失。"""
         self.session = session
         status = str(session.get("status") or "")
-        status_color = STATUS_COLORS.get(status, "#b8a890")
-
-        # 更新色带
-        stripe = self.findChild(QFrame, "StatusStripe")
-        if stripe:
-            stripe.setStyleSheet("background: {};".format(status_color))
+        status_color = STATUS_COLORS.get(status, "#98a2b3")
 
         # 更新圆点
         dot = self.findChild(QLabel, "StatusDot")
         if dot:
             dot.setStyleSheet(
-                "background: {}; border-radius: 4px; min-width: 8px; max-width: 8px; "
-                "min-height: 8px; max-height: 8px;".format(status_color)
+                "background: {}; border-radius: 3px; min-width: 7px; max-width: 7px; "
+                "min-height: 7px; max-height: 7px;".format(status_color)
             )
 
         # 更新状态文本
@@ -204,10 +197,9 @@ class SessionListItemWidget(QFrame):
         if info:
             status_text = STATUS_LABELS.get(status, status)
             info.setText(
-                "{}  |  候选 {}  |  A/B {}".format(
+                "{}  |  候选 {}".format(
                     status_text,
                     session.get("candidate_count") or 0,
-                    session.get("ab_count") or 0,
                 )
             )
 

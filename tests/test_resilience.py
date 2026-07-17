@@ -42,7 +42,7 @@ class FakeLiepinTool:
                 summary_text="{} IP衍生品 量产 供应链".format(" ".join(terms)),
                 result_index=index,
             )
-            for index in range(8)
+            for index in range(2)
         ]
 
     def fetch_candidate_detail(self, candidate):
@@ -280,7 +280,7 @@ class SlowMatcher:
             candidate_id=candidate_id,
             session_id=session_id,
             round_id=round_id,
-            tier="B",
+            tier="",
             summary="慢匹配完成",
         )
 
@@ -382,14 +382,15 @@ def test_no_wait_policy_does_not_block_round_review(tmp_path):
 
     assert session["status"] == "completed"
     assert len(matches) == 1
-    assert matches[0]["tier"] == "B"
+    assert matches[0]["tier"] == ""
     assert rounds[0]["matched_count"] == 1
-    assert rounds[0]["ab_count"] == 1
+    assert rounds[0]["ab_count"] == 0
     assert digests[0]["matched_count"] == 1
     assert digests[0]["pending_match_count"] == 0
-    assert digests[0]["b_count"] == 1
+    assert digests[0]["recommendation_state_counts"] == {
+        "information_insufficient": 1
+    }
     assert any(event["title"] == "后台匹配已提交" for event in events)
-    assert any(event["title"] == "正在收拢后台匹配" for event in events)
 
 
 def test_runtime_matcher_exception_has_no_business_tier(tmp_path):
@@ -424,7 +425,7 @@ def test_runtime_matcher_exception_has_no_business_tier(tmp_path):
     assert results[0]["status"] == "failed"
     assert results[0]["tier"] == ""
     assert candidates[0]["status"] == "deferred"
-    assert candidates[0]["match_tier"] == ""
+    assert "match_tier" not in candidates[0]
 
 
 def test_runtime_does_not_greet_gold_ab_candidates_automatically(tmp_path):

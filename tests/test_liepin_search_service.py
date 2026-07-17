@@ -4,7 +4,7 @@ from liepin_agent.core.liepin_search_service import LiepinSearchService
 def test_clean_candidate_lines_keeps_company_title_and_city_aligned():
     service = LiepinSearchService.__new__(LiepinSearchService)
 
-    cleaned, name, age, title, company, city, work_years, education = (
+    cleaned, name, age, title, company, city, work_years, education, gender = (
         service._clean_candidate_lines(
             [
                 "徐**",
@@ -32,7 +32,7 @@ def test_clean_candidate_lines_keeps_company_title_and_city_aligned():
 def test_clean_candidate_lines_does_not_treat_work_as_city():
     service = LiepinSearchService.__new__(LiepinSearchService)
 
-    _, _, _, title, company, city, work_years, _ = service._clean_candidate_lines(
+    _, _, _, title, company, city, work_years, _, _ = service._clean_candidate_lines(
         [
             "王**",
             "39岁",

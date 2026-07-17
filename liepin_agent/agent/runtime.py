@@ -13,6 +13,11 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from ..domain.models import CandidateDetail, CandidateSummary, MatchResult, SearchPlan
 from ..domain.pre_score import classify_candidate_card, pre_score_candidate
+from ..domain.recommendation import (
+    HIGH_POTENTIAL_VERIFY,
+    PRIORITY_CONTACT,
+    TRANSFERABLE_EXPLORE,
+)
 from ..domain.states import (
     AgentEventType,
     CandidateStatus,
@@ -24,6 +29,8 @@ from ..domain.stop_conditions import evaluate_stop_conditions
 from ..services.browser_queue import BrowserQueue
 from ..services.event_bus import EventBus
 from ..services.match_queue import MatchQueue
+from ..services.candidate_intelligence import CandidateIntelligenceService
+from ..services.candidate_ranking import CandidateRankingService
 from ..storage.sqlite_store import SQLiteStore
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
@@ -65,6 +72,8 @@ class AgentRuntime:
         self.matcher = matcher or RealMatchService.from_config()
         self.brain = agent_brain or LLMAgentBrain.from_config()
         self.web_search_tool = web_search_tool or WebSearchTool()
+        self.candidate_intelligence = CandidateIntelligenceService()
+        self.ranking_service = CandidateRankingService(store)
         self.config = (
             getattr(getattr(self.liepin_tool, "config_manager", None), "config", None)
             or getattr(self.store, "config", None)
@@ -173,6 +182,9 @@ class AgentRuntime:
                 self._notify(session_id)
                 return
             criteria = self.store.get_latest_criteria(session_id)
+            # Rebuild recommendation snapshots on resume so all sessions use
+            # the current uncertainty-aware pool logic.
+            self.ranking_service.refresh_session(session_id)
 
             used_queries: List[str] = [
                 str(item.get("query") or "")
@@ -253,6 +265,12 @@ class AgentRuntime:
                     {},
                 )
                 plan = self.brain.initial_plan(jd_text, user_notes, criteria)
+            self.store.ensure_search_hypotheses(session_id, criteria)
+            portfolio_plan = self.store.select_search_hypothesis_plan(
+                session_id, str(criteria.get("criteria_version_id") or "")
+            )
+            if portfolio_plan is not None:
+                plan = portfolio_plan
             consecutive_low_yield_rounds = 0
             config_max_rounds = getattr(
                 getattr(self.store, "config", None), "max_rounds_default", 20
@@ -289,13 +307,18 @@ class AgentRuntime:
                         )
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 fetched_count = self.store.count_fetched_details(session_id)
-                ab_count = self.store.count_ab_matches(session_id)
+                effective_pool_score = float(
+                    self.ranking_service.pool_summary(session_id).get(
+                        "effective_pool_score"
+                    )
+                    or 0
+                )
                 stop = evaluate_stop_conditions(
                     round_index=round_index - 1,
                     max_rounds=max_rounds,
                     fetched_details=fetched_count,
                     max_detail_fetches=max_detail_fetches,
-                    ab_count=ab_count,
+                    ab_count=effective_pool_score,
                     target_ab_count=target_ab_count,
                     consecutive_low_yield_rounds=consecutive_low_yield_rounds,
                     elapsed_minutes=(time.monotonic() - started_monotonic) / 60,
@@ -443,10 +466,15 @@ class AgentRuntime:
                 self._respect_control_flags(session_id, cancel_event, pause_event)
                 if (
                     observation.recommended_round_type == RoundType.HARVEST_DETAIL.value
-                    and self.store.count_ab_matches(session_id) < 2
+                    and float(
+                        self.ranking_service.pool_summary(session_id).get(
+                            "effective_pool_score", 0
+                        )
+                    )
+                    < 2
                 ):
                     observation.recommended_round_type = RoundType.VALIDATE_DETAIL.value
-                    observation.reason += " 但当前还没有足够 A/B 样本，先降级为验证轮。"
+                    observation.reason += " 但当前还没有足够有效候选，先降级为验证轮。"
                 self.store.update_round(
                     round_id, round_type=observation.recommended_round_type
                 )
@@ -556,28 +584,63 @@ class AgentRuntime:
                     for item in match_results
                     if str(item.get("status") or "") == "completed"
                 ]
-                round_ab_count = sum(
-                    1
-                    for item in valid_match_results
-                    if str(item.get("tier") or "").upper() in ("A", "B")
+                fetched_count = self.store.count_fetched_details(session_id)
+                rankings = self.store.list_current_rankings(
+                    session_id, str(criteria.get("criteria_version_id") or "")
+                )
+                rankings_by_candidate = {
+                    str(item.get("candidate_id") or ""): item for item in rankings
+                }
+                enriched_match_results: List[Dict[str, object]] = []
+                for item in match_results:
+                    enriched = dict(item)
+                    ranking = rankings_by_candidate.get(
+                        str(item.get("candidate_id") or ""), {}
+                    )
+                    for key in (
+                        "recommendation_state",
+                        "known_fit_score",
+                        "potential_fit_score",
+                        "evidence_coverage_score",
+                        "conflict_count",
+                    ):
+                        enriched[key] = ranking.get(key)
+                    enriched_match_results.append(enriched)
+                round_state_counts: Dict[str, int] = {}
+                for item in enriched_match_results:
+                    state = str(item.get("recommendation_state") or "")
+                    if state:
+                        round_state_counts[state] = round_state_counts.get(state, 0) + 1
+                round_viable_count = sum(
+                    round_state_counts.get(state, 0)
+                    for state in (
+                        PRIORITY_CONTACT,
+                        HIGH_POTENTIAL_VERIFY,
+                        TRANSFERABLE_EXPLORE,
+                    )
                 )
                 self.store.update_round(
                     round_id,
                     matched_count=len(match_results),
-                    ab_count=round_ab_count,
+                    # Legacy column name retained in SQLite; value is now the
+                    # five-state viable candidate count.
+                    ab_count=round_viable_count,
                 )
-
-                fetched_count = self.store.count_fetched_details(session_id)
-                total_ab_count = self.store.count_ab_matches(session_id)
+                effective_pool_score = float(
+                    self.ranking_service.pool_summary(session_id).get(
+                        "effective_pool_score"
+                    )
+                    or 0
+                )
                 pending_match_count = sum(1 for future in futures if not future.done())
                 if (
                     decision.action == "fetch_details"
                     and valid_match_results
-                    and round_ab_count == 0
+                    and round_viable_count == 0
                     and pending_match_count == 0
                 ):
                     consecutive_low_yield_rounds += 1
-                elif decision.action == "fetch_details" and round_ab_count > 0:
+                elif decision.action == "fetch_details" and round_viable_count > 0:
                     consecutive_low_yield_rounds = 0
 
                 stop = evaluate_stop_conditions(
@@ -585,7 +648,7 @@ class AgentRuntime:
                     max_rounds=max_rounds,
                     fetched_details=fetched_count,
                     max_detail_fetches=max_detail_fetches,
-                    ab_count=total_ab_count,
+                    ab_count=effective_pool_score,
                     target_ab_count=target_ab_count,
                     consecutive_low_yield_rounds=consecutive_low_yield_rounds,
                     elapsed_minutes=(time.monotonic() - started_monotonic) / 60,
@@ -603,7 +666,7 @@ class AgentRuntime:
                 review_criteria = dict(criteria or {})
                 if pending_match_count:
                     pending_hint = (
-                        "本轮仍有 {} 个匹配任务在后台执行，不能把当前暂时为 0 的 A/B "
+                        "本轮仍有 {} 个匹配任务在后台执行，不能把当前暂时为空的有效候选池 "
                         "视为低产出，也不要据此停止或大幅改变策略。"
                     ).format(pending_match_count)
                     current_hint = str(review_criteria.get("_strategy_hint") or "").strip()
@@ -626,9 +689,9 @@ class AgentRuntime:
                     "previous_plan": plan,
                     "jd_text": jd_text,
                     "used_queries": used_queries,
-                    "match_results": match_results,
+                    "match_results": enriched_match_results,
                     "noise_patterns": observation.noise_patterns,
-                    "target_met": total_ab_count >= target_ab_count,
+                    "target_met": effective_pool_score >= target_ab_count,
                     "should_stop": stop.should_stop,
                     "stop_reason": stop.reason,
                     "criteria": review_criteria,
@@ -645,10 +708,6 @@ class AgentRuntime:
                     )
                 review = self.brain.review_round(**review_kwargs)
                 self._respect_control_flags(session_id, cancel_event, pause_event)
-                tier_counts: Dict[str, int] = {}
-                for item in valid_match_results:
-                    tier = str(item.get("tier") or "").upper()
-                    tier_counts[tier] = tier_counts.get(tier, 0) + 1
                 observed_pages = sorted(
                     {
                         int(item.page_meta.get("page_num") or 1)
@@ -680,15 +739,21 @@ class AgentRuntime:
                     "detail_fetch_count": len(futures),
                     "matched_count": len(valid_match_results),
                     "pending_match_count": pending_match_count,
-                    "tier_counts": {
-                        tier: tier_counts.get(tier, 0)
-                        for tier in ("A", "B", "C", "D")
-                    },
-                    "a_count": tier_counts.get("A", 0),
-                    "b_count": tier_counts.get("B", 0),
-                    "ab_count": round_ab_count,
+                    "recommendation_state_counts": round_state_counts,
+                    "viable_count": round_viable_count,
+                    "effective_pool_score": effective_pool_score,
                     "conclusion": review.summary,
                 }
+                self.store.record_search_hypothesis_result(
+                    plan.search_hypothesis_id,
+                    round_id=round_id,
+                    page_count=round_digest["page_count"],
+                    raw_count=round_digest["raw_count"],
+                    new_count=round_digest["new_count"],
+                    detail_count=round_digest["detail_fetch_count"],
+                    relevant_count=round_digest["viable_count"],
+                    duplicate_rate=round_digest["duplicate_rate"],
+                )
                 self.store.update_round(
                     round_id,
                     status=RoundStatus.REVIEWED.value,
@@ -705,7 +770,7 @@ class AgentRuntime:
                     "round_review",
                     review.action,
                     {
-                        "match_results": build_match_review_context(match_results),
+                        "match_results": build_match_review_context(enriched_match_results),
                         "observation": observation.to_dict(),
                     },
                     review.to_dict(),
@@ -815,6 +880,11 @@ class AgentRuntime:
                 if review.action == "stop" or not review.next_plan:
                     break
                 plan = review.next_plan
+                portfolio_plan = self.store.select_search_hypothesis_plan(
+                    session_id, str(criteria.get("criteria_version_id") or "")
+                )
+                if portfolio_plan is not None:
+                    plan = portfolio_plan
 
                 user_cmd = self.store.consume_pending_user_command(session_id)
                 if user_cmd:
@@ -873,7 +943,9 @@ class AgentRuntime:
                 "寻访完成",
                 "Agent 已完成当前 Session。",
                 {
-                    "ab_count": self.store.count_ab_matches(session_id),
+                    "effective_pool_score": self.ranking_service.pool_summary(
+                        session_id
+                    ).get("effective_pool_score", 0),
                     "detail_count": self.store.count_fetched_details(session_id),
                 },
             )
@@ -952,6 +1024,7 @@ class AgentRuntime:
                 row.get("search_hypothesis_type") or "core_background"
             ),
             search_hypothesis_text=str(row.get("search_hypothesis_text") or ""),
+            search_hypothesis_id=str(row.get("search_hypothesis_id") or ""),
         )
 
     @staticmethod
@@ -1092,7 +1165,13 @@ class AgentRuntime:
                             candidate.get("name") or "候选人",
                             candidate.get("current_title") or "",
                         ),
-                        {"candidate_id": candidate_id, "reused": False},
+                        {
+                            "candidate_id": candidate_id,
+                            "reused": False,
+                            "extract_attempts": int(
+                                detail_payload.get("detail_extract_attempts") or 1
+                            ),
+                        },
                     )
 
                 prompt_version = str(
@@ -1424,6 +1503,30 @@ class AgentRuntime:
             result.tier,
         )
         self.store.save_match_result(result)
+        try:
+            facts = self.candidate_intelligence.extract_facts(
+                resume_text, structured_facts or {}
+            )
+            self.store.replace_candidate_facts(candidate_id, facts)
+            criteria_items = list(criteria.get("criteria_items") or [])
+            if criteria_items:
+                evaluations = self.candidate_intelligence.evaluate(
+                    criteria_items, facts, result
+                )
+                self.store.replace_criterion_evaluations(
+                    candidate_id,
+                    session_id,
+                    str(criteria.get("criteria_version_id") or ""),
+                    evaluations,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to persist candidate intelligence: candidate=%s", candidate_id
+            )
+        try:
+            self.ranking_service.refresh_session(session_id)
+        except Exception:
+            logger.exception("Failed to refresh candidate ranking: session=%s", session_id)
         self._refresh_round_match_metrics(session_id, round_id)
         if result.status == "completed":
             self._event(
@@ -1576,14 +1679,8 @@ class AgentRuntime:
             for item in match_results
             if str(item.get("status") or "") == "completed"
         ]
-        ab_count = sum(
-            1
-            for item in completed_results
-            if str(item.get("tier") or "").upper() in ("A", "B")
-        )
         update_kwargs: Dict[str, object] = {
             "matched_count": len(match_results),
-            "ab_count": ab_count,
         }
         round_row = next(
             (
@@ -1595,10 +1692,28 @@ class AgentRuntime:
         )
         digest = self._json_dict((round_row or {}).get("round_digest_json"))
         if digest:
-            tier_counts: Dict[str, int] = {}
-            for item in completed_results:
-                tier = str(item.get("tier") or "").upper()
-                tier_counts[tier] = tier_counts.get(tier, 0) + 1
+            rankings = self.store.list_current_rankings(
+                session_id, str((round_row or {}).get("criteria_version_id") or "")
+            )
+            matched_candidate_ids = {
+                str(item.get("candidate_id") or "") for item in completed_results
+            }
+            state_counts: Dict[str, int] = {}
+            for item in rankings:
+                if str(item.get("candidate_id") or "") not in matched_candidate_ids:
+                    continue
+                state = str(item.get("recommendation_state") or "")
+                if state:
+                    state_counts[state] = state_counts.get(state, 0) + 1
+            viable_count = sum(
+                state_counts.get(state, 0)
+                for state in (
+                    PRIORITY_CONTACT,
+                    HIGH_POTENTIAL_VERIFY,
+                    TRANSFERABLE_EXPLORE,
+                )
+            )
+            update_kwargs["ab_count"] = viable_count
             pending_count = sum(
                 1
                 for future in self._round_match_futures.get(
@@ -1610,13 +1725,11 @@ class AgentRuntime:
                 {
                     "matched_count": len(completed_results),
                     "pending_match_count": pending_count,
-                    "tier_counts": {
-                        tier: tier_counts.get(tier, 0)
-                        for tier in ("A", "B", "C", "D")
-                    },
-                    "a_count": tier_counts.get("A", 0),
-                    "b_count": tier_counts.get("B", 0),
-                    "ab_count": ab_count,
+                    "recommendation_state_counts": state_counts,
+                    "viable_count": viable_count,
+                    "effective_pool_score": self.ranking_service.pool_summary(
+                        session_id
+                    ).get("effective_pool_score", 0),
                     "needs_review_count": sum(
                         1
                         for item in match_results

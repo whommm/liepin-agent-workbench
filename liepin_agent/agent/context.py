@@ -283,6 +283,14 @@ def compact_match_result(match: Mapping[str, Any]) -> Dict[str, Any]:
         "core_total": _safe_int(match.get("core_total")),
         "dealbreaker_hit": _safe_bool(match.get("dealbreaker_hit")),
         "confidence": compact_text(match.get("confidence"), 24),
+        "recommendation_state": compact_text(
+            match.get("recommendation_state"), 32
+        ),
+        "known_fit_score": _safe_int(match.get("known_fit_score")),
+        "potential_fit_score": _safe_int(match.get("potential_fit_score")),
+        "evidence_coverage_score": _safe_int(
+            match.get("evidence_coverage_score")
+        ),
         "summary": compact_text(match.get("summary"), 180),
         "risks": compact_text(match.get("risks"), 120),
         "recommendation": compact_text(match.get("recommendation"), 120),
@@ -305,14 +313,15 @@ def build_match_review_context(
     """Aggregate current-round matches and retain only representative evidence."""
 
     results = list(match_results or [])
-    tier_counts = Counter(
-        compact_text(item.get("tier"), 8).upper() or "UNKNOWN" for item in results
-    )
     status_counts = Counter(
         compact_text(item.get("status") or "completed", 24) for item in results
     )
     confidence_counts = Counter(
         compact_text(item.get("confidence"), 24) or "unknown" for item in results
+    )
+    recommendation_state_counts = Counter(
+        compact_text(item.get("recommendation_state"), 32) or "unclassified"
+        for item in results
     )
     missing = Counter(
         text
@@ -327,13 +336,14 @@ def build_match_review_context(
     payload: Dict[str, Any] = {
         "aggregate": {
             "match_count": len(results),
-            "tier_counts": dict(sorted(tier_counts.items())),
-            "ab_count": tier_counts.get("A", 0) + tier_counts.get("B", 0),
             "status_counts": dict(sorted(status_counts.items())),
             "dealbreaker_count": sum(
                 1 for item in results if _safe_bool(item.get("dealbreaker_hit"))
             ),
             "confidence_counts": dict(sorted(confidence_counts.items())),
+            "recommendation_state_counts": dict(
+                sorted(recommendation_state_counts.items())
+            ),
         },
         "top_evidence_gaps": [
             {"item": item, "count": count} for item, count in missing.most_common(6)
@@ -690,9 +700,8 @@ def _compact_round_digest(value: Any) -> Dict[str, Any]:
         "detail_fetch_count",
         "matched_count",
         "pending_match_count",
-        "a_count",
-        "b_count",
-        "ab_count",
+        "viable_count",
+        "effective_pool_score",
         "conclusion",
     )
     result: Dict[str, Any] = {}
@@ -714,6 +723,12 @@ def _compact_round_digest(value: Any) -> Dict[str, Any]:
         result["selection_counts"] = {
             compact_text(key, 32): _safe_int(item)
             for key, item in list(selection_counts.items())[:8]
+        }
+    state_counts = value.get("recommendation_state_counts")
+    if isinstance(state_counts, Mapping):
+        result["recommendation_state_counts"] = {
+            compact_text(key, 40): _safe_int(item)
+            for key, item in list(state_counts.items())[:8]
         }
     return result
 

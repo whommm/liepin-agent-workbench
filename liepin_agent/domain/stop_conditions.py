@@ -34,7 +34,7 @@ def evaluate_stop_conditions(
     if 0 < max_detail_fetches < _UNLIMITED_DETAIL_FETCHES and fetched_details >= max_detail_fetches:
         return StopDecision(True, "已达到最大详情抓取数量")
     if 0 < target_ab_count < _UNLIMITED_TARGET_AB and ab_count >= target_ab_count:
-        return StopDecision(True, "A/B 候选人数量已达到目标")
+        return StopDecision(True, "有效候选池已达到目标")
     if consecutive_low_yield_rounds >= max(1, low_yield_threshold):
         return StopDecision(True, "连续低产出轮次过多，建议人工校准")
     return StopDecision(False, "")

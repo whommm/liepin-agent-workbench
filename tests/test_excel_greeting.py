@@ -1,8 +1,15 @@
+import pytest
 from openpyxl import Workbook, load_workbook
 
 from liepin_agent.tools.excel_greeting import ExcelGreetingService
 from liepin_agent.tools.greeting_text import GreetingTextGenerationService
 from liepin_agent.tools.real_liepin import RealLiepinTool
+from liepin_agent.domain.recommendation import (
+    HIGH_POTENTIAL_VERIFY,
+    INFORMATION_INSUFFICIENT,
+    PRIORITY_CONTACT,
+    TRANSFERABLE_EXPLORE,
+)
 
 
 def _make_excel(path):
@@ -14,28 +21,105 @@ def _make_excel(path):
         "公司",
         "职位",
         "金领",
-        "匹配档位",
+        "建议状态",
         "打招呼状态",
         "简历链接",
     ])
-    sheet.append(["A候选人", "能源公司", "销售总监", "是", "A", "", "https://h.liepin.com/resume/showresumedetail/?res_id=a"])
-    sheet.append(["B候选人", "能源公司", "销售经理", "是", "B", "", "/resume/showresumedetail/?res_id=b"])
-    sheet.append(["C候选人", "能源公司", "销售", "是", "C", "", "https://h.liepin.com/resume/showresumedetail/?res_id=c"])
-    sheet.append(["非金领", "能源公司", "销售", "否", "A", "", "https://h.liepin.com/resume/showresumedetail/?res_id=d"])
-    sheet.append(["已打过", "能源公司", "销售", "是", "A", "已发送", "https://h.liepin.com/resume/showresumedetail/?res_id=e"])
-    sheet.append(["外站", "能源公司", "销售", "是", "A", "", "https://example.com/resume/showresumedetail/?res_id=f"])
+    sheet.append(["优先候选人", "能源公司", "销售总监", "是", "优先沟通", "", "https://h.liepin.com/resume/showresumedetail/?res_id=a"])
+    sheet.append(["高潜候选人", "能源公司", "销售经理", "是", "高潜待确认", "", "/resume/showresumedetail/?res_id=b"])
+    sheet.append(["迁移候选人", "能源公司", "销售", "是", "可迁移探索", "", "https://h.liepin.com/resume/showresumedetail/?res_id=c"])
+    sheet.append(["非金领", "能源公司", "销售", "否", "优先沟通", "", "https://h.liepin.com/resume/showresumedetail/?res_id=d"])
+    sheet.append(["已打过", "能源公司", "销售", "是", "优先沟通", "已发送", "https://h.liepin.com/resume/showresumedetail/?res_id=e"])
+    sheet.append(["外站", "能源公司", "销售", "是", "优先沟通", "", "https://example.com/resume/showresumedetail/?res_id=f"])
     workbook.save(path)
     workbook.close()
 
 
-def test_excel_greeting_loads_only_ab_gold_candidates(tmp_path):
+def _make_recommendation_excel(path):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "候选人"
+    sheet.append([
+        "姓名",
+        "公司",
+        "职位",
+        "金领",
+        "建议状态",
+        "打招呼状态",
+        "简历链接",
+    ])
+    rows = [
+        ("优先", "优先沟通", "priority"),
+        ("高潜", "high_potential_verify", "potential"),
+        ("迁移", "可迁移探索", "transfer"),
+        ("不足", "信息不足", "insufficient"),
+        ("不匹配", "明确不匹配", "mismatch"),
+    ]
+    for name, state, resume_id in rows:
+        sheet.append([
+            name,
+            "能源公司",
+            "销售",
+            "是",
+            state,
+            "",
+            "https://h.liepin.com/resume/showresumedetail/?res_id={}".format(resume_id),
+        ])
+    workbook.save(path)
+    workbook.close()
+
+
+def test_excel_greeting_loads_default_recommendation_states(tmp_path):
     path = tmp_path / "candidates.xlsx"
     _make_excel(path)
 
     candidates = ExcelGreetingService.load_greetable_candidates(path)
 
-    assert [item.name for item in candidates] == ["A候选人", "B候选人"]
+    assert [item.name for item in candidates] == ["优先候选人", "高潜候选人"]
     assert candidates[1].profile_url == "https://h.liepin.com/resume/showresumedetail/?res_id=b"
+
+
+def test_excel_greeting_rejects_retired_tier_only_workbook(tmp_path):
+    path = tmp_path / "legacy.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["姓名", "金领", "匹配档位", "打招呼状态", "简历链接"])
+    sheet.append(["旧候选人", "是", "A", "", "https://h.liepin.com/resume/showresumedetail/?res_id=old"])
+    workbook.save(path)
+    workbook.close()
+
+    with pytest.raises(ValueError, match="建议状态"):
+        ExcelGreetingService.load_greetable_candidates(path)
+
+
+def test_excel_greeting_filters_by_selected_recommendation_states(tmp_path):
+    path = tmp_path / "recommendations.xlsx"
+    _make_recommendation_excel(path)
+
+    default_candidates = ExcelGreetingService.load_greetable_candidates(path)
+    assert [item.name for item in default_candidates] == ["优先", "高潜"]
+    assert [item.recommendation_state for item in default_candidates] == [
+        PRIORITY_CONTACT,
+        HIGH_POTENTIAL_VERIFY,
+    ]
+
+    selected = ExcelGreetingService.load_greetable_candidates(
+        path,
+        recommendation_states=[TRANSFERABLE_EXPLORE, INFORMATION_INSUFFICIENT],
+    )
+    assert [item.name for item in selected] == ["迁移", "不足"]
+
+
+def test_excel_greeting_never_bulk_loads_explicit_mismatch(tmp_path):
+    path = tmp_path / "recommendations.xlsx"
+    _make_recommendation_excel(path)
+
+    candidates = ExcelGreetingService.load_greetable_candidates(
+        path,
+        recommendation_states=["explicit_mismatch"],
+    )
+
+    assert candidates == []
 
 
 def test_excel_greeting_dry_run_does_not_send_or_write(tmp_path):

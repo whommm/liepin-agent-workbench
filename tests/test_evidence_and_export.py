@@ -116,6 +116,23 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
             confidence="medium",
         )
     )
+    store.save_rank_snapshots(
+        session_id,
+        criteria_id,
+        [
+            {
+                "candidate_id": candidate_id,
+                "fit_score": 86,
+                "confidence_score": 80,
+                "known_fit_score": 86,
+                "potential_fit_score": 92,
+                "evidence_coverage_score": 80,
+                "recommendation_state": "priority_contact",
+                "rank_score": 86,
+                "rank_position": 1,
+            }
+        ],
+    )
     rejected = CandidateSummary(
         session_id=session_id,
         round_id=round_id,
@@ -152,9 +169,11 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     workbook = load_workbook(path)
 
     assert "推荐总览" in workbook.sheetnames
-    assert "合格A_B" in workbook.sheetnames
-    assert "待复核_未匹配" in workbook.sheetnames
-    assert "不合格C" in workbook.sheetnames
+    assert "优先沟通" in workbook.sheetnames
+    assert "高潜待确认" in workbook.sheetnames
+    assert "可迁移探索" in workbook.sheetnames
+    assert "信息不足" in workbook.sheetnames
+    assert "明确不匹配" in workbook.sheetnames
     assert "候选人" in workbook.sheetnames
     assert "寻访基准" in workbook.sheetnames
     assert "效率总结" in workbook.sheetnames
@@ -162,23 +181,27 @@ def test_export_contains_criteria_evidence_sources_and_metrics(tmp_path):
     overview_headers = [cell.value for cell in workbook["推荐总览"][1]]
     assert "结论" in overview_headers
     assert "候选人档案" in overview_headers
-    assert workbook["推荐总览"]["A2"].value == "可推荐"
+    assert workbook["推荐总览"]["A2"].value == "优先沟通"
     name_column = overview_headers.index("姓名") + 1
-    assert workbook["合格A_B"].cell(row=2, column=name_column).value == "候选人"
-    assert (
-        workbook["待复核_未匹配"].cell(row=2, column=name_column).value
-        == "待复核候选人"
-    )
-    assert (
-        workbook["不合格C"].cell(row=2, column=name_column).value
-        == "不合格候选人"
-    )
+    assert workbook["优先沟通"].cell(row=2, column=name_column).value == "候选人"
+    insufficient_names = {
+        workbook["信息不足"].cell(row=row, column=name_column).value
+        for row in range(2, workbook["信息不足"].max_row + 1)
+    }
+    assert insufficient_names == {"不合格候选人", "待复核候选人"}
     headers = [cell.value for cell in workbook["候选人"][1]]
     assert "命中证据" in headers
     assert "基准版本" in headers
     assert "简历链接" in headers
     assert "金领" in headers
     assert "打招呼状态" in headers
+    assert "建议状态" in headers
+    assert "已知适配度" in headers
+    assert "潜在上界" in headers
+    assert "证据覆盖度" in headers
+    assert "综合排序分" in headers
+    assert "人工判断" in headers
+    assert "业务结果" in headers
     evidence_column = headers.index("命中证据") + 1
     link_column = headers.index("简历链接") + 1
     gold_column = headers.index("金领") + 1
@@ -302,5 +325,5 @@ def test_export_field_display_repairs_truncated_legacy_fields(tmp_path):
     assert fields["current_title"] == "销售经理"
     assert fields["city"] == "Zhuzhou"
     assert fields["education"] == "MBA/EMBA"
-def test_export_conclusion_treats_completed_d_as_rejected():
-    assert ExportService._candidate_conclusion({"match_tier": "D"}) == "不推荐"
+def test_export_conclusion_does_not_infer_state_from_retired_tier():
+    assert ExportService._candidate_conclusion({"match_tier": "D"}) == "信息不足"

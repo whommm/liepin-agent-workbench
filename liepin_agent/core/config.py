@@ -72,7 +72,7 @@ class AppConfig(BaseModel):
     match_concurrency_limit: int = Field(default=10, ge=1, le=50)
     max_rounds_default: int = Field(default=20, ge=1, le=50)
     max_detail_fetches_default: int = Field(default=999, ge=1, le=9999)
-    target_ab_count_default: int = Field(default=999, ge=1, le=9999)
+    target_effective_count_default: int = Field(default=999, ge=1, le=9999)
     consecutive_low_yield_threshold: int = Field(default=4, ge=1, le=10)
     jd_truncate_length: int = Field(default=800, ge=100, le=5000)
 
@@ -88,6 +88,9 @@ class AppConfig(BaseModel):
     # 浏览器自动化参数
     browser_task_timeout: int = Field(default=180, ge=30, le=600)
     detail_page_wait_seconds: float = Field(default=0.6, ge=0.0, le=10.0)
+    detail_page_ready_timeout_seconds: float = Field(default=4.0, ge=0.5, le=15.0)
+    detail_extract_max_attempts: int = Field(default=2, ge=1, le=3)
+    detail_extract_retry_wait_seconds: float = Field(default=1.5, ge=0.2, le=10.0)
     detail_min_resume_chars: int = Field(default=300, ge=50, le=5000)
     greeting_page_wait_seconds: float = Field(default=1.5, ge=0.0, le=10.0)
 

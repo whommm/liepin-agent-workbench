@@ -216,6 +216,8 @@ class _CriteriaMixin:
             return None
         item = dict(row)
         item["ai_raw_response"] = from_json(item.get("ai_raw_response_json"), {})
+        item["criteria_items"] = self.list_job_criteria(str(item.get("id") or ""))
+        item["personas"] = self.list_candidate_personas(str(item.get("id") or ""))
         return item
 
 
@@ -240,6 +242,8 @@ class _CriteriaMixin:
                 "selected_direction": str(ai_raw.get("selected_direction") or "").strip(),
                 # 性别要求只传给 matcher 作为已确认条件，不自动转成猎聘硬筛选。
                 "gender_requirement": str(ai_raw.get("gender_requirement") or "").strip(),
+                "criteria_items": version.get("criteria_items") or [],
+                "personas": version.get("personas") or [],
             }
         with self.connect() as connection:
             row = connection.execute(

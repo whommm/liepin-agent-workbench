@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
+from ...domain.recommendation import EFFECTIVE_POOL_WEIGHTS
+
 from ...domain.dedupe import build_candidate_dedupe_key
 from ...domain.models import CandidateDetail, CandidateSummary, MatchResult, SearchPlan
 from ...domain.states import CandidateStatus, RoundStatus, SessionStatus
@@ -72,21 +74,6 @@ class _MetricsMixin:
                 """,
                 (session_id, criteria_version_id),
             ).fetchone()
-            ab = connection.execute(
-                """
-                SELECT COUNT(*) AS n FROM match_results m
-                WHERE m.session_id = ? AND m.criteria_version_id = ?
-                  AND m.status = 'completed'
-                  AND UPPER(COALESCE(m.tier, '')) IN ('A', 'B')
-                  AND m.id = (
-                      SELECT m2.id FROM match_results m2
-                      WHERE m2.candidate_id = m.candidate_id
-                        AND m2.criteria_version_id = m.criteria_version_id
-                      ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
-                  )
-                """,
-                (session_id, criteria_version_id),
-            ).fetchone()
             manual = connection.execute(
                 """
                 SELECT COUNT(*) AS n FROM agent_events
@@ -98,7 +85,6 @@ class _MetricsMixin:
             ).fetchone()
         detail_count = int(details["n"] if details else 0)
         round_count = int(rounds["n"] if rounds else 0)
-        ab_count = int(ab["n"] if ab else 0)
         runtime_minutes = 0
         try:
             start = session.get("started_at")
@@ -114,6 +100,15 @@ class _MetricsMixin:
                 )
         except ValueError:
             runtime_minutes = 0
+        state_counts: Dict[str, int] = {}
+        for ranking in self.list_current_rankings(session_id, criteria_version_id):
+            state = str(ranking.get("recommendation_state") or "")
+            if state:
+                state_counts[state] = state_counts.get(state, 0) + 1
+        effective_pool_score = sum(
+            state_counts.get(state, 0) * weight
+            for state, weight in EFFECTIVE_POOL_WEIGHTS.items()
+        )
         return {
             "total_runtime_minutes": runtime_minutes,
             "search_round_count": round_count,
@@ -121,11 +116,9 @@ class _MetricsMixin:
             "unique_candidate_count": int(unique_candidates["n"] if unique_candidates else 0),
             "detail_fetch_count": detail_count,
             "matched_count": int(matched["n"] if matched else 0),
-            "ab_count": ab_count,
-            "ab_per_detail_fetch": round(ab_count / detail_count, 3) if detail_count else 0,
-            "ab_per_round": round(ab_count / round_count, 3) if round_count else 0,
-            "detail_fetch_to_ab_rate": round(ab_count / detail_count, 3) if detail_count else 0,
             "manual_intervention_count": int(manual["n"] if manual else 0),
+            "recommendation_state_counts": state_counts,
+            "effective_pool_score": round(effective_pool_score, 2),
             "status": session.get("status") or "",
         }
 
@@ -140,7 +133,7 @@ class _MetricsMixin:
                     COUNT(*) AS round_count,
                     COALESCE(SUM(raw_count), 0) AS raw_count,
                     COALESCE(SUM(detail_fetch_count), 0) AS detail_fetch_count,
-                    COALESCE(SUM(ab_count), 0) AS ab_count
+                    COALESCE(SUM(ab_count), 0) AS relevant_count
                 FROM search_rounds
                 WHERE session_id = ?
                 GROUP BY search_hypothesis_type, search_hypothesis_text
@@ -232,21 +225,6 @@ class _MetricsMixin:
                 """,
                 (session_id, criteria_version_id),
             ).fetchall()
-            tier_rows = connection.execute(
-                """
-                SELECT UPPER(COALESCE(m.tier, '')) AS tier, COUNT(*) AS n
-                FROM match_results m
-                WHERE m.session_id = ? AND m.criteria_version_id = ?
-                  AND m.id = (
-                      SELECT m2.id FROM match_results m2
-                      WHERE m2.candidate_id = m.candidate_id
-                        AND m2.criteria_version_id = m.criteria_version_id
-                      ORDER BY m2.created_at DESC, m2.rowid DESC LIMIT 1
-                  )
-                GROUP BY UPPER(COALESCE(m.tier, ''))
-                """,
-                (session_id, criteria_version_id),
-            ).fetchall()
             pending_match = connection.execute(
                 """
                 SELECT COUNT(DISTINCT d.candidate_id) AS n
@@ -275,21 +253,19 @@ class _MetricsMixin:
         card_decision_counts = self._count_rows(card_rows, "card_decision")
         detail_status_counts = self._count_rows(detail_rows, "capture_status")
         match_status_counts = self._count_rows(match_rows, "status")
-        tier_counts = self._count_rows(tier_rows, "tier")
         pending_match_count = int(pending_match["n"] if pending_match else 0)
         noise_count = int(card_decision_counts.get("noise") or 0)
         unique_count = int(metrics.get("unique_candidate_count") or 0)
         raw_count = int(metrics.get("raw_candidate_count") or 0)
         detail_count = int(metrics.get("detail_fetch_count") or 0)
         matched_count = int(metrics.get("matched_count") or 0)
-        ab_count = int(metrics.get("ab_count") or 0)
+        effective_pool_score = float(metrics.get("effective_pool_score") or 0)
         return {
             "metrics": metrics,
             "round_status_counts": round_status_counts,
             "card_decision_counts": card_decision_counts,
             "detail_status_counts": detail_status_counts,
             "match_status_counts": match_status_counts,
-            "tier_counts": tier_counts,
             "pending_match_count": pending_match_count,
             "error_count": len(error_rows),
             "recent_errors": [dict(row) for row in error_rows],
@@ -299,7 +275,7 @@ class _MetricsMixin:
                 unique_count=unique_count,
                 detail_count=detail_count,
                 matched_count=matched_count,
-                ab_count=ab_count,
+                effective_pool_score=effective_pool_score,
                 noise_count=noise_count,
                 pending_match_count=pending_match_count,
                 error_count=len(error_rows),
@@ -319,7 +295,7 @@ class _MetricsMixin:
         unique_count: int,
         detail_count: int,
         matched_count: int,
-        ab_count: int,
+        effective_pool_score: float,
         noise_count: int,
         pending_match_count: int,
         error_count: int,
@@ -333,8 +309,8 @@ class _MetricsMixin:
             flags.append("存在已抓详情但未完成匹配的候选人，后台匹配可能仍在进行或已失败。")
         if pending_match_count:
             flags.append("有 {} 位候选人等待匹配结果回写。".format(pending_match_count))
-        if detail_count and ab_count == 0:
-            flags.append("已抓详情但暂无 A/B 候选人，建议复盘搜索假设。")
+        if detail_count and effective_pool_score == 0:
+            flags.append("已抓详情但有效候选池仍为空，建议复盘搜索假设或证据缺失情况。")
         if raw_count and unique_count and unique_count / raw_count <= 0.5:
             flags.append("重复候选人占比较高，建议切换搜索假设或扩大关键词差异。")
         if error_count:

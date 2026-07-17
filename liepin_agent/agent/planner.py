@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List
 
+from ..domain.job_profile import normalize_job_profile
+
 from ..domain.models import SearchPlan
 
 
@@ -64,7 +66,7 @@ class Planner:
         core_terms = self.extract_domain_terms(text)
         position_filter = self.infer_position_filter(text)
         requirements_text = self.build_requirements_text(text, core_terms, position_filter)
-        return {
+        result = {
             "position_filter": position_filter,
             "core_terms": core_terms[:8],
             "negative_terms": ["实习", "应届", "客服", "行政"],
@@ -74,6 +76,10 @@ class Planner:
             "requirements_text": requirements_text,
             "gender_requirement": self.extract_gender_requirement(text),
         }
+        criteria_items, personas = normalize_job_profile(result)
+        result["criteria_items"] = criteria_items
+        result["personas"] = personas
+        return result
 
     def initial_plan(
         self, jd_text: str, user_notes: str = "", criteria: Dict[str, object] | None = None
@@ -146,7 +152,7 @@ class Planner:
             filters=dict(previous_plan.filters or {}),
             intent=intent,
             expected_signal=terms[:8],
-            risk="后续轮次可能边际收益下降，需要观察 A/B 产出",
+            risk="后续轮次可能边际收益下降，需要观察有效候选产出",
             search_hypothesis_type=self._infer_hypothesis_type(next_query, terms),
             search_hypothesis_text="验证搜索假设：{}".format(next_query),
         )
@@ -260,6 +266,14 @@ class Planner:
 
     @staticmethod
     def extract_city_scope(text: str) -> List[str]:
+        # 先尝试县级市归一化：JD 写"浙江金华义乌"时也要能识别到地级市"""
+        # 而非因为 CITY_NAMES 里没有"义乌"就把整段地点漏掉。
+        # _COUNTY_TO_PREFECTURE 的值本身就是合法地级市，直接信任即可。
+        from .city_normalizer import _COUNTY_TO_PREFECTURE
+
+        for county, prefecture in _COUNTY_TO_PREFECTURE.items():
+            if county in (text or ""):
+                return [prefecture]
         for city in CITY_NAMES:
             if city in (text or ""):
                 if city == "深圳":

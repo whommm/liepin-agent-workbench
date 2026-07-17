@@ -109,35 +109,6 @@ class _MatchMixin:
         return result
 
 
-    def count_ab_matches(self, session_id: str) -> int:
-        criteria = self.get_latest_criteria_version(session_id, "confirmed")
-        criteria_version_id = str((criteria or {}).get("id") or "")
-        if not criteria_version_id:
-            return 0
-        with self.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM match_results m
-                WHERE m.session_id = ?
-                  AND m.criteria_version_id = ?
-                  AND m.status = 'completed'
-                  AND UPPER(COALESCE(m.tier, '')) IN ('A', 'B')
-                  AND m.id = (
-                      SELECT m2.id
-                      FROM match_results m2
-                      WHERE m2.session_id = m.session_id
-                        AND m2.candidate_id = m.candidate_id
-                        AND m2.criteria_version_id = m.criteria_version_id
-                      ORDER BY m2.created_at DESC, m2.rowid DESC
-                      LIMIT 1
-                  )
-                """,
-                (session_id, criteria_version_id),
-            ).fetchone()
-        return int(row["count"] if row else 0)
-
-
     def find_match_result(
         self,
         candidate_id: str,

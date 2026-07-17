@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
+import time
 from collections import deque
 from html import escape
 from pathlib import Path
@@ -14,6 +16,8 @@ from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
 from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
+    QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -39,16 +43,27 @@ from PySide6.QtWidgets import (
 from ..agent.runtime import AgentRuntime
 from ..agent.brain import LLMAgentBrain
 from ..core.config import ConfigManager
+from ..domain.job_profile import normalize_job_profile
+from ..domain.greeting_policy import parse_recommendation_state
+from ..domain.recommendation import RECOMMENDATION_LABELS, recommendation_label
 from ..services.event_bus import EventBus
 from ..storage.sqlite_store import SQLiteStore, from_json
 from ..tools.exporter import ExportService
 from ..tools.excel_greeting import ExcelGreetingService, GreetingQuotaTracker
 from ..tools.real_liepin import RealLiepinTool
 from ..tools.real_matcher import RealMatchService
-from .dialogs import BatchGreetingDialog, NewSessionDialog, PoolNotificationDialog, SettingsDialog
+from .dialogs import (
+    BatchGreetingDialog,
+    GreetingScopeDialog,
+    NewSessionDialog,
+    PoolNotificationDialog,
+    SettingsDialog,
+)
 from .session_list_item import SessionListItemWidget
 from .styles import MAIN_STYLESHEET
 
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -70,9 +85,18 @@ class MainWindow(QMainWindow):
         self._runtime_events_lock = threading.Lock()
         self._queue_running = False
         self._active_pool_session_id: Optional[str] = None
+        self._pending_feedback_label = ""
+        self._runtime_dirty = False
+        self._force_refresh = False
+        self._last_refresh_monotonic = 0.0
+        self._last_heavy_refresh_monotonic = 0.0
+        self._runtime_refresh_interval = 1.0
+        self._heavy_refresh_interval = 5.0
+        self._feedback_summary_snapshot: Dict[str, object] = {}
 
         # Cache for incremental session-list updates
         self._session_list_ids: List[str] = []
+        self._session_rows_by_id: Dict[str, Dict[str, object]] = {}
 
         self.setWindowTitle("猎聘寻访 Agent 工作台")
         self._build_ui()
@@ -85,7 +109,13 @@ class MainWindow(QMainWindow):
         self.refresh_timer.setInterval(500)
         self.refresh_timer.timeout.connect(self._refresh_if_dirty)
         self.refresh_timer.start()
+        initial_refresh_started = time.monotonic()
+        logger.info("Starting initial UI refresh")
         self.refresh_all()
+        logger.info(
+            "Initial UI refresh completed in %.3fs",
+            time.monotonic() - initial_refresh_started,
+        )
 
     def _build_runtime(self) -> AgentRuntime:
         return AgentRuntime(
@@ -114,19 +144,28 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self._build_top_bar())
 
         main_splitter = QSplitter(Qt.Horizontal)
-        main_splitter.addWidget(self._build_left_panel())
-        main_splitter.addWidget(self._build_center_panel())
-        main_splitter.addWidget(self._build_right_panel())
-        main_splitter.setSizes([260, 780, 360])
+        left_panel = self._build_left_panel()
+        center_panel = self._build_center_panel()
+        right_panel = self._build_right_panel()
+        main_splitter.addWidget(left_panel)
+        main_splitter.addWidget(center_panel)
+        main_splitter.addWidget(right_panel)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setStretchFactor(2, 0)
+        main_splitter.setSizes([260, 930, 370])
         root_layout.addWidget(main_splitter, 1)
         self.setCentralWidget(root)
 
     def _build_top_bar(self) -> QWidget:
         frame = QFrame()
         frame.setObjectName("TopBar")
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(14, 6, 14, 6)
-        layout.setSpacing(8)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(6)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
 
         self.title_label = QLabel("未选择任务")
         self.title_label.setObjectName("TitleLabel")
@@ -147,39 +186,42 @@ class MainWindow(QMainWindow):
         self.browser_label = QLabel("")
         self.browser_label.setObjectName("SessionInfo")
 
-        layout.addWidget(self.title_label)
-        layout.addWidget(self.stage_label)
-        layout.addWidget(self.greeting_progress)
-        layout.addStretch(1)
-        layout.addWidget(self.stats_label)
-        layout.addWidget(self.browser_label)
+        status_row.addWidget(self.title_label)
+        status_row.addWidget(self.stage_label)
+        status_row.addWidget(self.greeting_progress)
+        status_row.addStretch(1)
+        status_row.addWidget(self.stats_label)
+        status_row.addWidget(self.browser_label)
+        layout.addLayout(status_row)
+
+        command_row = QHBoxLayout()
+        command_row.setSpacing(6)
 
         sep1 = QFrame()
         sep1.setObjectName("ToolbarSeparator")
-        layout.addWidget(sep1)
 
         # 任务操作组
         self.new_btn = QPushButton("新建")
         self.add_to_pool_btn = QPushButton("加入池")
         self.add_to_pool_btn.setObjectName("SecondaryBtn")
-        layout.addWidget(self.new_btn)
-        layout.addWidget(self.add_to_pool_btn)
+        command_row.addWidget(self.new_btn)
+        command_row.addWidget(self.add_to_pool_btn)
+        command_row.addWidget(sep1)
 
         sep2 = QFrame()
         sep2.setObjectName("ToolbarSeparator")
-        layout.addWidget(sep2)
 
         # 浏览器组
         self.open_liepin_btn = QPushButton("打开猎聘")
         self.open_liepin_btn.setObjectName("SuccessBtn")
         self.close_liepin_btn = QPushButton("关闭浏览器")
         self.close_liepin_btn.setObjectName("DangerBtn")
-        layout.addWidget(self.open_liepin_btn)
-        layout.addWidget(self.close_liepin_btn)
+        command_row.addWidget(self.open_liepin_btn)
+        command_row.addWidget(self.close_liepin_btn)
+        command_row.addWidget(sep2)
 
         sep3 = QFrame()
         sep3.setObjectName("ToolbarSeparator")
-        layout.addWidget(sep3)
 
         # 批量与设置组
         self.batch_greeting_btn = QPushButton("Excel 批量打招呼")
@@ -189,15 +231,19 @@ class MainWindow(QMainWindow):
         self.cancel_greeting_btn.setVisible(False)
         self.settings_btn = QPushButton("设置")
         self.settings_btn.setObjectName("SecondaryBtn")
-        layout.addWidget(self.batch_greeting_btn)
-        layout.addWidget(self.cancel_greeting_btn)
-        layout.addWidget(self.settings_btn)
+        command_row.addWidget(self.batch_greeting_btn)
+        command_row.addWidget(self.cancel_greeting_btn)
+        command_row.addStretch(1)
+        command_row.addWidget(sep3)
+        command_row.addWidget(self.settings_btn)
+        layout.addLayout(command_row)
 
         return frame
 
     def _build_left_panel(self) -> QWidget:
         container = QWidget()
-        container.setMinimumWidth(320)
+        container.setMinimumWidth(250)
+        container.setMaximumWidth(320)
         outer_layout = QVBoxLayout(container)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(6)
@@ -248,7 +294,7 @@ class MainWindow(QMainWindow):
         sessions_layout.addWidget(self.session_list, 1)
         splitter.addWidget(sessions_frame)
 
-        splitter.setSizes([220, 380])
+        splitter.setSizes([180, 420])
         outer_layout.addWidget(splitter)
         return container
 
@@ -258,7 +304,7 @@ class MainWindow(QMainWindow):
         timeline_frame.setObjectName("Panel")
         timeline_layout = QVBoxLayout(timeline_frame)
         timeline_layout.setContentsMargins(8, 8, 8, 8)
-        timeline_title = QLabel("Agent 决策时间线")
+        timeline_title = QLabel("运行记录")
         timeline_title.setObjectName("SectionTitle")
         timeline_layout.addWidget(timeline_title)
         self.timeline = QTextBrowser()
@@ -269,10 +315,17 @@ class MainWindow(QMainWindow):
         table_frame.setObjectName("Panel")
         table_layout = QVBoxLayout(table_frame)
         table_layout.setContentsMargins(8, 8, 8, 8)
-        table_title = QLabel("候选人池")
-        table_title.setObjectName("SectionTitle")
-        table_layout.addWidget(table_title)
-        self.candidate_table = QTableWidget(0, 13)
+        self.candidate_table_title = QLabel("候选人详情")
+        self.candidate_table_title.setObjectName("SectionTitle")
+        candidate_table_header = QHBoxLayout()
+        candidate_table_header.addWidget(self.candidate_table_title)
+        candidate_table_header.addStretch(1)
+        self.select_greeting_scope_btn = QPushButton("按资格选择")
+        self.select_greeting_scope_btn.setObjectName("SecondaryBtn")
+        self.select_greeting_scope_btn.setToolTip("按建议状态批量选中候选人，之后仍可逐人取消。")
+        candidate_table_header.addWidget(self.select_greeting_scope_btn)
+        table_layout.addLayout(candidate_table_header)
+        self.candidate_table = QTableWidget(0, 17)
         self.candidate_table.setHorizontalHeaderLabels(
             [
                 "姓名",
@@ -283,8 +336,12 @@ class MainWindow(QMainWindow):
                 "学历",
                 "金领",
                 "卡片判断",
-                "匹配",
-                "证据分",
+                "建议状态",
+                "已知适配",
+                "潜在上界",
+                "证据覆盖",
+                "综合排序",
+                "人工判断",
                 "打招呼",
                 "状态",
                 "摘要",
@@ -295,53 +352,187 @@ class MainWindow(QMainWindow):
         self.candidate_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.candidate_table.verticalHeader().setVisible(False)
         self.candidate_table.setAlternatingRowColors(True)
-        self.candidate_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        candidate_header = self.candidate_table.horizontalHeader()
+        candidate_header.setSectionResizeMode(QHeaderView.Interactive)
+        candidate_header.setStretchLastSection(False)
+        candidate_header.setMinimumSectionSize(42)
         self.candidate_table.verticalHeader().setDefaultSectionSize(28)
-        self.candidate_table.setColumnWidth(0, 75)
-        self.candidate_table.setColumnWidth(1, 120)
-        self.candidate_table.setColumnWidth(2, 100)
-        self.candidate_table.setColumnWidth(3, 50)
-        self.candidate_table.setColumnWidth(4, 40)
-        self.candidate_table.setColumnWidth(5, 50)
-        self.candidate_table.setColumnWidth(6, 40)
-        self.candidate_table.setColumnWidth(7, 70)
-        self.candidate_table.setColumnWidth(8, 45)
-        self.candidate_table.setColumnWidth(9, 60)
-        self.candidate_table.setColumnWidth(10, 60)
-        self.candidate_table.setColumnWidth(11, 50)
+        self.candidate_table.setColumnWidth(0, 90)
+        self.candidate_table.setColumnWidth(3, 58)
+        self.candidate_table.setColumnWidth(4, 52)
+        self.candidate_table.setColumnWidth(7, 80)
+        self.candidate_table.setColumnWidth(8, 96)
+        self.candidate_table.setColumnWidth(9, 68)
+        self.candidate_table.setColumnWidth(10, 68)
+        self.candidate_table.setColumnWidth(11, 68)
+        self.candidate_table.setColumnWidth(12, 68)
+        self.candidate_table.setColumnWidth(13, 76)
+        self.candidate_table.setColumnWidth(14, 72)
+        candidate_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        candidate_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        for hidden_column in (4, 5, 6, 7, 15, 16):
+            self.candidate_table.setColumnHidden(hidden_column, True)
         self._candidate_table_initialized = False
         table_layout.addWidget(self.candidate_table, 1)
 
-        splitter.addWidget(timeline_frame)
         splitter.addWidget(table_frame)
-        splitter.setSizes([420, 300])
+        splitter.addWidget(timeline_frame)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([620, 180])
         return splitter
+
+    def _build_feedback_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(6)
+
+        title = QLabel("人工判断")
+        title.setObjectName("FormSectionLabel")
+        layout.addWidget(title)
+
+        decision_row = QHBoxLayout()
+        decision_row.setSpacing(6)
+        self.feedback_button_group = QButtonGroup(self)
+        self.feedback_button_group.setExclusive(True)
+        self.feedback_buttons: Dict[str, QPushButton] = {}
+        for value, text, object_name in (
+            ("recommended", "推荐", "SuccessBtn"),
+            ("uncertain", "待确认", "SecondaryBtn"),
+            ("not_suitable", "不合适", "DangerBtn"),
+        ):
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setObjectName(object_name)
+            button.clicked.connect(
+                lambda _checked=False, selected=value: self._select_feedback_label(selected)
+            )
+            self.feedback_button_group.addButton(button)
+            self.feedback_buttons[value] = button
+            decision_row.addWidget(button)
+        layout.addLayout(decision_row)
+
+        self.feedback_reason_combo = QComboBox()
+        self.feedback_reason_combo.addItem("选择原因", "")
+        for reason in (
+            "核心经验不足",
+            "行业不匹配",
+            "职位层级不匹配",
+            "地点不匹配",
+            "薪资不匹配",
+            "信息不足",
+            "其他",
+        ):
+            self.feedback_reason_combo.addItem(reason, reason)
+        layout.addWidget(self.feedback_reason_combo)
+
+        self.feedback_note_input = QLineEdit()
+        self.feedback_note_input.setPlaceholderText("补充判断依据")
+        layout.addWidget(self.feedback_note_input)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        self.save_feedback_btn = QPushButton("保存判断")
+        self.pairwise_feedback_btn = QPushButton("首行优先")
+        self.pairwise_feedback_btn.setToolTip("选择两位候选人后，记录表格中靠前者更优")
+        self.pairwise_feedback_btn.setEnabled(False)
+        action_row.addWidget(self.save_feedback_btn)
+        action_row.addWidget(self.pairwise_feedback_btn)
+        layout.addLayout(action_row)
+        return panel
 
     def _build_right_panel(self) -> QWidget:
         frame = QFrame()
         frame.setObjectName("Panel")
+        frame.setMinimumWidth(330)
+        frame.setMaximumWidth(430)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(8, 8, 8, 8)
 
+        inspector_title = QLabel("工作检查器")
+        inspector_title.setObjectName("SectionTitle")
+        layout.addWidget(inspector_title)
+
+        self.right_tabs = QTabWidget()
+        self.right_tabs.setDocumentMode(True)
+
+        profile_widget = QWidget()
+        profile_layout = QVBoxLayout(profile_widget)
+        profile_layout.setContentsMargins(8, 8, 8, 8)
+        profile_layout.setSpacing(8)
+
         criteria_title = QLabel("岗位匹配要求")
-        criteria_title.setObjectName("SectionTitle")
-        layout.addWidget(criteria_title)
+        criteria_title.setObjectName("FormSectionLabel")
+        profile_layout.addWidget(criteria_title)
         self.criteria_requirements_input = QTextEdit()
         self.criteria_requirements_input.setPlaceholderText(
             "用一段话描述本岗位最关键的匹配要求，例如：\n"
             "需要5年以上无刷电机设计经验，熟悉FOC控制算法，有小家电或新能源汽车行业背景优先。"
         )
-        self.criteria_requirements_input.setMaximumHeight(150)
-        layout.addWidget(self.criteria_requirements_input)
+        self.criteria_requirements_input.setMaximumHeight(140)
+        profile_layout.addWidget(self.criteria_requirements_input)
 
         direction_title = QLabel("寻访方向（AI 对岗位的理解，可直接编辑修正）")
         direction_title.setObjectName("HintLabel")
-        layout.addWidget(direction_title)
+        profile_layout.addWidget(direction_title)
         self.search_direction_input = QLineEdit()
         self.search_direction_input.setPlaceholderText("AI 生成草案后显示对岗位的理解方向")
         self.search_direction_input.setEnabled(False)
-        layout.addWidget(self.search_direction_input)
+        profile_layout.addWidget(self.search_direction_input)
+
+        self.profile_tabs = QTabWidget()
+        self.profile_tabs.setDocumentMode(True)
+
+        criteria_widget = QWidget()
+        criteria_layout = QVBoxLayout(criteria_widget)
+        criteria_layout.setContentsMargins(2, 2, 2, 2)
+        criteria_actions = QHBoxLayout()
+        criteria_actions.addStretch(1)
+        self.add_criterion_btn = QPushButton("+")
+        self.add_criterion_btn.setToolTip("新增岗位条件")
+        self.remove_criterion_btn = QPushButton("-")
+        self.remove_criterion_btn.setToolTip("删除选中的岗位条件")
+        criteria_actions.addWidget(self.add_criterion_btn)
+        criteria_actions.addWidget(self.remove_criterion_btn)
+        criteria_layout.addLayout(criteria_actions)
+        self.criteria_items_table = QTableWidget(0, 8)
+        self.criteria_items_table.setHorizontalHeaderLabels(
+            ["类型", "条件", "权重", "替代条件", "搜索词", "年限窗", "证据渠道", "证据要求"]
+        )
+        self.criteria_items_table.verticalHeader().setVisible(False)
+        self.criteria_items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.criteria_items_table.horizontalHeader().setStretchLastSection(True)
+        self.criteria_items_table.setColumnWidth(0, 72)
+        self.criteria_items_table.setColumnWidth(1, 180)
+        self.criteria_items_table.setColumnWidth(2, 50)
+        criteria_layout.addWidget(self.criteria_items_table)
+        self.profile_tabs.addTab(criteria_widget, "结构化条件")
+
+        personas_widget = QWidget()
+        personas_layout = QVBoxLayout(personas_widget)
+        personas_layout.setContentsMargins(2, 2, 2, 2)
+        persona_actions = QHBoxLayout()
+        persona_actions.addStretch(1)
+        self.add_persona_btn = QPushButton("+")
+        self.add_persona_btn.setToolTip("新增人才原型")
+        self.remove_persona_btn = QPushButton("-")
+        self.remove_persona_btn.setToolTip("删除选中的人才原型")
+        persona_actions.addWidget(self.add_persona_btn)
+        persona_actions.addWidget(self.remove_persona_btn)
+        personas_layout.addLayout(persona_actions)
+        self.personas_table = QTableWidget(0, 5)
+        self.personas_table.setHorizontalHeaderLabels(
+            ["名称", "描述", "职位/技能", "公司类型", "优先级"]
+        )
+        self.personas_table.verticalHeader().setVisible(False)
+        self.personas_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.personas_table.horizontalHeader().setStretchLastSection(True)
+        self.personas_table.setColumnWidth(0, 90)
+        self.personas_table.setColumnWidth(1, 180)
+        personas_layout.addWidget(self.personas_table)
+        self.profile_tabs.addTab(personas_widget, "人才原型")
+        profile_layout.addWidget(self.profile_tabs, 1)
 
         criteria_buttons = QHBoxLayout()
         self.regenerate_criteria_btn = QPushButton("重新生成草案")
@@ -352,11 +543,9 @@ class MainWindow(QMainWindow):
         criteria_buttons.addWidget(self.regenerate_criteria_btn)
         criteria_buttons.addWidget(self.confirm_criteria_btn)
         criteria_buttons.addWidget(self.confirm_and_start_btn)
-        layout.addLayout(criteria_buttons)
+        profile_layout.addLayout(criteria_buttons)
 
-        # Tabbed lower area: 策略 / 详情 / 日志
-        self.right_tabs = QTabWidget()
-        self.right_tabs.setDocumentMode(True)
+        self.profile_tab_index = self.right_tabs.addTab(profile_widget, "画像")
 
         strategy_widget = QWidget()
         strategy_layout = QVBoxLayout(strategy_widget)
@@ -364,27 +553,96 @@ class MainWindow(QMainWindow):
         self.strategy_view = QTextBrowser()
         self.strategy_view.setMinimumHeight(120)
         strategy_layout.addWidget(self.strategy_view)
-        self.right_tabs.addTab(strategy_widget, "📋 策略")
+        self.right_tabs.addTab(strategy_widget, "策略")
+
+        coverage_widget = QWidget()
+        coverage_layout = QVBoxLayout(coverage_widget)
+        coverage_layout.setContentsMargins(8, 8, 8, 8)
+        coverage_primary_actions = QHBoxLayout()
+        self.pause_hypothesis_btn = QPushButton("暂停方向")
+        self.resume_hypothesis_btn = QPushButton("恢复方向")
+        self.raise_hypothesis_btn = QPushButton("提高优先级")
+        self.lower_hypothesis_btn = QPushButton("降低优先级")
+        self.pause_hypothesis_btn.setObjectName("SecondaryBtn")
+        coverage_primary_actions.addWidget(self.pause_hypothesis_btn)
+        coverage_primary_actions.addWidget(self.resume_hypothesis_btn)
+        coverage_layout.addLayout(coverage_primary_actions)
+
+        coverage_priority_actions = QHBoxLayout()
+        coverage_priority_actions.addWidget(self.raise_hypothesis_btn)
+        coverage_priority_actions.addWidget(self.lower_hypothesis_btn)
+        coverage_layout.addLayout(coverage_priority_actions)
+
+        self.coverage_summary_label = QLabel("")
+        self.coverage_summary_label.setObjectName("HintLabel")
+        coverage_layout.addWidget(self.coverage_summary_label)
+        self.coverage_table = QTableWidget(0, 8)
+        self.coverage_table.setHorizontalHeaderLabels(
+            ["方向", "搜索词", "状态", "次数", "新增", "有效", "重复率", "优先级"]
+        )
+        self.coverage_table.verticalHeader().setVisible(False)
+        self.coverage_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.coverage_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.coverage_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.coverage_table.horizontalHeader().setStretchLastSection(True)
+        coverage_layout.addWidget(self.coverage_table)
+        self.right_tabs.addTab(coverage_widget, "覆盖")
+
+        quality_widget = QWidget()
+        quality_layout = QVBoxLayout(quality_widget)
+        quality_layout.setContentsMargins(8, 8, 8, 8)
+        quality_header = QHBoxLayout()
+        self.refresh_ranking_btn = QPushButton("刷新排序")
+        self.refresh_ranking_btn.setObjectName("SecondaryBtn")
+        quality_header.addWidget(self.refresh_ranking_btn)
+        quality_header.addStretch(1)
+        quality_layout.addLayout(quality_header)
+        self.quality_view = QTextBrowser()
+        quality_layout.addWidget(self.quality_view)
+        self.right_tabs.addTab(quality_widget, "质量")
 
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
         detail_layout.setContentsMargins(8, 8, 8, 8)
-        detail_header = QHBoxLayout()
-        detail_header.addStretch(1)
+        outcome_row = QHBoxLayout()
+        self.outcome_combo = QComboBox()
+        self.outcome_combo.addItem("业务结果", "")
+        for text, value in (
+            ("已打招呼", "greeted"),
+            ("已回复", "replied"),
+            ("已约面", "interview"),
+            ("未通过", "rejected"),
+            ("已录用", "hired"),
+            ("未回复", "no_response"),
+        ):
+            self.outcome_combo.addItem(text, value)
+        self.save_outcome_btn = QPushButton("记录结果")
+        self.outcome_combo.setEnabled(False)
+        self.save_outcome_btn.setEnabled(False)
+        outcome_row.addWidget(self.outcome_combo, 1)
+        outcome_row.addWidget(self.save_outcome_btn)
+        detail_layout.addLayout(outcome_row)
+
+        candidate_action_row = QHBoxLayout()
+        self.reevaluate_btn = QPushButton("重新评估")
+        self.reevaluate_btn.setObjectName("SecondaryBtn")
+        self.reevaluate_btn.setEnabled(False)
+        candidate_action_row.addWidget(self.reevaluate_btn)
         self.manual_greeting_btn = QPushButton("手动打招呼")
         self.manual_greeting_btn.setEnabled(False)
-        detail_header.addWidget(self.manual_greeting_btn)
-        detail_layout.addLayout(detail_header)
+        candidate_action_row.addWidget(self.manual_greeting_btn)
+        detail_layout.addLayout(candidate_action_row)
         self.detail_view = QTextBrowser()
         detail_layout.addWidget(self.detail_view, 1)
-        self.right_tabs.addTab(detail_widget, "👤 详情")
+        detail_layout.addWidget(self._build_feedback_panel())
+        self.detail_tab_index = self.right_tabs.addTab(detail_widget, "候选人")
 
         log_widget = QWidget()
         log_layout = QVBoxLayout(log_widget)
         log_layout.setContentsMargins(8, 8, 8, 8)
         self.log_view = QTextBrowser()
         log_layout.addWidget(self.log_view, 1)
-        self.right_tabs.addTab(log_widget, "📝 日志")
+        self.right_tabs.addTab(log_widget, "日志")
 
         layout.addWidget(self.right_tabs, 1)
         return frame
@@ -402,12 +660,36 @@ class MainWindow(QMainWindow):
         self.clear_completed_btn.clicked.connect(self._clear_completed_pool)
         self.pool_list.currentItemChanged.connect(self._on_pool_item_selected)
         self.manual_greeting_btn.clicked.connect(self.greet_selected_candidate)
+        self.select_greeting_scope_btn.clicked.connect(self._select_candidates_by_greeting_scope)
+        self.reevaluate_btn.clicked.connect(self._reevaluate_selected_candidates)
         self.regenerate_criteria_btn.clicked.connect(self.regenerate_criteria_draft)
         self.confirm_criteria_btn.clicked.connect(self.confirm_current_criteria)
         self.confirm_and_start_btn.clicked.connect(self.confirm_criteria_and_start)
         self.criteria_requirements_input.textChanged.connect(self._mark_criteria_dirty)
+        self.criteria_items_table.itemChanged.connect(self._mark_criteria_dirty)
+        self.personas_table.itemChanged.connect(self._mark_criteria_dirty)
+        self.add_criterion_btn.clicked.connect(self._add_criterion_row)
+        self.remove_criterion_btn.clicked.connect(self._remove_criterion_row)
+        self.add_persona_btn.clicked.connect(self._add_persona_row)
+        self.remove_persona_btn.clicked.connect(self._remove_persona_row)
+        self.pause_hypothesis_btn.clicked.connect(
+            lambda: self._set_selected_hypothesis_status("paused")
+        )
+        self.resume_hypothesis_btn.clicked.connect(
+            lambda: self._set_selected_hypothesis_status("pending")
+        )
+        self.raise_hypothesis_btn.clicked.connect(
+            lambda: self._adjust_selected_hypothesis_priority(0.1)
+        )
+        self.lower_hypothesis_btn.clicked.connect(
+            lambda: self._adjust_selected_hypothesis_priority(-0.1)
+        )
+        self.refresh_ranking_btn.clicked.connect(self._refresh_candidate_ranking)
         self.session_list.currentItemChanged.connect(self._on_session_changed)
         self.candidate_table.itemSelectionChanged.connect(self._on_candidate_selected)
+        self.save_feedback_btn.clicked.connect(self._save_candidate_feedback)
+        self.pairwise_feedback_btn.clicked.connect(self._save_pairwise_feedback)
+        self.save_outcome_btn.clicked.connect(self._save_candidate_outcome)
         self.event_bus.subscribe(self._queue_runtime_event)
 
     def _apply_style(self) -> None:
@@ -425,7 +707,8 @@ class MainWindow(QMainWindow):
             mode=str(payload["mode"]),
             max_rounds=int(payload["max_rounds"]),
             max_detail_fetches=int(payload["max_detail_fetches"]),
-            target_ab_count=int(payload["target_ab_count"]),
+            # SQLite retains the historical column name for migration safety.
+            target_ab_count=int(payload["target_effective_count"]),
         )
         if add_to_pool:
             self.store.add_session_to_pool(session_id)
@@ -608,6 +891,7 @@ class MainWindow(QMainWindow):
         delay_max = float(payload.get("delay_max") or 5.0)
         max_retries = int(payload.get("max_retries") or 1)
         max_candidates = int(payload.get("max_candidates") or 0)
+        recommendation_states = list(payload.get("recommendation_states") or [])
         excel_path = str(payload.get("excel_path") or "")
         if excel_path:
             self.config_manager.update(last_greeting_excel_path=excel_path)
@@ -631,8 +915,12 @@ class MainWindow(QMainWindow):
         action_label = "预览 dry-run（不会实际发送）" if dry_run else "实际发送打招呼"
         gold_label = "发送前会重新打开页面复核金领状态" if verify_gold_on_page else "将信任 Excel 金领字段，不做页面复核"
         resume_label = "同时索要简历" if request_resume else "不索要简历"
-        scope_label = "A/B + 金领" if gold_only else "A/B（全部）"
-        limit_label = "全部（{} 人）".format(count) if max_candidates == 0 else "前 {} 人（A 档优先）".format(count)
+        scope_label = "、".join(
+            RECOMMENDATION_LABELS.get(state, state) for state in recommendation_states
+        )
+        if gold_only:
+            scope_label += " + 金领"
+        limit_label = "全部（{} 人）".format(count) if max_candidates == 0 else "前 {} 人（按建议状态优先）".format(count)
         reply = QMessageBox.question(
             self,
             "确认批量打招呼",
@@ -659,6 +947,7 @@ class MainWindow(QMainWindow):
             delay_max=delay_max,
             max_retries=max_retries,
             max_candidates=max_candidates,
+            recommendation_states=recommendation_states,
         )
 
     def _start_excel_batch_greeting(
@@ -673,6 +962,7 @@ class MainWindow(QMainWindow):
         delay_max: float = 5.0,
         max_retries: int = 1,
         max_candidates: int = 0,
+        recommendation_states: Optional[List[str]] = None,
     ) -> None:
         self.batch_greeting_btn.setEnabled(False)
         self.batch_greeting_btn.setText("预览中..." if dry_run else "打招呼中...")
@@ -697,6 +987,7 @@ class MainWindow(QMainWindow):
                     gold_only=gold_only,
                     max_retries=max_retries,
                     max_candidates=max_candidates,
+                    recommendation_states=recommendation_states,
                     progress_callback=lambda current, total, name: self.event_bus.publish(
                         "excel_greeting_progress",
                         {"current": current, "total": total, "name": name},
@@ -1043,6 +1334,8 @@ class MainWindow(QMainWindow):
             return
         # 获取用户编辑后的寻访方向
         selected_direction = self.search_direction_input.text().strip()
+        criteria_items = self._criteria_items_from_editor()
+        personas = self._personas_from_editor()
         # 继承并更新 ai_raw_response
         ai_raw = {}
         if criteria and criteria.get("ai_raw_response"):
@@ -1066,8 +1359,9 @@ class MainWindow(QMainWindow):
                 )
                 self.store.confirm_criteria_version(criteria_id)
             else:
+                criteria_id = str(criteria["id"])
                 self.store.update_criteria_version(
-                    str(criteria["id"]), keywords, requirements, status="draft"
+                    criteria_id, keywords, requirements, status="draft"
                 )
                 # 同步更新 ai_raw_response_json
                 try:
@@ -1076,11 +1370,11 @@ class MainWindow(QMainWindow):
                         with self.store.connect() as conn:
                             conn.execute(
                                 "UPDATE match_criteria_versions SET ai_raw_response_json = ? WHERE id = ?",
-                                (json.dumps(ai_raw, ensure_ascii=False), str(criteria["id"])),
+                                (json.dumps(ai_raw, ensure_ascii=False), criteria_id),
                             )
                 except Exception:
                     pass
-                self.store.confirm_criteria_version(str(criteria["id"]))
+                self.store.confirm_criteria_version(criteria_id)
         else:
             criteria_id = self.store.create_criteria_version(
                 self.selected_session_id,
@@ -1092,6 +1386,20 @@ class MainWindow(QMainWindow):
                 created_by="human",
             )
             self.store.confirm_criteria_version(criteria_id)
+        if not criteria_items or not personas:
+            normalized_items, normalized_personas = normalize_job_profile(
+                {
+                    **ai_raw,
+                    "requirements_text": requirements,
+                    "criteria_items": criteria_items,
+                    "personas": personas,
+                }
+            )
+            criteria_items = criteria_items or normalized_items
+            personas = personas or normalized_personas
+        for item in criteria_items:
+            item["human_confirmed"] = True
+        self.store.replace_job_profile(criteria_id, criteria_items, personas)
         self.store.add_event(
             self.selected_session_id,
             None,
@@ -1153,7 +1461,7 @@ class MainWindow(QMainWindow):
             keywords = "\n".join(str(item) for item in criteria.get("core_terms", []) if item)
         if not requirements:
             requirements = "请人工填写本岗位最关键的匹配要求。"
-        self.store.create_criteria_version(
+        criteria_id = self.store.create_criteria_version(
             session_id,
             keywords,
             requirements,
@@ -1163,6 +1471,8 @@ class MainWindow(QMainWindow):
             created_by="ai",
             status="draft",
         )
+        criteria_items, personas = normalize_job_profile(criteria)
+        self.store.replace_job_profile(criteria_id, criteria_items, personas)
         self.store.add_event(
             session_id,
             None,
@@ -1181,7 +1491,113 @@ class MainWindow(QMainWindow):
         self.selected_candidate_id = None
         self.detail_view.clear()
         self._update_manual_greeting_button_state()
+        self._update_feedback_controls_state()
+        self._update_reevaluate_button_state()
         self._mark_dirty()
+
+    def _add_criterion_row(self) -> None:
+        row = self.criteria_items_table.rowCount()
+        self.criteria_items_table.insertRow(row)
+        for column, value in enumerate(
+            ["preferred", "", "0.6", "", "", "", "resume", "需要简历直接事实证据"]
+        ):
+            self.criteria_items_table.setItem(row, column, QTableWidgetItem(value))
+        self.criteria_items_table.setCurrentCell(row, 1)
+
+    def _remove_criterion_row(self) -> None:
+        rows = sorted(
+            {index.row() for index in self.criteria_items_table.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            self.criteria_items_table.removeRow(row)
+
+    def _add_persona_row(self) -> None:
+        row = self.personas_table.rowCount()
+        self.personas_table.insertRow(row)
+        for column, value in enumerate(["新人才原型", "", "", "", "0.5"]):
+            self.personas_table.setItem(row, column, QTableWidgetItem(value))
+        self.personas_table.setCurrentCell(row, 0)
+
+    def _remove_persona_row(self) -> None:
+        rows = sorted(
+            {index.row() for index in self.personas_table.selectedIndexes()},
+            reverse=True,
+        )
+        for row in rows:
+            self.personas_table.removeRow(row)
+
+    def _criteria_items_from_editor(self) -> List[Dict[str, object]]:
+        result: List[Dict[str, object]] = []
+        for row in range(self.criteria_items_table.rowCount()):
+            values = [
+                self.criteria_items_table.item(row, column).text().strip()
+                if self.criteria_items_table.item(row, column)
+                else ""
+                for column in range(8)
+            ]
+            if not values[1]:
+                continue
+            try:
+                weight = max(0.0, min(1.0, float(values[2] or 0.5)))
+            except ValueError:
+                weight = 0.5
+            try:
+                time_window = int(values[5]) if values[5] else None
+            except ValueError:
+                time_window = None
+            result.append(
+                {
+                    "criterion_type": values[0] or "preferred",
+                    "criterion_text": values[1],
+                    "weight": weight,
+                    "alternatives": self._split_editor_terms(values[3]),
+                    "search_aliases": self._split_editor_terms(values[4]),
+                    "time_window_years": time_window,
+                    "observability": values[6] or "resume",
+                    "evidence_policy": values[7],
+                    "confidence": 1.0,
+                    "human_confirmed": True,
+                }
+            )
+        return result
+
+    def _personas_from_editor(self) -> List[Dict[str, object]]:
+        result: List[Dict[str, object]] = []
+        for row in range(self.personas_table.rowCount()):
+            values = [
+                self.personas_table.item(row, column).text().strip()
+                if self.personas_table.item(row, column)
+                else ""
+                for column in range(5)
+            ]
+            if not values[0]:
+                continue
+            try:
+                priority = max(0.0, min(1.0, float(values[4] or 0.5)))
+            except ValueError:
+                priority = 0.5
+            title_skills = self._split_editor_terms(values[2])
+            result.append(
+                {
+                    "name": values[0],
+                    "description": values[1],
+                    "titles": title_skills[:3],
+                    "skills": title_skills,
+                    "company_patterns": self._split_editor_terms(values[3]),
+                    "priority": priority,
+                    "status": "active",
+                }
+            )
+        return result
+
+    @staticmethod
+    def _split_editor_terms(value: str) -> List[str]:
+        return [
+            item.strip()
+            for item in re.split(r"[，,、;；\n]+", value or "")
+            if item.strip()
+        ]
 
     def _on_candidate_selected(self) -> None:
         candidate_ids = self._selected_candidate_ids()
@@ -1189,12 +1605,16 @@ class MainWindow(QMainWindow):
             self.selected_candidate_id = None
             self.detail_view.clear()
             self._update_manual_greeting_button_state()
+            self._update_feedback_controls_state()
+            self._update_reevaluate_button_state()
             return
         self.selected_candidate_id = candidate_ids[0]
         self._render_candidate_detail(candidate_ids[0])
         self._update_manual_greeting_button_state()
+        self._update_feedback_controls_state()
+        self._update_reevaluate_button_state()
         # Auto-switch to detail tab when a candidate is selected
-        self.right_tabs.setCurrentIndex(1)
+        self.right_tabs.setCurrentIndex(self.detail_tab_index)
 
     def _selected_candidate_ids(self) -> list[str]:
         if not hasattr(self, "candidate_table"):
@@ -1214,6 +1634,187 @@ class MainWindow(QMainWindow):
             if candidate_id and candidate_id not in candidate_ids:
                 candidate_ids.append(candidate_id)
         return candidate_ids
+
+    def _select_candidates_by_greeting_scope(self) -> None:
+        state_counts: Dict[str, int] = {}
+        row_states: Dict[int, str] = {}
+        for row in range(self.candidate_table.rowCount()):
+            state_item = self.candidate_table.item(row, 8)
+            state = parse_recommendation_state(state_item.text() if state_item else "")
+            if not state:
+                continue
+            row_states[row] = state
+            state_counts[state] = state_counts.get(state, 0) + 1
+
+        dialog = GreetingScopeDialog(state_counts, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected_states = set(dialog.selected_states())
+        selection_model = self.candidate_table.selectionModel()
+        if selection_model is None:
+            return
+        self.candidate_table.clearSelection()
+        for row, state in row_states.items():
+            if state not in selected_states:
+                continue
+            selection_model.select(
+                self.candidate_table.model().index(row, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+        self._on_candidate_selected()
+
+    def _select_feedback_label(self, label: str) -> None:
+        self._pending_feedback_label = label
+        for value, button in self.feedback_buttons.items():
+            button.setChecked(value == label)
+
+    def _update_feedback_controls_state(self) -> None:
+        if not hasattr(self, "save_feedback_btn"):
+            return
+        candidate_ids = self._selected_candidate_ids()
+        enabled = bool(candidate_ids)
+        self.pairwise_feedback_btn.setEnabled(len(candidate_ids) == 2)
+        self.outcome_combo.setEnabled(len(candidate_ids) == 1)
+        self.save_outcome_btn.setEnabled(len(candidate_ids) == 1)
+        for button in self.feedback_buttons.values():
+            button.setEnabled(enabled)
+        self.feedback_reason_combo.setEnabled(enabled)
+        self.feedback_note_input.setEnabled(enabled)
+        self.save_feedback_btn.setEnabled(enabled)
+
+        if len(candidate_ids) != 1:
+            self._pending_feedback_label = ""
+            self.feedback_button_group.setExclusive(False)
+            for button in self.feedback_buttons.values():
+                button.setChecked(False)
+            self.feedback_button_group.setExclusive(True)
+            self.feedback_reason_combo.setCurrentIndex(0)
+            self.feedback_note_input.clear()
+            return
+
+        feedback = self.store.get_latest_candidate_feedback(candidate_ids[0]) or {}
+        label = str(feedback.get("feedback_label") or "")
+        self._pending_feedback_label = label
+        self.feedback_button_group.setExclusive(False)
+        for value, button in self.feedback_buttons.items():
+            button.setChecked(value == label)
+        self.feedback_button_group.setExclusive(True)
+        reasons = feedback.get("reason_codes") or []
+        reason = str(reasons[0] if reasons else "")
+        reason_index = self.feedback_reason_combo.findData(reason)
+        self.feedback_reason_combo.setCurrentIndex(max(0, reason_index))
+        self.feedback_note_input.setText(str(feedback.get("note") or ""))
+
+    def _save_candidate_feedback(self) -> None:
+        candidate_ids = self._selected_candidate_ids()
+        if not candidate_ids:
+            return
+        if not self._pending_feedback_label:
+            QMessageBox.information(self, "人工判断", "请先选择推荐、待确认或不合适。")
+            return
+        reason = str(self.feedback_reason_combo.currentData() or "")
+        reasons = [reason] if reason else []
+        note = self.feedback_note_input.text().strip()
+        for candidate_id in candidate_ids:
+            self.store.save_candidate_feedback(
+                candidate_id,
+                self._pending_feedback_label,
+                reason_codes=reasons,
+                note=note,
+            )
+        if self.selected_session_id:
+            self.runtime.ranking_service.refresh_session(self.selected_session_id)
+        if self.selected_session_id:
+            self.store.add_event(
+                self.selected_session_id,
+                None,
+                "candidate_feedback",
+                "已记录人工判断",
+                "已标注 {} 位候选人。".format(len(candidate_ids)),
+                {
+                    "candidate_ids": candidate_ids,
+                    "feedback_label": self._pending_feedback_label,
+                    "reason_codes": reasons,
+                },
+            )
+        self._mark_dirty()
+
+    def _save_pairwise_feedback(self) -> None:
+        candidate_ids = self._selected_candidate_ids()
+        if len(candidate_ids) != 2 or not self.selected_session_id:
+            return
+        self.store.save_ranking_feedback(
+            self.selected_session_id,
+            candidate_ids[0],
+            candidate_ids[1],
+            reason=self.feedback_note_input.text().strip(),
+        )
+        self.runtime.ranking_service.refresh_session(self.selected_session_id)
+        self._mark_dirty()
+
+    def _save_candidate_outcome(self) -> None:
+        candidate_ids = self._selected_candidate_ids()
+        outcome = str(self.outcome_combo.currentData() or "")
+        if len(candidate_ids) != 1 or not outcome:
+            return
+        self.store.save_candidate_outcome(
+            candidate_ids[0],
+            outcome,
+            note=self.feedback_note_input.text().strip(),
+        )
+        self.outcome_combo.setCurrentIndex(0)
+        self._render_candidate_detail(candidate_ids[0])
+
+    def _update_reevaluate_button_state(self) -> None:
+        if not hasattr(self, "reevaluate_btn"):
+            return
+        candidate_ids = self._selected_candidate_ids()
+        eligible = any(
+            str((self.store.get_candidate_detail(candidate_id) or {}).get("resume_text") or "").strip()
+            for candidate_id in candidate_ids
+        )
+        self.reevaluate_btn.setEnabled(bool(candidate_ids) and eligible)
+        self.reevaluate_btn.setToolTip(
+            "按当前已确认的结构化岗位画像重新评估选中候选人。"
+            if eligible
+            else "候选人尚未抓取有效简历详情。"
+        )
+
+    def _reevaluate_selected_candidates(self) -> None:
+        if not self.selected_session_id:
+            return
+        session = self.store.get_session(self.selected_session_id) or {}
+        criteria = dict(self.store.get_latest_criteria(self.selected_session_id) or {})
+        if not criteria.get("criteria_version_id"):
+            QMessageBox.warning(self, "重新评估", "请先确认结构化岗位画像。")
+            return
+        criteria["jd_text"] = str(session.get("jd_text") or "")
+        criteria["user_notes"] = str(session.get("user_notes") or "")
+        queued = 0
+        candidates = {
+            str(item.get("id") or ""): item
+            for item in self.store.get_candidates_by_ids(self._selected_candidate_ids())
+        }
+        for candidate_id, candidate in candidates.items():
+            detail = self.store.get_candidate_detail(candidate_id) or {}
+            resume_text = str(detail.get("resume_text") or "").strip()
+            if not resume_text:
+                continue
+            structured, quality = self.runtime._detail_match_context(detail, resume_text)
+            self.runtime.match_queue.submit(
+                self.runtime._match_and_persist,
+                self.selected_session_id,
+                str(candidate.get("round_id") or ""),
+                candidate_id,
+                resume_text,
+                criteria,
+                None,
+                None,
+                structured,
+                quality,
+            )
+            queued += 1
+        self.stage_label.setText("已提交 {} 位候选人重新评估".format(queued))
 
     def _update_manual_greeting_button_state(self) -> None:
         if not hasattr(self, "manual_greeting_btn"):
@@ -1270,14 +1871,34 @@ class MainWindow(QMainWindow):
 
     def _mark_dirty(self) -> None:
         self._dirty = True
+        self._force_refresh = True
         QTimer.singleShot(0, self._refresh_if_dirty)
 
     def _queue_runtime_event(
         self, event_type: str, payload: Dict[str, object]
     ) -> None:
+        payload = payload or {}
+        coalesced_events = {"event_added", "session_updated"}
+        ui_only_events = {
+            "browser_ready",
+            "browser_closed",
+            "browser_error",
+            "excel_greeting_progress",
+            "excel_greeting_done",
+            "excel_greeting_error",
+        }
         with self._runtime_events_lock:
-            self._runtime_events.append((event_type, payload or {}))
-        self._dirty = True
+            if event_type not in coalesced_events:
+                self._runtime_events.append((event_type, payload))
+        if event_type not in ui_only_events:
+            self._dirty = True
+            self._runtime_dirty = True
+        if (
+            event_type in {"criteria_ready", "manual_greeting_done"}
+            or str(payload.get("event_type") or "")
+            in {"session_completed", "session_failed", "session_cancelled"}
+        ):
+            self._force_refresh = True
 
     def _drain_runtime_events(self) -> None:
         events = []
@@ -1366,29 +1987,51 @@ class MainWindow(QMainWindow):
             self._pending_browser_error = ""
             QMessageBox.warning(self, "猎聘浏览器打开失败", error)
         if self._dirty:
-            self.refresh_all()
+            now = time.monotonic()
+            if (
+                self._runtime_dirty
+                and not self._force_refresh
+                and now - self._last_refresh_monotonic
+                < self._runtime_refresh_interval
+            ):
+                self._check_queue_advance()
+                return
+            lightweight = self._runtime_dirty and not self._force_refresh
+            self.refresh_all(lightweight=lightweight)
+            self._last_refresh_monotonic = now
+            self._runtime_dirty = False
+            self._force_refresh = False
         self._check_queue_advance()
 
-    def refresh_all(self) -> None:
+    def refresh_all(self, lightweight: bool = False) -> None:
         self._dirty = False
+        now = time.monotonic()
+        if (
+            lightweight
+            and now - self._last_heavy_refresh_monotonic
+            >= self._heavy_refresh_interval
+        ):
+            lightweight = False
+        if not lightweight:
+            self._last_heavy_refresh_monotonic = now
         self._refresh_pool()
         self._refresh_sessions()
-        self._refresh_selected_session()
+        self._refresh_selected_session(lightweight=lightweight)
 
     def _refresh_sessions(self) -> None:
         sessions = self.store.list_sessions()
         new_ids = [str(s["id"]) for s in sessions]
+        self._session_rows_by_id = {str(s["id"]): s for s in sessions}
 
         # Fast path: only update widgets in-place when the session list hasn't changed
         # to avoid destroying/recreating widgets (prevents scroll reset and flicker).
         if new_ids == self._session_list_ids:
-            sessions_by_id = {str(s["id"]): s for s in sessions}
             for index in range(self.session_list.count()):
                 item = self.session_list.item(index)
                 if item is None:
                     continue
                 session_id = str(item.data(Qt.UserRole) or "")
-                session = sessions_by_id.get(session_id)
+                session = self._session_rows_by_id.get(session_id)
                 if session is None:
                     continue
                 existing_widget = self.session_list.itemWidget(item)
@@ -1432,25 +2075,36 @@ class MainWindow(QMainWindow):
                 self.session_list.setCurrentItem(item)
                 break
 
-    def _refresh_selected_session(self) -> None:
+    def _refresh_selected_session(self, lightweight: bool = False) -> None:
         if not self.selected_session_id:
             self.selected_candidate_id = None
             self.title_label.setText("未选择任务")
             self.stage_label.setText("就绪")
             self.timeline.clear()
             self.candidate_table.setRowCount(0)
+            self.candidate_table_title.setText("候选人详情")
             self._candidate_table_initialized = False
             self.strategy_view.clear()
             self.detail_view.clear()
             self.log_view.clear()
             self._update_manual_greeting_button_state()
+            self._update_feedback_controls_state()
             return
-        session = self.store.get_session(self.selected_session_id) or {}
-        sessions = {item["id"]: item for item in self.store.list_sessions()}
-        aggregate = sessions.get(self.selected_session_id, {})
+        session = self._session_rows_by_id.get(self.selected_session_id) or {}
+        if not session:
+            session = self.store.get_session(self.selected_session_id) or {}
+        aggregate = session
         metrics = self.store.session_efficiency_metrics(self.selected_session_id)
+        if lightweight:
+            feedback_summary = self._feedback_summary_snapshot
+        else:
+            feedback_summary = self.store.session_feedback_summary(
+                self.selected_session_id
+            )
+            self._feedback_summary_snapshot = dict(feedback_summary)
+        events = self.store.list_events(self.selected_session_id)
         self.title_label.setText(str(session.get("title") or "未命名任务"))
-        latest_event = self._latest_event(self.selected_session_id)
+        latest_event = events[-1] if events else {}
         stage_text = latest_event.get("title") if latest_event else ""
         if session.get("error_message"):
             stage_text = "{} | {}".format(
@@ -1463,28 +2117,37 @@ class MainWindow(QMainWindow):
             )
         )
         self.stats_label.setText(
-            "轮次 {} | 读卡 {} | 候选人 {} | 详情 {} | A/B {}".format(
-                len(self.store.list_rounds(self.selected_session_id)),
+            "轮次 {} | 读卡 {} | 候选人 {} | 详情 {} | 有效池 {} | 已标注 {}".format(
+                metrics.get("search_round_count") or 0,
                 metrics.get("raw_candidate_count") or 0,
                 aggregate.get("candidate_count") or 0,
                 aggregate.get("detail_count") or 0,
-                aggregate.get("ab_count") or 0,
+                metrics.get("effective_pool_score") or 0,
+                feedback_summary.get("labeled_candidate_count") or 0,
             )
         )
         self.stats_label.setToolTip(
-            "A/B 每详情占比：{}".format(metrics.get("ab_per_detail_fetch") or 0)
+            "人工判断一致率：{}".format(
+                feedback_summary.get("agreement_rate")
+                if feedback_summary.get("agreement_rate") is not None
+                else "样本不足",
+            )
         )
-        self._render_timeline()
-        self._render_criteria_editor()
+        self._render_timeline(events, limit=30 if lightweight else 80)
         self._render_candidates()
-        self._render_strategy()
-        self._render_logs()
+        if not lightweight:
+            self._render_criteria_editor()
+            self._render_strategy()
+            self._render_logs(events)
+            self._render_quality_dashboard()
         self._update_manual_greeting_button_state()
+        self._update_feedback_controls_state()
 
-    def _render_timeline(self) -> None:
-        events = self.store.list_events(self.selected_session_id)
+    def _render_timeline(
+        self, events: List[Dict[str, object]], limit: int = 80
+    ) -> None:
         lines = []
-        for event in events[-80:]:
+        for event in events[-max(1, int(limit)):]:
             lines.append(
                 "<p><b>{}</b> <span style='color:#8a8070'>{}</span><br>{}</p>".format(
                     self._html(event.get("title")),
@@ -1527,9 +2190,47 @@ class MainWindow(QMainWindow):
             direction = ""
         self.search_direction_input.setText(direction)
         self.search_direction_input.setEnabled(bool(direction))
+        self.criteria_items_table.blockSignals(True)
+        criteria_items = criteria.get("criteria_items") or []
+        self.criteria_items_table.setRowCount(len(criteria_items))
+        for row, item in enumerate(criteria_items):
+            values = [
+                item.get("criterion_type") or "preferred",
+                item.get("criterion_text") or "",
+                "{:.2f}".format(float(item.get("weight") or 0.5)),
+                "、".join(item.get("alternatives") or []),
+                "、".join(item.get("search_aliases") or []),
+                item.get("time_window_years") or "",
+                item.get("observability") or "resume",
+                item.get("evidence_policy") or "",
+            ]
+            for column, value in enumerate(values):
+                self.criteria_items_table.setItem(
+                    row, column, QTableWidgetItem(str(value))
+                )
+        self.criteria_items_table.blockSignals(False)
 
-    def _render_logs(self) -> None:
-        events = self.store.list_events(self.selected_session_id)
+        self.personas_table.blockSignals(True)
+        personas = criteria.get("personas") or []
+        self.personas_table.setRowCount(len(personas))
+        for row, persona in enumerate(personas):
+            title_skills = list(
+                dict.fromkeys(
+                    [*(persona.get("titles") or []), *(persona.get("skills") or [])]
+                )
+            )
+            values = [
+                persona.get("name") or "",
+                persona.get("description") or "",
+                "、".join(title_skills),
+                "、".join(persona.get("company_patterns") or []),
+                "{:.2f}".format(float(persona.get("priority") or 0.5)),
+            ]
+            for column, value in enumerate(values):
+                self.personas_table.setItem(row, column, QTableWidgetItem(str(value)))
+        self.personas_table.blockSignals(False)
+
+    def _render_logs(self, events: List[Dict[str, object]]) -> None:
         lines = []
         for event in events[-120:]:
             payload = event.get("payload") or {}
@@ -1557,19 +2258,19 @@ class MainWindow(QMainWindow):
             self.log_view.verticalScrollBar().maximum()
         )
 
-    def _latest_event(self, session_id: str) -> Dict[str, object]:
-        events = self.store.list_events(session_id)
-        return events[-1] if events else {}
-
     def _render_candidates(self) -> None:
         selected_ids = set(self._selected_candidate_ids())
         if self.selected_candidate_id:
             selected_ids.add(self.selected_candidate_id)
-        candidates = self.store.list_candidates(self.selected_session_id)
+        candidates = self.store.list_candidates(
+            self.selected_session_id, detail_only=True
+        )
+        self.candidate_table_title.setText("候选人详情 ({})".format(len(candidates)))
         available_ids = {str(c.get("id") or "") for c in candidates}
         selected_ids = {cid for cid in selected_ids if cid in available_ids}
 
         self.candidate_table.blockSignals(True)
+        self.candidate_table.setUpdatesEnabled(False)
         new_count = len(candidates)
         self.candidate_table.setRowCount(new_count)
 
@@ -1584,55 +2285,71 @@ class MainWindow(QMainWindow):
                 candidate.get("education") or "",
                 "是" if int(candidate.get("is_gold_collar") or 0) == 1 else "否",
                 self._card_decision_label(candidate.get("card_decision") or ""),
-                candidate.get("match_tier") or "",
-                candidate.get("match_score")
-                if candidate.get("match_tier")
-                else "",
+                recommendation_label(candidate.get("recommendation_state")),
+                "{:.0f}".format(float(candidate.get("known_fit_score") or 0)),
+                "{:.0f}".format(float(candidate.get("potential_fit_score") or 0)),
+                "{:.0f}".format(float(candidate.get("evidence_coverage_score") or 0)),
+                "{:.0f}".format(float(candidate.get("rank_score") or 0)),
+                self._feedback_label(candidate.get("feedback_label") or ""),
                 self._greeting_status_label(candidate.get("greeting_status") or ""),
                 candidate.get("status") or "",
                 candidate.get("summary_text") or "",
             ]
             for column, value in enumerate(values):
                 str_value = str(value)
-                is_color_column = column in {8, 10}
                 existing = self.candidate_table.item(row, column)
-                if existing is not None and existing.text() == str_value and not is_color_column:
+                same_candidate = (
+                    column != 0
+                    or existing is None
+                    or str(existing.data(Qt.UserRole) or "") == candidate_id
+                )
+                if (
+                    existing is not None
+                    and existing.text() == str_value
+                    and same_candidate
+                ):
                     continue  # skip unchanged cells
                 table_item = QTableWidgetItem(str_value)
                 if column == 0:
                     table_item.setData(Qt.UserRole, candidate_id)
-                if column in {6, 7, 8, 9, 10}:
+                if column in {6, 7, 8, 9, 10, 11, 12, 13, 14, 15}:
                     table_item.setTextAlignment(Qt.AlignCenter)
 
-                # 匹配等级 Badge 着色
+                # Keep operational states readable without turning cells into badges.
                 if column == 8:
-                    tier = str(value).strip().upper()
-                    if tier == "A":
-                        table_item.setBackground(QBrush(QColor("#2d6a4f")))
-                        table_item.setForeground(QBrush(QColor("#ffffff")))
-                    elif tier == "B":
-                        table_item.setBackground(QBrush(QColor("#52b788")))
-                        table_item.setForeground(QBrush(QColor("#ffffff")))
-                    elif tier == "C":
-                        table_item.setBackground(QBrush(QColor("#e9c46a")))
-                        table_item.setForeground(QBrush(QColor("#3d3929")))
-                    elif tier == "D":
-                        table_item.setBackground(QBrush(QColor("#a8a29e")))
-                        table_item.setForeground(QBrush(QColor("#ffffff")))
+                    state_colors = {
+                        "优先沟通": "#24543d",
+                        "高潜待确认": "#8f5429",
+                        "可迁移探索": "#3b6b55",
+                        "信息不足": "#667085",
+                        "明确不匹配": "#a33f3f",
+                    }
+                    fg = state_colors.get(str(value).strip())
+                    if fg:
+                        table_item.setForeground(QBrush(QColor(fg)))
+                # Human review is expressed by the label first, then a restrained color.
+                elif column == 13:
+                    feedback_colors = {
+                        "推荐": "#24543d",
+                        "待确认": "#8f5429",
+                        "不合适": "#667085",
+                    }
+                    fg = feedback_colors.get(str(value).strip())
+                    if fg:
+                        table_item.setForeground(QBrush(QColor(fg)))
 
-                # 打招呼状态 Badge 着色
-                elif column == 10:
+                # Greeting status uses text color without covering the table surface.
+                elif column == 14:
                     greeting = str(value).strip()
                     color_map = {
-                        "已发送": ("#5a9a5a", "#ffffff"),
-                        "已打过": ("#7cb87c", "#ffffff"),
-                        "已跳过": ("#c4956a", "#ffffff"),
-                        "失败": ("#c56a6a", "#ffffff"),
-                        "待处理": ("#6a8aaa", "#ffffff"),
+                        "已发送": "#2f6b4f",
+                        "已打过": "#475467",
+                        "已跳过": "#667085",
+                        "失败": "#a33f3f",
+                        "待处理": "#475467",
                     }
-                    bg, fg = color_map.get(greeting, (None, None))
-                    if bg:
-                        table_item.setBackground(QBrush(QColor(bg)))
+                    fg = color_map.get(greeting)
+                    if fg:
                         table_item.setForeground(QBrush(QColor(fg)))
 
                 self.candidate_table.setItem(row, column, table_item)
@@ -1648,18 +2365,18 @@ class MainWindow(QMainWindow):
                         QItemSelectionModel.Select | QItemSelectionModel.Rows,
                     )
         self.candidate_table.blockSignals(False)
+        self.candidate_table.setUpdatesEnabled(True)
 
         selected_after_refresh = self._selected_candidate_ids()
         self.selected_candidate_id = (
             selected_after_refresh[0] if selected_after_refresh else None
         )
-        # Only resize columns on first population to prevent column-width jumps
+        # Keep the comparison columns stable instead of resizing on every refresh.
         if not self._candidate_table_initialized and new_count > 0:
-            self.candidate_table.resizeColumnsToContents()
-            self.candidate_table.horizontalHeader().setStretchLastSection(True)
             self._candidate_table_initialized = True
 
     def _render_strategy(self) -> None:
+        self._render_search_coverage()
         rounds = self.store.list_rounds(self.selected_session_id)
         criteria = self.store.get_latest_criteria(self.selected_session_id)
         if not rounds:
@@ -1678,7 +2395,7 @@ class MainWindow(QMainWindow):
         <p><b>范围：</b>{scope} / {match_mode}</p>
         <p><b>城市：</b>{city}</p>
         <p><b>意图：</b>{intent}</p>
-        <p><b>统计：</b>结果 {raw_count}，建议抓详情 {prequalified_count}，抓详情 {detail_fetch_count}，A/B {ab_count}</p>
+        <p><b>统计：</b>结果 {raw_count}，建议抓详情 {prequalified_count}，抓详情 {detail_fetch_count}</p>
         """.format(
             round_index=self._html(last.get("round_index")),
             status=self._html(last.get("status")),
@@ -1700,9 +2417,144 @@ class MainWindow(QMainWindow):
             raw_count=self._html(last.get("raw_count") or 0),
             prequalified_count=self._html(last.get("prequalified_count") or 0),
             detail_fetch_count=self._html(last.get("detail_fetch_count") or 0),
-            ab_count=self._html(last.get("ab_count") or 0),
         )
         self.strategy_view.setHtml(html)
+
+    def _render_search_coverage(self) -> None:
+        if not self.selected_session_id or not hasattr(self, "coverage_table"):
+            return
+        criteria = self.store.get_latest_criteria(self.selected_session_id)
+        self.store.ensure_search_hypotheses(self.selected_session_id, criteria)
+        summary = self.store.search_coverage_summary(self.selected_session_id)
+        hypotheses = summary.get("hypotheses") or []
+        self.coverage_table.setRowCount(len(hypotheses))
+        status_labels = {
+            "pending": "待探索",
+            "active": "搜索中",
+            "completed": "已探索",
+            "paused": "已暂停",
+            "disabled": "已关闭",
+        }
+        for row, item in enumerate(hypotheses):
+            values = [
+                item.get("title") or "",
+                item.get("query") or "",
+                status_labels.get(item.get("status"), item.get("status") or ""),
+                item.get("attempt_count") or 0,
+                item.get("new_count") or 0,
+                item.get("relevant_count") or 0,
+                "{:.0f}%".format(float(item.get("duplicate_rate") or 0) * 100),
+                "{:.2f}".format(float(item.get("priority") or 0)),
+            ]
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(str(value))
+                if column == 0:
+                    table_item.setData(Qt.UserRole, str(item.get("id") or ""))
+                self.coverage_table.setItem(row, column, table_item)
+        self.coverage_summary_label.setText(
+            "覆盖 {}/{} | 新增 {} | 有效 {}".format(
+                summary.get("completed") or 0,
+                summary.get("total") or 0,
+                summary.get("new_count") or 0,
+                summary.get("relevant_count") or 0,
+            )
+        )
+
+    def _set_selected_hypothesis_status(self, status: str) -> None:
+        row = self.coverage_table.currentRow()
+        item = self.coverage_table.item(row, 0) if row >= 0 else None
+        hypothesis_id = str(item.data(Qt.UserRole) or "") if item else ""
+        if not hypothesis_id:
+            return
+        self.store.update_search_hypothesis(hypothesis_id, status=status)
+        self._render_search_coverage()
+
+    def _adjust_selected_hypothesis_priority(self, delta: float) -> None:
+        row = self.coverage_table.currentRow()
+        id_item = self.coverage_table.item(row, 0) if row >= 0 else None
+        priority_item = self.coverage_table.item(row, 7) if row >= 0 else None
+        hypothesis_id = str(id_item.data(Qt.UserRole) or "") if id_item else ""
+        if not hypothesis_id or not priority_item:
+            return
+        try:
+            priority = float(priority_item.text())
+        except ValueError:
+            priority = 0.5
+        self.store.update_search_hypothesis(
+            hypothesis_id, priority=max(0.0, min(1.0, priority + delta))
+        )
+        self._render_search_coverage()
+
+    def _refresh_candidate_ranking(self) -> None:
+        if not self.selected_session_id:
+            return
+        self.runtime.ranking_service.refresh_session(self.selected_session_id)
+        self._mark_dirty()
+
+    def _render_quality_dashboard(self) -> None:
+        if not self.selected_session_id or not hasattr(self, "quality_view"):
+            return
+        dashboard = self.runtime.ranking_service.quality_dashboard(
+            self.selected_session_id
+        )
+        feedback = dashboard.get("feedback") or {}
+        coverage = dashboard.get("search_coverage") or {}
+        candidate_pool = dashboard.get("candidate_pool") or {}
+        state_counts = candidate_pool.get("state_counts") or {}
+        calibration = dashboard.get("calibration") or {}
+        calibration_metrics = calibration.get("metrics") or {}
+
+        def percent(value):
+            return "样本不足" if value is None else "{:.1f}%".format(float(value) * 100)
+
+        ranking_rows = "".join(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.0f}</td><td>{}</td></tr>".format(
+                self._html(item.get("rank_position") or ""),
+                self._html(item.get("name") or ""),
+                self._html(recommendation_label(item.get("recommendation_state"))),
+                float(item.get("rank_score") or 0),
+                percent(item.get("calibrated_probability")),
+            )
+            for item in (dashboard.get("top_rankings") or [])[:10]
+        )
+        self.quality_view.setHtml(
+            """
+            <p><b>人工标注：</b>{labeled} / {total}</p>
+            <p><b>模型与人工一致率：</b>{agreement}</p>
+            <p><b>已标注样本精确率：</b>{precision}　<b>召回率：</b>{recall}</p>
+            <p><b>假阳性：</b>{fp}　<b>假阴性：</b>{fn}</p>
+            <p><b>校准样本：</b>{calibration_samples}　<b>Brier：</b>{brier}</p>
+            <p><b>搜索覆盖：</b>{completed}/{coverage_total}　新增 {new_count}　有效 {relevant_count}</p>
+            <p><b>有效候选池：</b>{effective_pool}　优先沟通 {priority}　高潜待确认 {verify}　可迁移探索 {transferable}　信息不足 {insufficient}　明确不匹配 {mismatch}</p>
+            <p><b>当前排序：</b></p>
+            <table cellspacing="0" cellpadding="4" border="1">
+              <tr><th>排名</th><th>候选人</th><th>建议状态</th><th>综合分</th><th>校准概率</th></tr>
+              {rankings}
+            </table>
+            """.format(
+                labeled=feedback.get("labeled_candidate_count") or 0,
+                total=feedback.get("candidate_count") or 0,
+                agreement=percent(feedback.get("agreement_rate")),
+                precision=percent(feedback.get("precision")),
+                recall=percent(feedback.get("recall")),
+                fp=feedback.get("false_positive") or 0,
+                fn=feedback.get("false_negative") or 0,
+                calibration_samples=calibration.get("sample_count") or 0,
+                brier=calibration_metrics.get("brier_score", "样本不足"),
+                completed=coverage.get("completed") or 0,
+                coverage_total=coverage.get("total") or 0,
+                new_count=coverage.get("new_count") or 0,
+                relevant_count=coverage.get("relevant_count") or 0,
+                effective_pool=candidate_pool.get("effective_pool_score") or 0,
+                priority=state_counts.get("priority_contact") or 0,
+                verify=state_counts.get("high_potential_verify") or 0,
+                transferable=state_counts.get("transferable_explore") or 0,
+                insufficient=state_counts.get("information_insufficient") or 0,
+                mismatch=state_counts.get("explicit_mismatch") or 0,
+                rankings=ranking_rows
+                or "<tr><td colspan='5'>尚未生成排序</td></tr>",
+            )
+        )
 
     @staticmethod
     def _evidence_source_label(item: Dict[str, object]) -> str:
@@ -1733,6 +2585,16 @@ class MainWindow(QMainWindow):
             if item.get("candidate_id") == candidate_id
         ]
         match = matches[0] if matches else {}
+        ranking = next(
+            (
+                item
+                for item in self.store.list_current_rankings(self.selected_session_id)
+                if item.get("candidate_id") == candidate_id
+            ),
+            {},
+        )
+        feedback = self.store.get_latest_candidate_feedback(candidate_id) or {}
+        outcomes = self.store.list_candidate_outcomes(candidate_id)
         sources = self.store.list_candidate_sources(candidate_id)
         evidence = match.get("matched_evidence") or []
         evidence_html = "".join(
@@ -1749,9 +2611,59 @@ class MainWindow(QMainWindow):
             "<li>{}</li>".format(self._html(item))
             for item in (match.get("missing_or_unclear") or [])
         )
+        criteria = self.store.get_latest_criteria(self.selected_session_id)
+        evaluations = self.store.list_criterion_evaluations(
+            candidate_id, str(criteria.get("criteria_version_id") or "")
+        )
+        verification_questions = list(
+            dict.fromkeys(
+                [
+                    *[str(item) for item in (match.get("questions_to_verify") or []) if str(item)],
+                    *[
+                        str(item.get("verification_question") or "")
+                        for item in evaluations
+                        if str(item.get("verification_question") or "")
+                    ],
+                ]
+            )
+        )
         questions_html = "".join(
             "<li>{}</li>".format(self._html(item))
-            for item in (match.get("questions_to_verify") or [])
+            for item in verification_questions
+        )
+        evaluation_labels = {
+            "direct_met": "直接满足",
+            "met": "直接满足",
+            "inferred_met": "推断满足",
+            "partial": "部分满足",
+            "explicit_not_met": "明确不满足",
+            "not_met": "明确不满足",
+            "conflict": "明确冲突",
+            "unknown": "未知",
+        }
+        evaluations_html = "".join(
+            "<tr><td>{}</td><td>{}</td><td>{:.0f}%</td><td>{}</td><td>{}</td></tr>".format(
+                self._html(evaluation.get("criterion_text") or ""),
+                self._html(evaluation_labels.get(evaluation.get("status"), "未知")),
+                float(evaluation.get("confidence") or 0) * 100,
+                self._html(
+                    "；".join(
+                        str(item.get("quote") or "")
+                        for item in (evaluation.get("evidence") or [])[:2]
+                    )
+                ),
+                self._html(
+                    "；".join(
+                        item
+                        for item in (
+                            str(evaluation.get("reason") or ""),
+                            str(evaluation.get("verification_question") or ""),
+                        )
+                        if item
+                    )
+                ),
+            )
+            for evaluation in evaluations
         )
         source_html = "".join(
             "<li>第{}轮：{} / {} / 排名 {}</li>".format(
@@ -1763,14 +2675,26 @@ class MainWindow(QMainWindow):
             for source in sources[-8:]
         )
         is_gold = int(detail.get("is_gold_collar") or 0) == 1
+        outcome_html = "、".join(
+            "{}({})".format(item.get("outcome") or "", item.get("occurred_at") or "")
+            for item in outcomes[:5]
+        )
         html = """
         <p><b>{name}</b> / {title}</p>
         <p>{company} | {city} | {work_years} | {education}</p>
         <p><b>金领：</b>{gold} | <b>打招呼：</b>{greeting_status}</p>
         <p><b>卡片判断：</b>{card_decision}</p>
-        <p><b>匹配：</b>{tier} {recommendation}</p>
+        <p><b>建议状态：</b>{recommendation_state}</p>
+        <p><b>量化视图：</b>已知适配 {known_fit_score} / 潜在上界 {potential_fit_score} / 证据覆盖 {evidence_coverage_score} / 综合排序 {rank_score} / 第 {rank_position} 位</p>
+        <p><b>匹配建议：</b>{recommendation}</p>
+        <p><b>人工判断：</b>{human_feedback}　<b>业务结果：</b>{outcomes}</p>
         <p><b>摘要：</b>{summary}</p>
         <p><b>风险：</b>{risks}</p>
+        <p><b>逐条件评估：</b></p>
+        <table cellspacing="0" cellpadding="4" border="1">
+          <tr><th>岗位条件</th><th>判断</th><th>置信度</th><th>原文证据</th><th>说明</th></tr>
+          {evaluations}
+        </table>
         <p><b>命中证据：</b></p><ul>{evidence}</ul>
         <p><b>缺口/未知：</b></p><ul>{unknowns}</ul>
         <p><b>待确认问题：</b></p><ul>{questions}</ul>
@@ -1793,12 +2717,29 @@ class MainWindow(QMainWindow):
             card_decision=self._html(
                 self._card_decision_label(candidate.get("card_decision") or "")
             ),
-            tier=self._html(match.get("tier") or "待匹配"),
+            recommendation_state=self._html(
+                recommendation_label(ranking.get("recommendation_state"))
+            ),
             recommendation=self._html(match.get("recommendation")),
+            known_fit_score=self._html(ranking.get("known_fit_score") or 0),
+            potential_fit_score=self._html(
+                ranking.get("potential_fit_score") or 0
+            ),
+            evidence_coverage_score=self._html(
+                ranking.get("evidence_coverage_score") or 0
+            ),
+            rank_score=self._html(ranking.get("rank_score") or 0),
+            rank_position=self._html(ranking.get("rank_position") or "-"),
+            human_feedback=self._html(
+                self._feedback_label(feedback.get("feedback_label") or "") or "未标注"
+            ),
+            outcomes=self._html(outcome_html or "暂无"),
             summary=self._html(
                 match.get("summary") or candidate.get("summary_text") or ""
             ),
             risks=self._html(match.get("risks") or "暂无"),
+            evaluations=evaluations_html
+            or "<tr><td colspan='5'>尚未生成逐条件评估</td></tr>",
             evidence=evidence_html or "<li>暂无</li>",
             unknowns=unknowns_html or "<li>暂无</li>",
             questions=questions_html or "<li>暂无</li>",
@@ -1877,6 +2818,14 @@ class MainWindow(QMainWindow):
             "failed": "失败",
             "pending": "待处理",
         }.get(str(value or ""), "")
+
+    @staticmethod
+    def _feedback_label(value: object) -> str:
+        return {
+            "recommended": "推荐",
+            "uncertain": "待确认",
+            "not_suitable": "不合适",
+        }.get(str(value or "").strip().lower(), "")
 
     # ------------------------------------------------------------------
     # Project Pool

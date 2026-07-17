@@ -15,7 +15,7 @@
     "search_hypothesis_text": "下一轮验证的搜索假设"
   }},
   "evidence": {{
-    "ab_count": "数字",
+    "recommendation_state_counts": "五态建议数量",
     "match_count": "数字",
     "noise_root_cause": "噪音根因分类：关键词太宽/关键词太窄/维度错误/行业误匹配/职级错配/正常噪音",
     "iteration_strategy": "迭代策略：收紧/放宽/换维度/跨行业mapping/长尾狙击/停止"
@@ -25,7 +25,7 @@
 ## 复盘要求
 
 ### 1. 停止条件（如果 should_stop 为 true，必须 action=stop）
-- 已达到目标 A/B 数量。
+- 已达到目标有效候选池数量。
 - 连续多轮低产出且无明显改进空间。
 - 预算耗尽。
 - 已穷尽合理搜索假设。
@@ -46,7 +46,7 @@
 - **不要重复 used_queries**。
 - **不要发明新的岗位要求**，只能围绕已确认匹配词组合、放宽或收紧。
 - **next_plan.query 中的关键词必须严格来自【已确认匹配词与岗位要求】中的匹配词，不得自行添加、扩展或发明新的关键词**。你只能对这些已确认词进行组合、拆分、减少数量或添加排除词（如 `-软件`），禁止引入未确认的新词。
-- 如果同一假设方向已验证成功（AB 产出好），沿相邻场景继续扩展（如从"BMS"扩展到"电池包""电芯研发"）。
+- 如果同一假设方向已验证成功（有效候选产出好），沿相邻场景继续扩展（如从"BMS"扩展到"电池包""电芯研发"）。
 - 如果同一假设方向已验证失败（连续低产出），切换假设类型（如从 core_background 切换到 transferable_scene 或 long_tail）。
 - 当 core_background 和 target_company 都耗尽时，优先尝试 transferable_scene（跨行业mapping）。
 

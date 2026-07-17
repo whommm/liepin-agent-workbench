@@ -20,10 +20,12 @@ from ..domain.models import (
     RoundReview,
     SearchPlan,
 )
+from ..domain.job_profile import normalize_job_profile
 from ..domain.states import RoundType
 from ..prompts.loader import PromptLoader, get_prompt_loader, system_prompt
 from ..tools.llm_client import LLMClient
 from .candidate_picker import CandidatePicker
+from .city_normalizer import normalize_city_list
 from .context import (
     OBSERVE_PROMPT_CHAR_BUDGET,
     REVIEW_PROMPT_CHAR_BUDGET,
@@ -230,7 +232,7 @@ rpm_limit=config.llm_rpm_limit,
         except Exception as exc:
             self._record_fallback("build_criteria", exc)
             return self._fallback_brain.build_criteria(jd_text, user_notes)
-        return {
+        result = {
             "position_filter": str(data.get("position_filter") or "").strip(),
             "core_requirement": str(data.get("core_requirement") or "").strip(),
             "requirements_text": str(data.get("core_requirement") or "").strip(),
@@ -238,11 +240,17 @@ rpm_limit=config.llm_rpm_limit,
             "search_direction": str(data.get("search_direction") or "").strip(),
             "target_companies": self._string_list(data.get("target_companies"))[:8],
             "city_requirement": str(data.get("city_requirement") or "").strip(),
-            "city_scope": self._string_list(data.get("city_scope"))[:8],
+            # 猎聘城市筛选只支持直辖市 + 地级市，县级市（义乌/昆山/晋江…）
+            # 必须归一化到所属地级市，否则城市弹窗找不到选项会让整轮搜索中断。
+            "city_scope": normalize_city_list(self._string_list(data.get("city_scope")))[:8],
             # gender_requirement 直接影响猎聘搜索的性别筛选，必须透传，
             # 否则下游 initial_plan / matcher 都拿不到 JD 的性别要求。
             "gender_requirement": str(data.get("gender_requirement") or "").strip(),
         }
+        criteria_items, personas = normalize_job_profile({**data, **result})
+        result["criteria_items"] = criteria_items
+        result["personas"] = personas
+        return result
 
     def initial_plan(
         self, jd_text: str, user_notes: str, criteria: Dict[str, object]
@@ -844,16 +852,24 @@ rpm_limit=config.llm_rpm_limit,
         )
         city_scope = {
             str(item).strip()
-            for item in (criteria.get("city_scope") or [])
+            for item in normalize_city_list(criteria.get("city_scope") or [])
             if str(item).strip()
         }
         city_requirement = str(criteria.get("city_requirement") or "").strip()
         if "city" in guarded:
             requested = guarded["city"]
-            requested_cities = (
-                [str(item).strip() for item in requested if str(item).strip()]
-                if isinstance(requested, list)
-                else [str(requested).strip()]
+            # 即便 LLM/用户在 plan 里把县级市直接填进 city，也要先归一
+            # 到地级市，否则猎聘城市选择会失败。
+            requested_cities = normalize_city_list(
+                [
+                    str(item).strip()
+                    for item in (
+                        requested
+                        if isinstance(requested, list)
+                        else [requested]
+                    )
+                    if str(item).strip()
+                ]
             )
             confirmed_cities = city_scope or (
                 {city_requirement}

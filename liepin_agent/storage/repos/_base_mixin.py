@@ -44,7 +44,6 @@ class _BaseMixin:
         connection = sqlite3.connect(self.db_path, timeout=30)
         connection.row_factory = sqlite3.Row
         try:
-            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA foreign_keys=ON")
             yield connection
             connection.commit()
@@ -57,6 +56,9 @@ class _BaseMixin:
 
     def initialize(self) -> None:
         with self.connect() as connection:
+            # Journal mode is persistent database metadata. Setting it for every
+            # short-lived repository connection adds substantial locking and I/O.
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS search_sessions (
@@ -101,6 +103,7 @@ class _BaseMixin:
                     criteria_version_id TEXT,
                     search_hypothesis_type TEXT,
                     search_hypothesis_text TEXT,
+                    search_hypothesis_id TEXT,
                     raw_count INTEGER NOT NULL DEFAULT 0,
                     deduped_count INTEGER NOT NULL DEFAULT 0,
                     prequalified_count INTEGER NOT NULL DEFAULT 0,
@@ -262,6 +265,161 @@ class _BaseMixin:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS candidate_feedback (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT,
+                    feedback_label TEXT NOT NULL,
+                    corrected_tier TEXT,
+                    reason_codes_json TEXT,
+                    note TEXT,
+                    source TEXT NOT NULL DEFAULT 'human',
+                    model_snapshot_json TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_outcomes (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    outcome TEXT NOT NULL,
+                    note TEXT,
+                    occurred_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ranking_feedback (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT,
+                    preferred_candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    other_candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    reason TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS job_criteria_items (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT NOT NULL REFERENCES match_criteria_versions(id) ON DELETE CASCADE,
+                    ordinal INTEGER NOT NULL DEFAULT 0,
+                    criterion_type TEXT NOT NULL,
+                    criterion_text TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 0.5,
+                    alternatives_json TEXT,
+                    search_aliases_json TEXT,
+                    time_window_years INTEGER,
+                    evidence_policy TEXT,
+                    observability TEXT NOT NULL DEFAULT 'resume',
+                    source_quote TEXT,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    human_confirmed INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_personas (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT NOT NULL REFERENCES match_criteria_versions(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    titles_json TEXT,
+                    skills_json TEXT,
+                    company_patterns_json TEXT,
+                    transfer_rationale TEXT,
+                    priority REAL NOT NULL DEFAULT 0.5,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_facts (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    fact_type TEXT NOT NULL,
+                    fact_value TEXT NOT NULL,
+                    normalized_value TEXT,
+                    section TEXT,
+                    evidence_quote TEXT,
+                    evidence_start INTEGER,
+                    evidence_end INTEGER,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    extractor_version TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS criterion_evaluations (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT NOT NULL REFERENCES match_criteria_versions(id) ON DELETE CASCADE,
+                    criterion_id TEXT NOT NULL REFERENCES job_criteria_items(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    evidence_json TEXT,
+                    reason TEXT,
+                    verification_question TEXT,
+                    evaluator_version TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS search_hypotheses (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT,
+                    persona_id TEXT,
+                    hypothesis_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    position_filter TEXT,
+                    filters_json TEXT,
+                    expected_signals_json TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    priority REAL NOT NULL DEFAULT 0.5,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    page_count INTEGER NOT NULL DEFAULT 0,
+                    raw_count INTEGER NOT NULL DEFAULT 0,
+                    new_count INTEGER NOT NULL DEFAULT 0,
+                    detail_count INTEGER NOT NULL DEFAULT 0,
+                    relevant_count INTEGER NOT NULL DEFAULT 0,
+                    duplicate_rate REAL NOT NULL DEFAULT 0,
+                    last_round_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS candidate_rank_snapshots (
+                    id TEXT PRIMARY KEY,
+                    candidate_id TEXT NOT NULL REFERENCES candidate_summaries(id) ON DELETE CASCADE,
+                    session_id TEXT NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+                    criteria_version_id TEXT,
+                    fit_score REAL NOT NULL DEFAULT 0,
+                    confidence_score REAL NOT NULL DEFAULT 0,
+                    known_fit_score REAL NOT NULL DEFAULT 0,
+                    potential_fit_score REAL NOT NULL DEFAULT 0,
+                    evidence_coverage_score REAL NOT NULL DEFAULT 0,
+                    recommendation_state TEXT NOT NULL DEFAULT '',
+                    conflict_count INTEGER NOT NULL DEFAULT 0,
+                    rank_score REAL NOT NULL DEFAULT 0,
+                    calibrated_probability REAL,
+                    rank_position INTEGER NOT NULL DEFAULT 0,
+                    explanation_json TEXT,
+                    ranker_version TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS calibration_models (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    session_id TEXT,
+                    model_type TEXT NOT NULL,
+                    parameters_json TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    metrics_json TEXT,
+                    version TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_pool_order ON project_pool(order_index);
 
                 CREATE INDEX IF NOT EXISTS idx_sessions_updated
@@ -284,11 +442,45 @@ class _BaseMixin:
 
                 CREATE INDEX IF NOT EXISTS idx_candidate_details_status
                 ON candidate_details(candidate_id, capture_status, fetched_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_feedback_latest
+                ON candidate_feedback(candidate_id, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_feedback_session
+                ON candidate_feedback(session_id, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_outcomes_candidate
+                ON candidate_outcomes(candidate_id, occurred_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_ranking_feedback_session
+                ON ranking_feedback(session_id, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_job_criteria_version
+                ON job_criteria_items(criteria_version_id, ordinal);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_personas_version
+                ON candidate_personas(criteria_version_id, priority DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_candidate_facts_candidate
+                ON candidate_facts(candidate_id, fact_type);
+
+                CREATE INDEX IF NOT EXISTS idx_criterion_evaluations_current
+                ON criterion_evaluations(candidate_id, criteria_version_id, criterion_id, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_search_hypotheses_session
+                ON search_hypotheses(session_id, status, priority DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_rank_snapshots_current
+                ON candidate_rank_snapshots(session_id, criteria_version_id, rank_position, created_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_rank_snapshots_candidate_latest
+                ON candidate_rank_snapshots(candidate_id, criteria_version_id, created_at DESC);
                 """
             )
             self._ensure_column(connection, "search_rounds", "criteria_version_id", "TEXT")
             self._ensure_column(connection, "search_rounds", "search_hypothesis_type", "TEXT")
             self._ensure_column(connection, "search_rounds", "search_hypothesis_text", "TEXT")
+            self._ensure_column(connection, "search_rounds", "search_hypothesis_id", "TEXT")
             self._ensure_column(connection, "candidate_summaries", "card_decision", "TEXT")
             self._ensure_column(connection, "candidate_summaries", "card_signals_json", "TEXT")
             self._ensure_column(connection, "candidate_summaries", "card_risks_json", "TEXT")
@@ -313,6 +505,48 @@ class _BaseMixin:
             self._ensure_column(connection, "candidate_details", "greeting_error", "TEXT")
             self._ensure_column(connection, "candidate_details", "greeted_at", "TEXT")
             self._ensure_column(connection, "search_rounds", "round_digest_json", "TEXT")
+            self._ensure_column(
+                connection,
+                "job_criteria_items",
+                "observability",
+                "TEXT NOT NULL DEFAULT 'resume'",
+            )
+            self._ensure_column(
+                connection,
+                "candidate_rank_snapshots",
+                "known_fit_score",
+                "REAL NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "candidate_rank_snapshots",
+                "potential_fit_score",
+                "REAL NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "candidate_rank_snapshots",
+                "evidence_coverage_score",
+                "REAL NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "candidate_rank_snapshots",
+                "recommendation_state",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                connection,
+                "candidate_rank_snapshots",
+                "conflict_count",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "criterion_evaluations",
+                "verification_question",
+                "TEXT",
+            )
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_match_results_current

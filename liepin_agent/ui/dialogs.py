@@ -27,6 +27,12 @@ from PySide6.QtWidgets import (
 
 from ..agent.planner import Planner
 from ..core.config import ConfigManager
+from ..domain.greeting_policy import (
+    DEFAULT_GREETING_STATES,
+    GREETING_BLOCKED_STATES,
+    GREETING_SELECTABLE_STATES,
+)
+from ..domain.recommendation import RECOMMENDATION_LABELS
 from ..tools.excel_greeting import ExcelGreetingService
 
 
@@ -102,10 +108,10 @@ class NewSessionDialog(QDialog):
         self.max_details.setValue(999)
         form.addRow("最大详情抓取", self.max_details)
 
-        self.target_ab = QSpinBox()
-        self.target_ab.setRange(1, 9999)
-        self.target_ab.setValue(999)
-        form.addRow("目标 A/B 数", self.target_ab)
+        self.target_effective = QSpinBox()
+        self.target_effective.setRange(1, 9999)
+        self.target_effective.setValue(999)
+        form.addRow("目标有效候选池", self.target_effective)
 
         layout.addLayout(form)
 
@@ -152,8 +158,61 @@ class NewSessionDialog(QDialog):
             "mode": self.mode_combo.currentText(),
             "max_rounds": self.max_rounds.value(),
             "max_detail_fetches": self.max_details.value(),
-            "target_ab_count": self.target_ab.value(),
+            "target_effective_count": self.target_effective.value(),
         }
+
+
+class GreetingScopeDialog(QDialog):
+    """Select recommendation states before populating the manual greeting queue."""
+
+    def __init__(self, state_counts: Dict[str, int], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("按资格选择候选人")
+        self.resize(420, 300)
+        layout = QVBoxLayout(self)
+        intro = QLabel("选择要加入手动打招呼名单的候选人资格。确认后仍可在表格中逐人取消。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.state_checks: Dict[str, QCheckBox] = {}
+        for state in (*GREETING_SELECTABLE_STATES, *GREETING_BLOCKED_STATES):
+            checkbox = QCheckBox(
+                "{}（{} 人）".format(
+                    RECOMMENDATION_LABELS[state], int(state_counts.get(state, 0))
+                )
+            )
+            checkbox.setChecked(state in DEFAULT_GREETING_STATES)
+            if state in GREETING_BLOCKED_STATES:
+                checkbox.setEnabled(False)
+                checkbox.setToolTip("明确不匹配不进入批量名单；如确需联系，请单独选择候选人。")
+            self.state_checks[state] = checkbox
+            layout.addWidget(checkbox)
+
+        layout.addStretch(1)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("SecondaryBtn")
+        confirm_btn = QPushButton("选择候选人")
+        confirm_btn.setDefault(True)
+        cancel_btn.clicked.connect(self.reject)
+        confirm_btn.clicked.connect(self._validate_and_accept)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(confirm_btn)
+        layout.addLayout(buttons)
+
+    def selected_states(self) -> List[str]:
+        return [
+            state
+            for state in GREETING_SELECTABLE_STATES
+            if self.state_checks[state].isChecked()
+        ]
+
+    def _validate_and_accept(self) -> None:
+        if not self.selected_states():
+            QMessageBox.warning(self, "提示", "请至少选择一个候选人资格。")
+            return
+        self.accept()
 
 
 class BatchGreetingDialog(QDialog):
@@ -166,11 +225,11 @@ class BatchGreetingDialog(QDialog):
         self._generation_signals.done.connect(self._on_generation_done)
         self._generation_signals.failed.connect(self._on_generation_failed)
         self.setWindowTitle("Excel 批量打招呼")
-        self.resize(760, 700)
+        self.resize(780, 780)
 
         layout = QVBoxLayout(self)
         layout.addWidget(
-            QLabel("导入候选人 Excel，仅处理匹配档位 A/B、未打过招呼、有猎聘简历链接的候选人。")
+            QLabel("导入候选人 Excel，按建议状态筛选未联系且有猎聘详情链接的候选人。")
         )
 
         file_row = QHBoxLayout()
@@ -190,13 +249,29 @@ class BatchGreetingDialog(QDialog):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
+        layout.addWidget(QLabel("候选人资格（可多选）"))
+        scope_row = QHBoxLayout()
+        self.state_checks: Dict[str, QCheckBox] = {}
+        for state in GREETING_SELECTABLE_STATES:
+            checkbox = QCheckBox(RECOMMENDATION_LABELS[state])
+            checkbox.setChecked(state in DEFAULT_GREETING_STATES)
+            checkbox.stateChanged.connect(self._on_scope_changed)
+            self.state_checks[state] = checkbox
+            scope_row.addWidget(checkbox)
+        blocked_check = QCheckBox(RECOMMENDATION_LABELS[GREETING_BLOCKED_STATES[0]])
+        blocked_check.setEnabled(False)
+        blocked_check.setToolTip("明确不匹配不允许批量打招呼。")
+        scope_row.addWidget(blocked_check)
+        scope_row.addStretch(1)
+        layout.addLayout(scope_row)
+
         limit_row = QHBoxLayout()
         limit_row.addWidget(QLabel("本次打招呼人数："))
         self.max_candidates_spin = QSpinBox()
         self.max_candidates_spin.setRange(0, 9999)
         self.max_candidates_spin.setValue(0)
         self.max_candidates_spin.setSpecialValueText("全部")
-        self.max_candidates_spin.setToolTip("0 = 全部处理；填写具体数字则只处理前 N 位（A 档优先）。")
+        self.max_candidates_spin.setToolTip("0 = 全部处理；填写具体数字则按建议状态优先级处理前 N 位。")
         self.max_candidates_spin.setSuffix(" 人")
         limit_row.addWidget(self.max_candidates_spin)
         limit_row.addStretch(1)
@@ -206,7 +281,7 @@ class BatchGreetingDialog(QDialog):
         self.dry_run_check.setChecked(True)
         self.gold_only_check = QCheckBox("仅处理金领候选人")
         self.gold_only_check.setChecked(config_manager.config.greet_gold_only)
-        self.gold_only_check.setToolTip("开启后只向 Excel 中标记为金领的候选人打招呼；关闭则全部 A/B 档候选人都处理。")
+        self.gold_only_check.setToolTip("开启后只处理 Excel 中标记为金领且符合所选资格的候选人。")
         self.gold_only_check.stateChanged.connect(self._on_gold_only_changed)
         self.verify_gold_check = QCheckBox("发送前重新打开页面复核金领状态")
         self.verify_gold_check.setChecked(True)
@@ -308,6 +383,18 @@ class BatchGreetingDialog(QDialog):
         if path and Path(path).exists():
             self._load_preview(path)
 
+    def _on_scope_changed(self, _state: int) -> None:
+        path = self.excel_path.text().strip()
+        if path and Path(path).exists():
+            self._load_preview(path)
+
+    def selected_recommendation_states(self) -> List[str]:
+        return [
+            state
+            for state in GREETING_SELECTABLE_STATES
+            if self.state_checks[state].isChecked()
+        ]
+
     def _pick_excel(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -323,7 +410,9 @@ class BatchGreetingDialog(QDialog):
     def _load_preview(self, path: str) -> None:
         try:
             self._candidates = ExcelGreetingService.load_greetable_candidates(
-                path, gold_only=self.gold_only_check.isChecked()
+                path,
+                gold_only=self.gold_only_check.isChecked(),
+                recommendation_states=self.selected_recommendation_states(),
             )
         except Exception as exc:
             self._candidates = []
@@ -333,16 +422,17 @@ class BatchGreetingDialog(QDialog):
         if len(self._candidates) > 10:
             names += " 等"
         gold_text = "金领 + " if self.gold_only_check.isChecked() else ""
-        tier_counts = {}
+        state_counts = {}
         for item in self._candidates:
-            tier_counts[item.tier] = tier_counts.get(item.tier, 0) + 1
-        a_count = tier_counts.get("A", 0)
-        b_count = tier_counts.get("B", 0)
+            state_counts[item.recommendation_state] = state_counts.get(item.recommendation_state, 0) + 1
+        scope_summary = " / ".join(
+            "{} {} 人".format(RECOMMENDATION_LABELS[state], state_counts.get(state, 0))
+            for state in self.selected_recommendation_states()
+        )
         self.summary_label.setText(
-            "可处理候选人：{} 位（A 档 {} 人 / B 档 {} 人；筛选：A/B + {}未打过 + 猎聘详情链接）。".format(
+            "可处理候选人：{} 位（{}；筛选：{}未打过 + 猎聘详情链接）。".format(
                 len(self._candidates),
-                a_count,
-                b_count,
+                scope_summary or "未选择资格",
                 gold_text,
             )
         )
@@ -461,10 +551,18 @@ class BatchGreetingDialog(QDialog):
         if not path:
             QMessageBox.warning(self, "提示", "请先选择候选人 Excel。")
             return
+        if not self.selected_recommendation_states():
+            QMessageBox.warning(self, "提示", "请至少选择一个候选人资格。")
+            return
         if not self._candidates:
             self._load_preview(path)
         if not self._candidates:
-            filter_text = "A/B + 金领" if self.gold_only_check.isChecked() else "A/B"
+            filter_text = "、".join(
+                RECOMMENDATION_LABELS[state]
+                for state in self.selected_recommendation_states()
+            )
+            if self.gold_only_check.isChecked():
+                filter_text += " + 金领"
             QMessageBox.warning(self, "提示", "没有符合 {} 条件的候选人。".format(filter_text))
             return
         if not self.dry_run_check.isChecked() and not self.verify_gold_check.isChecked():
@@ -493,6 +591,7 @@ class BatchGreetingDialog(QDialog):
             "verify_gold_on_page": self.verify_gold_check.isChecked(),
             "request_resume": self.request_resume_check.isChecked(),
             "gold_only": self.gold_only_check.isChecked(),
+            "recommendation_states": self.selected_recommendation_states(),
             "delay_min": self.delay_min_spin.value(),
             "delay_max": self.delay_max_spin.value(),
             "max_retries": self.retry_spin.value(),

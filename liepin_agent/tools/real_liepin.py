@@ -13,7 +13,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from ..core.config import ConfigManager
 from ..core.liepin_browser import LiepinBrowserManager
-from ..core.liepin_resume_extractor import LiepinResumeExtractor
+from ..core.liepin_resume_extractor import (
+    LiepinResumeExtractionError,
+    LiepinResumeExtractor,
+)
 from ..core.liepin_search_service import (
     AdaptivePaginationPolicy,
     LiepinSearchCandidate,
@@ -197,6 +200,7 @@ class RealLiepinTool:
         summary = LiepinSearchCandidate(
             name=str(candidate.get("name") or ""),
             age=str(candidate.get("age") or ""),
+            gender=str(candidate.get("gender") or ""),
             current_title=str(candidate.get("current_title") or ""),
             current_company=str(candidate.get("current_company") or ""),
             city=str(candidate.get("city") or ""),
@@ -212,13 +216,61 @@ class RealLiepinTool:
             detail_page = self.search_service.open_candidate_detail(page, summary)
             try:
                 time.sleep(self.timing_detail_page_wait)
-                extracted = self.resume_extractor.extract_candidate(detail_page, summary)
+                self._wait_for_resume_content(detail_page)
+                extracted = None
+                extraction_errors = []
+                attempts = max(
+                    1,
+                    int(
+                        getattr(
+                            self.config_manager.config,
+                            "detail_extract_max_attempts",
+                            2,
+                        )
+                        or 2
+                    ),
+                )
+                for attempt in range(1, attempts + 1):
+                    try:
+                        extracted = self.resume_extractor.extract_candidate(
+                            detail_page, summary
+                        )
+                        break
+                    except LiepinResumeExtractionError as exc:
+                        extraction_errors.append(str(exc))
+                        if attempt >= attempts:
+                            raise LiepinResumeExtractionError(
+                                "详情提取连续 {} 次失败：{}".format(
+                                    attempts, "；".join(extraction_errors)
+                                )
+                            ) from exc
+                        logger.warning(
+                            "candidate detail extraction empty; retrying attempt=%s/%s url=%s error=%s",
+                            attempt,
+                            attempts,
+                            (getattr(detail_page, "url", "") or summary.profile_url)[:120],
+                            exc,
+                        )
+                        self._page_wait(
+                            detail_page,
+                            float(
+                                getattr(
+                                    self.config_manager.config,
+                                    "detail_extract_retry_wait_seconds",
+                                    1.5,
+                                )
+                                or 1.5
+                            ),
+                        )
+                        self._wait_for_resume_content(detail_page)
+                if extracted is None:
+                    raise LiepinResumeExtractionError("详情提取未返回结果")
                 is_gold_collar = self._is_gold_collar_detail_page(detail_page)
-                return extracted, is_gold_collar
+                return extracted, is_gold_collar, len(extraction_errors) + 1
             finally:
                 self.search_service.close_detail_page(detail_page, page)
 
-        extracted, is_gold_collar = self.browser_manager.run_with_page(_extract)
+        extracted, is_gold_collar, extract_attempts = self.browser_manager.run_with_page(_extract)
         return CandidateDetail(
             candidate_id=str(candidate.get("id") or ""),
             resume_text=extracted.resume_text or "",
@@ -227,12 +279,47 @@ class RealLiepinTool:
                 "raw_payload_json": extracted.raw_payload_json or "",
                 "profile_url": extracted.profile_url or summary.profile_url or "",
                 "is_gold_collar": is_gold_collar,
+                "detail_extract_attempts": extract_attempts,
             },
             capture_status="success"
             if (extracted.resume_text or "").strip()
             else "partial",
             is_gold_collar=is_gold_collar,
         )
+
+    def _wait_for_resume_content(self, page) -> None:
+        timeout_seconds = float(
+            getattr(
+                self.config_manager.config,
+                "detail_page_ready_timeout_seconds",
+                4.0,
+            )
+            or 4.0
+        )
+        try:
+            page.wait_for_function(
+                """() => {
+                    const text = (document.body && document.body.innerText) || '';
+                    const markers = ['工作经历', '教育经历', '项目经历', '自我评价', '求职期望'];
+                    return text.length >= 120 && markers.some((marker) => text.includes(marker));
+                }""",
+                timeout=int(timeout_seconds * 1000),
+            )
+        except Exception:
+            # The extractor still has body-text fallbacks for short or unusual resumes.
+            logger.warning(
+                "candidate detail readiness marker timed out url=%s timeout=%.1fs",
+                (getattr(page, "url", "") or "")[:120],
+                timeout_seconds,
+            )
+
+    @staticmethod
+    def _page_wait(page, seconds: float) -> None:
+        milliseconds = max(0, int(float(seconds or 0) * 1000))
+        try:
+            page.wait_for_timeout(milliseconds)
+        except Exception:
+            time.sleep(max(0.0, float(seconds or 0)))
 
     def greet_candidate(
         self, candidate: Dict[str, object], message_template: str = "", request_resume: bool = False
