@@ -229,9 +229,15 @@ def test_structured_attributes_gender_fallback_chain():
     # 1) 卡片字段优先
     summary = LiepinSearchCandidate(gender="男")
     assert extractor._extract_structured_attributes(sections, summary, "")["gender"] == "男"
-    # 2) 卡片文本兜底
+    # 2) 详情页 body 头部行（姓名旁的性别标签）
+    summary = LiepinSearchCandidate()
+    header = ["猎聘", "找人", "蒋**", "女", "44岁", "无锡", "21年经验", "本科"]
+    assert extractor._extract_structured_attributes(
+        sections, summary, "", header_lines=header
+    )["gender"] == "女"
+    # 3) 卡片文本兜底
     summary = LiepinSearchCandidate(summary="蒋**\n女 44岁 工作21年 本科 无锡")
     assert extractor._extract_structured_attributes(sections, summary, "")["gender"] == "女"
-    # 3) 都没有则为空（匹配时按 unknown 处理，而不是编造）
+    # 4) 都没有则为空（匹配时按 unknown 处理，而不是编造）
     summary = LiepinSearchCandidate(summary="蒋**\n44岁 工作21年 本科 无锡")
     assert extractor._extract_structured_attributes(sections, summary, "")["gender"] == ""

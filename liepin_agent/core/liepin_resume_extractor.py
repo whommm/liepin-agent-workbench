@@ -119,10 +119,13 @@ class LiepinResumeExtractor:
             + sections.get("summary", [])
             + sections.get("experience", [])[:3]
         )
-        # 结构化提取薪资/年龄/城市，供下游 matcher 做精准校验，避免
+        # 结构化选择器覆盖不了简历头部区域（姓名旁的性别/年龄标签），但页面
+        # 全选复制能拿到这些文本，因此额外抓 body 头部行做字段扫描。
+        header_lines = self._extract_header_lines(page)
+        # 结构化提取薪资/年龄/城市/性别，供下游 matcher 做精准校验，避免
         # 全靠 LLM 从大段文本里"阅读理解"导致判断不稳定。
         structured = self._extract_structured_attributes(
-            sections, summary, resume_text
+            sections, summary, resume_text, header_lines=header_lines
         )
         raw_payload = dict(sections)
         raw_payload["_structured"] = structured
@@ -140,11 +143,23 @@ class LiepinResumeExtractor:
             raw_payload_json=json.dumps(raw_payload, ensure_ascii=False),
         )
 
+    HEADER_SCAN_LINES = 40
+
+    def _extract_header_lines(self, page: Page) -> List[str]:
+        """抓取详情页 body 文本的头部行（姓名/性别/年龄标签所在区域）。
+
+        结构化选择器长期无法覆盖简历头部，但用户在页面上全选复制可以拿到
+        性别和年龄，说明它们就在 body 文本里。只取头部若干行做字段扫描，
+        避免正文和页面框架噪音进入字段提取。
+        """
+        return self._extract_first_section(page, ["body"])[: self.HEADER_SCAN_LINES]
+
     def _extract_structured_attributes(
         self,
         sections: Dict[str, List[str]],
         summary: LiepinSearchCandidate,
         resume_text: str,
+        header_lines: List[str] | None = None,
     ) -> Dict[str, object]:
         """把薪资/年龄/城市等关键字段抽成结构化 dict，写入 raw_payload['_structured']。
 
@@ -226,7 +241,9 @@ class LiepinResumeExtractor:
                 str(getattr(summary, "gender", "") or "")
                 or self._detect_gender(
                     resume_text,
-                    basic_lines + [summary.summary or "", summary.raw_text or ""],
+                    list(header_lines or [])
+                    + basic_lines
+                    + [summary.summary or "", summary.raw_text or ""],
                 )
             ),
         }
@@ -244,7 +261,7 @@ class LiepinResumeExtractor:
     @classmethod
     def _detect_gender(cls, resume_text: str, basic_lines: List[str]) -> str:
         """从基础信息行里识别性别。猎聘简历头部通常有 '男'/'女' 标签。"""
-        for line in list(basic_lines or [])[:12]:
+        for line in list(basic_lines or [])[:20]:
             match = cls._GENDER_TOKEN.search(line.strip())
             if match:
                 return match.group(1)

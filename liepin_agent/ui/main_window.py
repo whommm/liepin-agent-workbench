@@ -696,7 +696,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(MAIN_STYLESHEET)
 
     def _create_session_from_dialog(self, add_to_pool: bool = False) -> Optional[str]:
-        dialog = NewSessionDialog(self)
+        dialog = NewSessionDialog(self.config_manager, self)
         if dialog.exec() != QDialog.Accepted:
             return None
         payload = dialog.payload()

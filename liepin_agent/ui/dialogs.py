@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import html
 import threading
 from pathlib import Path
 from typing import Dict, List
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,11 +22,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
 )
 
 from ..agent.planner import Planner
+from ..services.jd_consultant import JDConsultant
 from ..core.config import ConfigManager
 from ..domain.greeting_policy import (
     DEFAULT_GREETING_STATES,
@@ -38,6 +41,12 @@ from ..tools.excel_greeting import ExcelGreetingService
 
 class _GreetingGenerationSignals(QObject):
     done = Signal(int, list)
+    failed = Signal(str)
+
+
+class _ChatSignals(QObject):
+    replied = Signal(str)
+    finalized = Signal(str)
     failed = Signal(str)
 
 
@@ -82,79 +91,280 @@ class PoolNotificationDialog(QDialog):
 
 
 class NewSessionDialog(QDialog):
-    def __init__(self, parent=None):
+    """Chat-style new-task dialog.
+
+    The user pastes a JD and discusses it with the JD consultant (chat model).
+    "固定方案" unlocks after at least one discussion round; clicking it asks the
+    consultant to produce the final 《寻访方案》, which becomes the session jd_text.
+    """
+
+    MIN_USER_MESSAGES = 2  # JD 本身 + 至少一轮回复
+
+    def __init__(self, config_manager: ConfigManager, parent=None, consultant=None):
         super().__init__(parent)
-        self.setWindowTitle("新建寻访任务")
-        self.resize(720, 560)
+        self.config_manager = config_manager
+        self.consultant = consultant or JDConsultant.from_config(config_manager)
+        self._history: List[Dict[str, str]] = []
+        self._busy = False
+        self._signals = _ChatSignals(self)
+        self._signals.replied.connect(self._on_reply)
+        self._signals.finalized.connect(self._on_finalized)
+        self._signals.failed.connect(self._on_failed)
+
+        self.setWindowTitle("新建寻访任务 · JD 讨论")
+        self.resize(760, 680)
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(8)
 
         self.title_input = QLineEdit()
-        self.title_input.setPlaceholderText("例如：文创产品经理 / 深圳")
-        form.addRow("任务名称", self.title_input)
+        self.title_input.setPlaceholderText("任务名称（留空则按方案自动命名），例如：文创产品经理 / 深圳")
+        layout.addWidget(self.title_input)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["自动", "单步", "监督"])
-        form.addRow("运行模式", self.mode_combo)
+        self.mode_combo.setFixedWidth(86)
 
         self.max_rounds = QSpinBox()
         self.max_rounds.setRange(1, 30)
         self.max_rounds.setValue(20)
-        form.addRow("最大轮次", self.max_rounds)
+        self.max_rounds.setFixedWidth(70)
 
         self.max_details = QSpinBox()
         self.max_details.setRange(1, 9999)
         self.max_details.setValue(999)
-        form.addRow("最大详情抓取", self.max_details)
+        self.max_details.setFixedWidth(84)
 
         self.target_effective = QSpinBox()
         self.target_effective.setRange(1, 9999)
         self.target_effective.setValue(999)
-        form.addRow("目标有效候选池", self.target_effective)
+        self.target_effective.setFixedWidth(84)
 
-        layout.addLayout(form)
+        params_row = QHBoxLayout()
+        params_row.setSpacing(14)
+        for caption_text, widget in (
+            ("运行模式", self.mode_combo),
+            ("最大轮次", self.max_rounds),
+            ("最大详情抓取", self.max_details),
+            ("目标有效候选池", self.target_effective),
+        ):
+            caption = QLabel(caption_text)
+            caption.setObjectName("SessionInfo")
+            params_row.addWidget(caption)
+            params_row.addWidget(widget)
+        params_row.addStretch(1)
+        layout.addLayout(params_row)
 
-        layout.addWidget(QLabel("JD 文本"))
-        self.jd_input = QTextEdit()
-        self.jd_input.setPlaceholderText(
-            "粘贴岗位描述。Agent 会基于文本生成第一轮搜索假设。"
-        )
-        layout.addWidget(self.jd_input, 1)
+        self.round_label = QLabel("粘贴岗位 JD 发送，先与寻访顾问讨论确认方向。")
+        self.round_label.setObjectName("SessionInfo")
+        self.round_label.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(self.round_label)
 
-        layout.addWidget(QLabel("补充说明"))
-        self.notes_input = QTextEdit()
-        self.notes_input.setMaximumHeight(90)
-        self.notes_input.setPlaceholderText(
-            "客户偏好、排除方向、城市弹性、特殊背景等。"
-        )
-        layout.addWidget(self.notes_input)
+        self.chat_view = QTextBrowser()
+        layout.addWidget(self.chat_view, 1)
+
+        self.plan_edit = QTextEdit()
+        self.plan_edit.setPlaceholderText("《寻访方案》终稿，可直接编辑修正。")
+        self.plan_edit.hide()
+        layout.addWidget(self.plan_edit, 1)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(8)
+        self.chat_input = QTextEdit()
+        self.chat_input.setMinimumHeight(64)
+        self.chat_input.setMaximumHeight(88)
+        self.chat_input.setPlaceholderText("粘贴 JD 或回复顾问（Ctrl+Enter 发送）")
+        self.chat_input.installEventFilter(self)
+        input_row.addWidget(self.chat_input, 1)
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setObjectName("AccentBtn")
+        self.send_btn.setFixedWidth(84)
+        self.send_btn.setMinimumHeight(64)
+        self.send_btn.clicked.connect(self._send_message)
+        input_row.addWidget(self.send_btn, 0, Qt.AlignBottom)
+        layout.addLayout(input_row)
 
         buttons = QHBoxLayout()
         buttons.addStretch(1)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setObjectName("SecondaryBtn")
-        create_btn = QPushButton("创建")
-        create_btn.setDefault(True)
-        cancel_btn.clicked.connect(self.reject)
-        create_btn.clicked.connect(self._validate_and_accept)
-        buttons.addWidget(cancel_btn)
-        buttons.addWidget(create_btn)
+        self.cancel_btn = QPushButton("取消")
+        self.cancel_btn.setObjectName("SecondaryBtn")
+        self.cancel_btn.clicked.connect(self.reject)
+        self.back_btn = QPushButton("返回继续讨论")
+        self.back_btn.setObjectName("SecondaryBtn")
+        self.back_btn.clicked.connect(self._back_to_discussion)
+        self.back_btn.hide()
+        self.finalize_btn = QPushButton("固定方案")
+        self.finalize_btn.setObjectName("SuccessBtn")
+        self.finalize_btn.setEnabled(False)
+        self.finalize_btn.setToolTip("请先回复顾问的问题，完成至少一轮讨论。")
+        self.finalize_btn.clicked.connect(self._finalize)
+        self.confirm_btn = QPushButton("确认创建任务")
+        self.confirm_btn.setObjectName("SuccessBtn")
+        self.confirm_btn.setDefault(True)
+        self.confirm_btn.clicked.connect(self._confirm)
+        self.confirm_btn.hide()
+        buttons.addWidget(self.cancel_btn)
+        buttons.addWidget(self.back_btn)
+        buttons.addWidget(self.finalize_btn)
+        buttons.addWidget(self.confirm_btn)
         layout.addLayout(buttons)
 
-    def _validate_and_accept(self) -> None:
-        if not self.jd_input.toPlainText().strip():
-            QMessageBox.warning(self, "提示", "请先输入 JD 文本")
+    # --------------------------------------------------------------
+    # discussion flow
+    # --------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        if obj is self.chat_input and event.type() == QEvent.Type.KeyPress:
+            if (
+                event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and event.modifiers() & Qt.ControlModifier
+            ):
+                self._send_message()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _user_message_count(self) -> int:
+        return sum(1 for item in self._history if item.get("role") == "user")
+
+    def _can_finalize(self) -> bool:
+        return self._user_message_count() >= self.MIN_USER_MESSAGES
+
+    _BUBBLE_STYLES = {
+        # (气泡底色, 角色标签色, 角色名)
+        "user": ("#f6e9da", "#a96632", "用户"),
+        "assistant": ("#f2f4f7", "#475467", "寻访顾问"),
+    }
+
+    def _append_message(self, role: str, content: str) -> None:
+        bg, fg, label = self._BUBBLE_STYLES.get(role, self._BUBBLE_STYLES["assistant"])
+        body = html.escape(content).replace("\n", "<br>")
+        bubble = (
+            '<td width="82%" bgcolor="{bg}">'
+            '<div style="font-size:11px; font-weight:600; color:{fg};">{label}</div>'
+            '<div style="color:#252a32;">{body}</div>'
+            "</td>"
+        ).format(bg=bg, fg=fg, label=label, body=body)
+        spacer = '<td width="18%"></td>'
+        # 用户气泡靠右，顾问气泡靠左
+        cells = (spacer + bubble) if role == "user" else (bubble + spacer)
+        self.chat_view.append(
+            '<table width="100%" cellpadding="10" cellspacing="0">'
+            "<tr>{}</tr></table>".format(cells)
+        )
+        self.chat_view.append('<div style="font-size:6px;"> </div>')
+
+    def _send_message(self) -> None:
+        if self._busy:
+            return
+        content = self.chat_input.toPlainText().strip()
+        if not content:
+            return
+        self._history.append({"role": "user", "content": content})
+        self._append_message("user", content)
+        self.chat_input.clear()
+        self._set_busy(True, "顾问正在思考…")
+        history_snapshot = list(self._history)
+
+        def _run():
+            try:
+                reply = self.consultant.reply(history_snapshot)
+                self._signals.replied.emit(reply)
+            except Exception as exc:
+                self._signals.failed.emit(str(exc))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_reply(self, content: str) -> None:
+        self._history.append({"role": "assistant", "content": content})
+        self._append_message("assistant", content)
+        self._set_busy(False)
+        self._update_round_state()
+
+    def _on_failed(self, error: str) -> None:
+        self._set_busy(False)
+        self._update_round_state()
+        QMessageBox.warning(
+            self,
+            "讨论失败",
+            "{}\n\n请检查设置中的讨论模型配置。".format(error or "未知错误"),
+        )
+
+    def _set_busy(self, busy: bool, hint: str = "") -> None:
+        self._busy = busy
+        self.send_btn.setEnabled(not busy)
+        self.send_btn.setText("思考中..." if busy else "发送")
+        self.chat_input.setEnabled(not busy)
+        self.finalize_btn.setEnabled((not busy) and self._can_finalize())
+        if not busy:
+            self.finalize_btn.setText("固定方案")
+        self.back_btn.setEnabled(not busy)
+        if busy and hint:
+            self.round_label.setText(hint)
+
+    def _update_round_state(self) -> None:
+        rounds = self._user_message_count() - 1  # 第一条消息是 JD 本身
+        if rounds >= 1:
+            self.round_label.setText(
+                "已讨论 {} 轮，可以固定方案，也可以继续讨论。".format(rounds)
+            )
+        else:
+            self.round_label.setText("顾问已给出分析，请至少回复一轮后再固定方案。")
+
+    # --------------------------------------------------------------
+    # finalize flow
+    # --------------------------------------------------------------
+    def _finalize(self) -> None:
+        if self._busy or not self._can_finalize():
+            return
+        self._set_busy(True, "正在生成《寻访方案》终稿…")
+        self.finalize_btn.setText("生成中...")
+        history_snapshot = list(self._history)
+
+        def _run():
+            try:
+                plan = self.consultant.finalize_plan(history_snapshot)
+                self._signals.finalized.emit(plan)
+            except Exception as exc:
+                self._signals.failed.emit(str(exc))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_finalized(self, plan: str) -> None:
+        self.plan_edit.setPlainText(plan)
+        self._show_plan_state(True)
+        self._set_busy(False)
+
+    def _show_plan_state(self, show_plan: bool) -> None:
+        self.chat_view.setVisible(not show_plan)
+        self.chat_input.setVisible(not show_plan)
+        self.send_btn.setVisible(not show_plan)
+        self.finalize_btn.setVisible(not show_plan)
+        self.plan_edit.setVisible(show_plan)
+        self.back_btn.setVisible(show_plan)
+        self.confirm_btn.setVisible(show_plan)
+        if show_plan:
+            self.round_label.setText(
+                "《寻访方案》已生成，可直接编辑修正；确认后以此为岗位方向创建任务。"
+            )
+        else:
+            self._update_round_state()
+
+    def _back_to_discussion(self) -> None:
+        self._show_plan_state(False)
+
+    def _confirm(self) -> None:
+        if not self.plan_edit.toPlainText().strip():
+            QMessageBox.warning(self, "提示", "方案内容为空，无法创建任务。")
             return
         self.accept()
 
     def payload(self) -> Dict[str, object]:
-        jd_text = self.jd_input.toPlainText().strip()
+        jd_text = self.plan_edit.toPlainText().strip()
         title = self.title_input.text().strip() or Planner.infer_title(jd_text)
         return {
             "title": title,
             "jd_text": jd_text,
-            "user_notes": self.notes_input.toPlainText().strip(),
+            "user_notes": "",
             "mode": self.mode_combo.currentText(),
             "max_rounds": self.max_rounds.value(),
             "max_detail_fetches": self.max_details.value(),
@@ -664,6 +874,33 @@ class SettingsDialog(QDialog):
         self.backend_llm_provider.setCurrentIndex(max(0, index))
         form.addRow("后端 API 格式", self.backend_llm_provider)
 
+        # Chat LLM (JD 讨论顾问)
+        form.addRow(QLabel(""))
+        chat_label = QLabel(
+            "讨论 LLM 配置（JD 讨论顾问专用，留空则共用上方配置）"
+        )
+        chat_label.setObjectName("SessionInfo")
+        form.addRow(chat_label)
+
+        self.chat_api_base_url = QLineEdit(config.chat_api_base_url)
+        self.chat_api_base_url.setPlaceholderText("https://opencode.ai/zen/go/v1")
+        form.addRow("讨论 API Base URL", self.chat_api_base_url)
+
+        self.chat_api_key = QLineEdit(config.chat_api_key)
+        self.chat_api_key.setEchoMode(QLineEdit.Password)
+        self.chat_api_key.setPlaceholderText("留空则使用上方 API Key")
+        form.addRow("讨论 API Key", self.chat_api_key)
+
+        self.chat_model_name = QLineEdit(config.chat_model_name)
+        self.chat_model_name.setPlaceholderText("留空则使用上方模型名称")
+        form.addRow("讨论模型名称", self.chat_model_name)
+
+        self.chat_llm_provider = QComboBox()
+        self.chat_llm_provider.addItems(["openai", "anthropic"])
+        index = self.chat_llm_provider.findText(config.chat_llm_provider or "openai")
+        self.chat_llm_provider.setCurrentIndex(max(0, index))
+        form.addRow("讨论 API 格式", self.chat_llm_provider)
+
         self.browser_channel = QComboBox()
         self.browser_channel.addItems(["msedge", "chrome", "chromium"])
         index = self.browser_channel.findText(
@@ -695,16 +932,20 @@ class SettingsDialog(QDialog):
         test_agent_btn.setObjectName("SecondaryBtn")
         test_matcher_btn = QPushButton("测试匹配模型")
         test_matcher_btn.setObjectName("SecondaryBtn")
+        test_chat_btn = QPushButton("测试讨论模型")
+        test_chat_btn.setObjectName("SecondaryBtn")
         buttons.addStretch(1)
         cancel_btn = QPushButton("取消")
         cancel_btn.setObjectName("SecondaryBtn")
         save_btn = QPushButton("保存")
         test_agent_btn.clicked.connect(lambda: self._test_connection("default"))
         test_matcher_btn.clicked.connect(lambda: self._test_connection("backend"))
+        test_chat_btn.clicked.connect(lambda: self._test_connection("chat"))
         cancel_btn.clicked.connect(self.reject)
         save_btn.clicked.connect(self._save)
         buttons.addWidget(test_agent_btn)
         buttons.addWidget(test_matcher_btn)
+        buttons.addWidget(test_chat_btn)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(save_btn)
         layout.addLayout(buttons)
@@ -718,12 +959,16 @@ class SettingsDialog(QDialog):
             backend_api_base_url=self.backend_api_base_url.text().strip(),
             backend_api_key=self.backend_api_key.text().strip(),
             backend_model_name=self.backend_model_name.text().strip(),
+            chat_api_base_url=self.chat_api_base_url.text().strip(),
+            chat_api_key=self.chat_api_key.text().strip(),
+            chat_model_name=self.chat_model_name.text().strip(),
             liepin_browser_channel=self.browser_channel.currentText(),
             liepin_browser_profile_dir=self.profile_dir.text().strip()
             or "browser_profile/liepin",
             greeting_template=self.greeting_template.toPlainText().strip(),
             llm_provider=self.llm_provider.currentText(),
             backend_llm_provider=self.backend_llm_provider.currentText(),
+            chat_llm_provider=self.chat_llm_provider.currentText(),
             greet_gold_only=self.greet_gold_only.isChecked(),
         )
 

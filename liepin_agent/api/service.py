@@ -527,6 +527,8 @@ class WorkbenchService:
         data["backend_api_key"] = ""
         data["api_key_configured"] = bool(config.api_key)
         data["backend_api_key_configured"] = bool(config.backend_api_key)
+        data["chat_api_key"] = ""
+        data["chat_api_key_configured"] = bool(config.chat_api_key)
         return data
 
     def update_config(self, payload: ConfigUpdateRequest) -> Dict[str, Any]:
@@ -535,6 +537,8 @@ class WorkbenchService:
             values["api_key"] = self.config_manager.config.api_key
         if not values.get("backend_api_key"):
             values["backend_api_key"] = self.config_manager.config.backend_api_key
+        if not values.get("chat_api_key"):
+            values["chat_api_key"] = self.config_manager.config.chat_api_key
         self.config_manager.update(**values)
         if not self.config_manager.save_config():
             raise ApiError("config_save_failed", "配置文件写入失败。")

@@ -65,3 +65,56 @@ def test_llm_connection_specs_resolve_backend_fallback(tmp_path):
     assert specs["backend"]["api_key"] == "secret-key"
     assert specs["backend"]["model_name"] == "matcher-model"
     assert specs["backend"]["source"]["api_base_url"] == "default"
+
+
+def test_llm_connection_specs_resolve_chat_fallback(tmp_path):
+    config_path = tmp_path / "config.json"
+    manager = ConfigManager(str(config_path))
+    manager.update(
+        api_base_url="https://api.example.com/v1",
+        api_key="secret-key",
+        model_name="agent-model",
+    )
+
+    specs = manager.llm_connection_specs()
+
+    assert specs["chat"]["api_base_url"] == "https://api.example.com/v1"
+    assert specs["chat"]["api_key"] == "secret-key"
+    assert specs["chat"]["model_name"] == "agent-model"
+    assert specs["chat"]["provider"] == "openai"
+    assert specs["chat"]["source"]["model_name"] == "default"
+
+
+def test_chat_config_partial_override_and_env_roundtrip(tmp_path):
+    config_path = tmp_path / "config.json"
+    manager = ConfigManager(str(config_path))
+    manager.update(
+        api_base_url="https://api.example.com/v1",
+        api_key="secret-key",
+        model_name="agent-model",
+        chat_model_name="chat-pro-model",
+    )
+
+    specs = manager.llm_connection_specs()
+    assert specs["chat"]["model_name"] == "chat-pro-model"
+    assert specs["chat"]["api_base_url"] == "https://api.example.com/v1"
+    assert specs["chat"]["source"]["model_name"] == "config.json"
+
+    assert manager.save_config() is True
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "LIEPIN_AGENT_CHAT_MODEL_NAME=chat-pro-model" in env_text
+
+    reloaded = ConfigManager(str(config_path))
+    assert reloaded.config.chat_model_name == "chat-pro-model"
+
+
+def test_chat_config_os_env_overrides(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    manager = ConfigManager(str(config_path))
+    manager.update(chat_model_name="file-model")
+    assert manager.save_config() is True
+
+    monkeypatch.setenv("LIEPIN_AGENT_CHAT_MODEL_NAME", "env-model")
+    reloaded = ConfigManager(str(config_path))
+
+    assert reloaded.config.chat_model_name == "env-model"

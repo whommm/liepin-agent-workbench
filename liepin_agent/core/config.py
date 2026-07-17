@@ -21,6 +21,12 @@ BACKEND_API_ENV_NAMES = {
     "model_name": "LIEPIN_AGENT_BACKEND_MODEL_NAME",
 }
 
+CHAT_API_ENV_NAMES = {
+    "api_base_url": "LIEPIN_AGENT_CHAT_API_BASE_URL",
+    "api_key": "LIEPIN_AGENT_CHAT_API_KEY",
+    "model_name": "LIEPIN_AGENT_CHAT_MODEL_NAME",
+}
+
 
 class AppConfig(BaseModel):
     """应用配置数据类（Pydantic 校验）"""
@@ -36,6 +42,12 @@ class AppConfig(BaseModel):
     backend_api_base_url: str = ""
     backend_api_key: str = ""
     backend_model_name: str = ""
+
+    # 讨论 LLM 配置（JD 讨论顾问专用）
+    # 留空时逐字段 fallback 到默认配置
+    chat_api_base_url: str = ""
+    chat_api_key: str = ""
+    chat_model_name: str = ""
 
     tavily_api_key: str = ""
     web_search_enabled: bool = True
@@ -54,6 +66,7 @@ class AppConfig(BaseModel):
     last_greeting_excel_path: str = ""
     llm_provider: str = "openai"
     backend_llm_provider: str = "openai"
+    chat_llm_provider: str = "openai"
     debug_snapshots_enabled: bool = False
 
     # --- 运行时可调参数（之前硬编码的魔法数字）---
@@ -62,6 +75,7 @@ class AppConfig(BaseModel):
     llm_max_tokens: int = Field(default=4096, ge=1, le=8192)
     llm_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     backend_llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    chat_llm_temperature: float = Field(default=0.4, ge=0.0, le=2.0)
     # RPM 限流（实测 SenseNova deepseek-v4-flash 为 5 次/分钟，令牌桶容量 5）
     llm_rpm_limit: int = Field(default=5, ge=1, le=600)
     llm_rpm_burst: int = Field(default=5, ge=1, le=100)
@@ -171,7 +185,7 @@ class ConfigManager:
                 setattr(self.config, key, value)
 
     def llm_connection_specs(self) -> Dict[str, Dict[str, object]]:
-        """Return resolved Agent Brain and Matcher LLM connection specs."""
+        """Return resolved Agent Brain, Matcher and Chat LLM connection specs."""
         default_spec = {
             "api_base_url": self.config.api_base_url,
             "api_key": self.config.api_key,
@@ -190,7 +204,21 @@ class ConfigManager:
             "provider": self.config.backend_llm_provider or "openai",
             "source": self.config_source_summary("backend"),
         }
-        return {"default": default_spec, "backend": backend_spec}
+        chat_spec = {
+            "api_base_url": self.config.chat_api_base_url or self.config.api_base_url,
+            "api_key": self.config.chat_api_key or self.config.api_key,
+            "model_name": self.config.chat_model_name
+            or self.config.model_name
+            or "deepseek-v4-flash",
+            "timeout": int(self.config.timeout or 120),
+            "provider": self.config.chat_llm_provider or "openai",
+            "source": self.config_source_summary("chat"),
+        }
+        return {
+            "default": default_spec,
+            "backend": backend_spec,
+            "chat": chat_spec,
+        }
 
     def config_source_summary(self, profile: str = "default") -> Dict[str, str]:
         env_values = self._read_env_file()
@@ -215,6 +243,27 @@ class ConfigManager:
                     fallback="default",
                 ),
             }
+        if profile == "chat":
+            return {
+                "api_base_url": self._value_source(
+                    CHAT_API_ENV_NAMES["api_base_url"],
+                    env_values,
+                    bool(self.config.chat_api_base_url),
+                    fallback="default",
+                ),
+                "api_key": self._value_source(
+                    CHAT_API_ENV_NAMES["api_key"],
+                    env_values,
+                    bool(self.config.chat_api_key),
+                    fallback="default",
+                ),
+                "model_name": self._value_source(
+                    CHAT_API_ENV_NAMES["model_name"],
+                    env_values,
+                    bool(self.config.chat_model_name),
+                    fallback="default",
+                ),
+            }
         return {
             "api_base_url": self._value_source(
                 API_ENV_NAMES["api_base_url"], env_values, bool(self.config.api_base_url)
@@ -236,7 +285,7 @@ class ConfigManager:
         from ..tools.llm_client import LLMClient
 
         specs = self.llm_connection_specs()
-        spec = specs["backend" if profile == "backend" else "default"]
+        spec = specs[profile if profile in ("backend", "chat") else "default"]
         client = LLMClient(
             str(spec.get("api_base_url") or ""),
             str(spec.get("api_key") or ""),
@@ -245,13 +294,17 @@ class ConfigManager:
             provider=str(spec.get("provider") or "openai"),
             max_retries=self.config.llm_max_retries,
             max_tokens=self.config.llm_max_tokens,
-            temperature=self.config.llm_temperature,
+            temperature=(
+                self.config.chat_llm_temperature
+                if profile == "chat"
+                else self.config.llm_temperature
+            ),
             rpm_limit=self.config.llm_rpm_limit,
             rpm_burst=self.config.llm_rpm_burst,
             rpm_cooldown_seconds=self.config.llm_rpm_cooldown_seconds,
         )
         result = client.test_connection()
-        result["profile"] = "backend" if profile == "backend" else "default"
+        result["profile"] = profile if profile in ("backend", "chat") else "default"
         result["source"] = spec.get("source") or {}
         return result
 
@@ -280,6 +333,14 @@ class ConfigManager:
         config.backend_api_key = backend_key or config.backend_api_key
         config.backend_model_name = backend_model or config.backend_model_name
 
+        # Chat LLM env overrides
+        chat_url = env_values.get(CHAT_API_ENV_NAMES["api_base_url"], "")
+        chat_key = env_values.get(CHAT_API_ENV_NAMES["api_key"], "")
+        chat_model = env_values.get(CHAT_API_ENV_NAMES["model_name"], "")
+        config.chat_api_base_url = chat_url or config.chat_api_base_url
+        config.chat_api_key = chat_key or config.chat_api_key
+        config.chat_model_name = chat_model or config.chat_model_name
+
         config.api_base_url = os.environ.get(
             API_ENV_NAMES["api_base_url"], config.api_base_url
         )
@@ -304,6 +365,16 @@ class ConfigManager:
         )
         config.backend_model_name = os.environ.get(
             BACKEND_API_ENV_NAMES["model_name"], config.backend_model_name
+        )
+
+        config.chat_api_base_url = os.environ.get(
+            CHAT_API_ENV_NAMES["api_base_url"], config.chat_api_base_url
+        )
+        config.chat_api_key = os.environ.get(
+            CHAT_API_ENV_NAMES["api_key"], config.chat_api_key
+        )
+        config.chat_model_name = os.environ.get(
+            CHAT_API_ENV_NAMES["model_name"], config.chat_model_name
         )
 
         # Tavily API key
@@ -337,6 +408,9 @@ class ConfigManager:
         env_values[BACKEND_API_ENV_NAMES["api_base_url"]] = self.config.backend_api_base_url or ""
         env_values[BACKEND_API_ENV_NAMES["api_key"]] = self.config.backend_api_key or ""
         env_values[BACKEND_API_ENV_NAMES["model_name"]] = self.config.backend_model_name or ""
+        env_values[CHAT_API_ENV_NAMES["api_base_url"]] = self.config.chat_api_base_url or ""
+        env_values[CHAT_API_ENV_NAMES["api_key"]] = self.config.chat_api_key or ""
+        env_values[CHAT_API_ENV_NAMES["model_name"]] = self.config.chat_model_name or ""
         env_values["TAVILY_API_KEY"] = self.config.tavily_api_key or ""
         self._write_env_file(env_values)
 
@@ -366,6 +440,9 @@ class ConfigManager:
             BACKEND_API_ENV_NAMES["api_base_url"],
             BACKEND_API_ENV_NAMES["api_key"],
             BACKEND_API_ENV_NAMES["model_name"],
+            CHAT_API_ENV_NAMES["api_base_url"],
+            CHAT_API_ENV_NAMES["api_key"],
+            CHAT_API_ENV_NAMES["model_name"],
             "TAVILY_API_KEY",
         ]
         written = set()
