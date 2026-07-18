@@ -17,6 +17,7 @@ from ..domain.models import (
     CandidateSummary,
     FetchDecision,
     Observation,
+    PaginationVerdict,
     RoundReview,
     SearchPlan,
 )
@@ -28,6 +29,7 @@ from .candidate_picker import CandidatePicker
 from .city_normalizer import normalize_city_list
 from .context import (
     OBSERVE_PROMPT_CHAR_BUDGET,
+    PAGINATION_PROMPT_CHAR_BUDGET,
     REVIEW_PROMPT_CHAR_BUDGET,
     build_match_review_context,
     build_observation_context,
@@ -125,6 +127,49 @@ class RuleBasedAgentBrain:
             already_fetched_ids=already_fetched_ids,
         )
 
+    def decide_pagination(
+        self,
+        plan: SearchPlan,
+        criteria: Dict[str, object],
+        page_stats: List[Dict[str, object]],
+        cursor_page_num: int,
+        hard_cap: int,
+        total_results: Optional[int] = None,
+        has_next_page: bool = True,
+        new_card_samples: Optional[List[Dict[str, str]]] = None,
+        min_new_unique: int = 3,
+        duplicate_rate_threshold: float = 0.8,
+    ) -> PaginationVerdict:
+        """Rule fallback for pagination: continue while the latest page yields."""
+        max_additional = max(0, int(hard_cap) - int(cursor_page_num))
+        if max_additional <= 0 or not has_next_page:
+            return PaginationVerdict(
+                action="stop",
+                additional_pages=0,
+                reason="已达到分页硬上限或没有下一页，停止翻页。",
+            )
+        latest = (page_stats or [])[-1] if page_stats else {}
+        new_unique = int(latest.get("new_unique") or 0)
+        duplicate_rate = float(latest.get("duplicate_rate") or 0.0)
+        if (
+            page_stats
+            and new_unique >= max(1, int(min_new_unique))
+            and duplicate_rate < float(duplicate_rate_threshold)
+        ):
+            pages = min(2, max_additional)
+            return PaginationVerdict(
+                action="continue",
+                additional_pages=pages,
+                reason="最新页新增 {} 张候选、重复率 {:.0%}，继续翻 {} 页。".format(
+                    new_unique, duplicate_rate, pages
+                ),
+            )
+        return PaginationVerdict(
+            action="stop",
+            additional_pages=0,
+            reason="最新页新增不足或重复率过高，停止翻页。",
+        )
+
     def review_round(
         self,
         previous_plan: SearchPlan,
@@ -178,6 +223,10 @@ class LLMAgentBrain:
         self.last_prompt_metrics: Dict[str, Dict[str, int]] = {}
         self._fallback_brain = RuleBasedAgentBrain()
         self.last_fallback: Dict[str, str] = {}
+        # 规则兜底参数（search_min_new_unique_per_page /
+        # search_duplicate_rate_threshold），from_config 会用配置覆盖。
+        self._rule_min_new_unique = 3
+        self._rule_duplicate_rate_threshold = 0.8
 
     @classmethod
     def from_config(
@@ -204,7 +253,7 @@ class LLMAgentBrain:
                 "skip_audit_rate": min(config.candidate_skip_audit_rate, 0.05),
             },
         }
-        return cls(
+        brain = cls(
             LLMClient(
                 api_base_url=config.api_base_url,
                 api_key=config.api_key,
@@ -220,6 +269,13 @@ rpm_limit=config.llm_rpm_limit,
             ),
             candidate_picker=CandidatePicker(strategies),
         )
+        brain._rule_min_new_unique = int(
+            getattr(config, "search_min_new_unique_per_page", 3) or 3
+        )
+        brain._rule_duplicate_rate_threshold = float(
+            getattr(config, "search_duplicate_rate_threshold", 0.8) or 0.8
+        )
+        return brain
 
     def build_criteria(self, jd_text: str, user_notes: str) -> Dict[str, object]:
         prompt = self._prompt.get(
@@ -245,7 +301,11 @@ rpm_limit=config.llm_rpm_limit,
             "city_scope": normalize_city_list(self._string_list(data.get("city_scope")))[:8],
             # gender_requirement 直接影响猎聘搜索的性别筛选，必须透传，
             # 否则下游 initial_plan / matcher 都拿不到 JD 的性别要求。
-            "gender_requirement": str(data.get("gender_requirement") or "").strip(),
+            # build_criteria 提示词不要求 LLM 输出该字段，自由文本格式也
+            # 不可控，这里用确定性规则从 JD + 补充说明提取（男/女/不限/空）。
+            "gender_requirement": Planner.extract_gender_requirement(
+                "{}\n{}".format(jd_text or "", user_notes or "")
+            ),
         }
         criteria_items, personas = normalize_job_profile({**data, **result})
         result["criteria_items"] = criteria_items
@@ -335,6 +395,90 @@ rpm_limit=config.llm_rpm_limit,
             candidates,
             remaining_detail_budget,
             already_fetched_ids=already_fetched_ids,
+        )
+
+    def decide_pagination(
+        self,
+        plan: SearchPlan,
+        criteria: Dict[str, object],
+        page_stats: List[Dict[str, object]],
+        cursor_page_num: int,
+        hard_cap: int,
+        total_results: Optional[int] = None,
+        has_next_page: bool = True,
+        new_card_samples: Optional[List[Dict[str, str]]] = None,
+    ) -> PaginationVerdict:
+        """LLM 依据逐页产出决定"再翻 N 页"或"停止"；失败回退规则脑，不直接停。"""
+        max_additional = max(0, int(hard_cap) - int(cursor_page_num))
+        if max_additional <= 0 or not has_next_page:
+            return PaginationVerdict(
+                action="stop",
+                additional_pages=0,
+                reason="已达到分页硬上限或没有下一页，停止翻页。",
+            )
+        prompt = self._render_budgeted_prompt(
+            "decide_pagination",
+            char_budget=PAGINATION_PROMPT_CHAR_BUDGET,
+            shrink_order=("page_stats", "samples"),
+            plan=json_text(
+                {
+                    "query": plan.query,
+                    "position_filter": plan.position_filter,
+                    "intent": plan.intent,
+                    "expected_signal": list(plan.expected_signal or [])[:8],
+                }
+            ),
+            criteria=json_text(
+                {
+                    "core_terms": list((criteria or {}).get("core_terms") or []),
+                    "negative_terms": list(
+                        (criteria or {}).get("negative_terms") or []
+                    ),
+                }
+            ),
+            page_stats=json_text(list(page_stats or [])),
+            samples=json_text(list(new_card_samples or [])[:10]),
+            total_results=(
+                total_results if total_results is not None else "未知"
+            ),
+            current_page=int(cursor_page_num),
+            hard_cap=int(hard_cap),
+            max_additional=max_additional,
+            has_next_page="是" if has_next_page else "否",
+        )
+        try:
+            data = self._chat_json(prompt)
+        except Exception as exc:
+            self._record_fallback("decide_pagination", exc)
+            return self._fallback_brain.decide_pagination(
+                plan=plan,
+                criteria=criteria,
+                page_stats=page_stats,
+                cursor_page_num=cursor_page_num,
+                hard_cap=hard_cap,
+                total_results=total_results,
+                has_next_page=has_next_page,
+                new_card_samples=new_card_samples,
+                min_new_unique=self._rule_min_new_unique,
+                duplicate_rate_threshold=self._rule_duplicate_rate_threshold,
+            )
+        action = str(data.get("action") or "").strip().lower()
+        reason = str(data.get("reason") or "").strip()
+        if action != "continue":
+            return PaginationVerdict(
+                action="stop",
+                additional_pages=0,
+                reason=reason or "Agent 判断继续翻页价值不足，停止翻页。",
+            )
+        try:
+            pages = int(data.get("additional_pages") or 1)
+        except (TypeError, ValueError):
+            pages = 1
+        pages = max(1, min(max_additional, pages))
+        return PaginationVerdict(
+            action="continue",
+            additional_pages=pages,
+            reason=reason or "Agent 判断后续页仍有产出，继续翻页。",
         )
 
     def review_round(
@@ -895,6 +1039,19 @@ rpm_limit=config.llm_rpm_limit,
         if criteria.get("allow_protected_attribute_filters") is not True:
             guarded.pop("age", None)
             guarded.pop("gender", None)
+
+        # 性别例外：JD 明确提出性别要求（男/女）时，搜索阶段强制带上性别
+        # 硬筛选，避免召回性别不符的候选人浪费沟通额度。这里做确定性注入，
+        # 不依赖 LLM 在 plan 里自觉填写；LLM 错填的值也会被覆盖。
+        gender_requirement = str(criteria.get("gender_requirement") or "").strip()
+        if gender_requirement not in ("男", "女"):
+            # 讨论确认环节可能人工改写过要求文本，gender_requirement 字段
+            # 未必同步更新，再从已确认要求文本里确定性提取一次。
+            gender_requirement = Planner.extract_gender_requirement(
+                str(criteria.get("requirements_text") or "")
+            )
+        if gender_requirement in ("男", "女"):
+            guarded["gender"] = gender_requirement
 
         if hypothesis_type != "target_company":
             guarded.pop("company", None)

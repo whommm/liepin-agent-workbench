@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from dataclasses import replace
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 from ._models import (
     AdaptivePaginationPolicy,
@@ -15,6 +16,8 @@ from ._models import (
     LiepinSearchNoResultsError,
     LiepinSearchPageChangedError,
     PageYieldStats,
+    SearchCursor,
+    SearchCursorLostError,
 )
 from ...domain.dedupe import normalize_profile_url, normalize_text
 
@@ -47,12 +50,20 @@ class _ExecutorMixin:
         candidate_classifier: Optional[Callable[[LiepinSearchCandidate], str]] = None,
         on_page: Optional[Callable[[PageYieldStats], None]] = None,
         known_candidate_keys: Optional[Iterable[str]] = None,
+        checkpoint_pages: Optional[int] = None,
     ) -> List[LiepinSearchCandidate]:
         """Run a keyword search and optionally stop on low marginal page yield.
 
         Passing an integer ``max_pages`` keeps the legacy fixed-page behavior.
         Adaptive callers may pass a policy as ``max_pages`` or combine an old
         integer hard cap with ``pagination_policy``.
+
+        When ``checkpoint_pages`` is set, pagination becomes agent-driven: the
+        search returns after ``min(checkpoint_pages, page_cap)`` pages, the
+        policy verdict is recorded on each ``PageYieldStats`` as signal only
+        (it no longer terminates pagination), and a ``SearchCursor`` is
+        exported via ``self.last_search_cursor`` so the agent can continue
+        later with ``resume_pagination``.
         """
         if not keyword.strip():
             raise LiepinSearchError("搜索关键词不能为空")
@@ -65,6 +76,13 @@ class _ExecutorMixin:
             page_cap = min(10, max(1, int(max_pages)))
             if active_policy is not None:
                 page_cap = min(page_cap, active_policy.effective_max_pages)
+
+        if checkpoint_pages is None:
+            pages_to_fetch = page_cap
+            policy_signal_only = False
+        else:
+            pages_to_fetch = min(max(1, int(checkpoint_pages)), page_cap)
+            policy_signal_only = True
 
         self.open_search_page()
 
@@ -82,102 +100,304 @@ class _ExecutorMixin:
             if filters:
                 self._apply_filters_on_page(page, filters)
 
-            all_candidates: List[LiepinSearchCandidate] = []
             historical_keys = {
                 self._normalize_candidate_key(item)
                 for item in (known_candidate_keys or [])
                 if self._normalize_candidate_key(item)
             }
-            seen_keys: set[str] = set(historical_keys)
-            page_history: List[PageYieldStats] = []
-            self.last_pagination_stats = page_history
+            cursor = SearchCursor(
+                query=keyword.strip(),
+                filters=dict(filters or {}),
+                match_mode=match_mode or "",
+                scope=scope or "",
+                position_filter=position_filter or "",
+                seen_keys=set(historical_keys),
+            )
+            self.last_search_cursor = cursor
+            self.last_pagination_stats = cursor.history
 
-            for page_num in range(1, page_cap + 1):
-                try:
-                    candidates = self.extract_candidates_from_page(page)
-                except Exception as exc:
-                    if page_num == 1:
-                        raise
-                    logger.warning(
-                        "search: page %s extraction failed, stopping pagination: %s",
-                        page_num,
-                        exc,
-                    )
-                    break
-
-                page_meta = self._extract_page_meta(page)
-
-                new_unique_candidates = []
-                duplicate_count = 0
-                for page_index, c in enumerate(candidates):
-                    c.page_meta = {**page_meta, "page_num": page_num}
-                    if c.result_index < 0:
-                        c.result_index = page_index
-                    dedupe_key = self._candidate_dedupe_key(c)
-                    if dedupe_key in seen_keys:
-                        duplicate_count += 1
-                        c.page_meta["duplicate_in_search"] = True
-                        if dedupe_key in historical_keys:
-                            c.page_meta["seen_in_previous_round"] = True
-                        continue
-                    seen_keys.add(dedupe_key)
-                    new_unique_candidates.append(c)
-
-                # Return the raw page cards, including historical/cross-page
-                # duplicates. Runtime persists those occurrences as candidate
-                # sources while pagination yield only counts first-seen keys.
-                all_candidates.extend(candidates)
-
-                potential_count = 0
-                validate_count = 0
-                for candidate in new_unique_candidates:
-                    bucket = self._pagination_candidate_bucket(
-                        candidate, candidate_classifier
-                    )
-                    if bucket == "potential":
-                        potential_count += 1
-                    elif bucket == "validate":
-                        validate_count += 1
-                stats = PageYieldStats(
-                    page_num=page_num,
-                    raw_count=len(candidates),
-                    new_unique=len(new_unique_candidates),
-                    duplicate_count=duplicate_count,
-                    potential_count=potential_count,
-                    validate_count=validate_count,
-                )
-                page_history.append(stats)
-                logger.info("search pagination page=%s", stats.to_dict())
-                if on_page is not None:
-                    try:
-                        on_page(stats)
-                    except Exception as exc:
-                        logger.warning("search: on_page callback failed: %s", exc)
-
-                if active_policy is not None:
-                    pagination_decision = active_policy.assess(page_history)
-                    logger.info(
-                        "search pagination decision continue=%s reason=%s",
-                        pagination_decision.continue_paging,
-                        pagination_decision.reason,
-                    )
-                    if not pagination_decision.continue_paging:
-                        break
-
-                if page_num < page_cap:
-                    next_ok = self.go_to_next_result_page()
-                    if not next_ok:
-                        logger.warning(
-                            "search: pagination stopped at page %s", page_num
-                        )
-                        break
-
-            return all_candidates
+            return self._paginate_from_current_page(
+                page,
+                start_page_num=1,
+                pages_to_fetch=pages_to_fetch,
+                page_cap=page_cap,
+                cursor=cursor,
+                historical_keys=historical_keys,
+                candidate_classifier=candidate_classifier,
+                on_page=on_page,
+                active_policy=active_policy,
+                policy_signal_only=policy_signal_only,
+                raise_on_first_page_error=True,
+            )
 
         return self._with_debug_snapshot(
             "search_keyword_{}".format(keyword.strip()),
             lambda: self.browser_manager.run_with_page(_run),
         )
+
+    def resume_pagination(
+        self,
+        cursor: SearchCursor,
+        additional_pages: int,
+        *,
+        page_cap: int = 10,
+        pagination_policy: Optional[AdaptivePaginationPolicy] = None,
+        candidate_classifier: Optional[Callable[[LiepinSearchCandidate], str]] = None,
+        on_page: Optional[Callable[[PageYieldStats], None]] = None,
+    ) -> List[LiepinSearchCandidate]:
+        """Continue paging from a previously exported ``SearchCursor``.
+
+        Validates that the browser still sits on the cursor's result page;
+        when the SPA state was lost (refresh/crash/session expiry) the search
+        is rebuilt from the cursor and advanced by clicking back to
+        ``cursor.page_num``. Raises ``SearchCursorLostError`` when neither
+        works so the runtime can finish the round gracefully.
+        """
+        page_cap = min(10, max(1, int(page_cap)))
+        additional = int(additional_pages)
+        if cursor.exhausted or cursor.page_num >= page_cap or additional < 1:
+            return []
+        pages_to_fetch = min(additional, page_cap - cursor.page_num)
+
+        self.last_search_cursor = cursor
+        self.last_pagination_stats = cursor.history
+
+        def _run(page):
+            if not self._validate_search_cursor(page, cursor):
+                self._recover_search_cursor(page, cursor)
+            return self._paginate_from_current_page(
+                page,
+                start_page_num=cursor.page_num,
+                pages_to_fetch=pages_to_fetch,
+                page_cap=page_cap,
+                cursor=cursor,
+                candidate_classifier=candidate_classifier,
+                on_page=on_page,
+                active_policy=pagination_policy,
+                policy_signal_only=True,
+                advance_first=True,
+            )
+
+        return self._with_debug_snapshot(
+            "resume_pagination_page_{}".format(cursor.page_num),
+            lambda: self.browser_manager.run_with_page(_run),
+        )
+
+    def _validate_search_cursor(self, page: Page, cursor: SearchCursor) -> bool:
+        """Check URL, DOM page number and an optional first-card fingerprint."""
+        url = getattr(page, "url", "") or ""
+        if not self.browser_manager._is_search_page_url(url):
+            logger.warning(
+                "search cursor validation failed: url %s is not the search workspace",
+                url,
+            )
+            return False
+        dom_page = self._get_current_page_number(page)
+        if cursor.page_num <= 1:
+            # Pagination may be hidden on a single result page, reading as 0.
+            if dom_page not in (0, 1):
+                logger.warning(
+                    "search cursor validation failed: dom page %s, expected 1",
+                    dom_page,
+                )
+                return False
+        elif dom_page != cursor.page_num:
+            logger.warning(
+                "search cursor validation failed: dom page %s, expected %s",
+                dom_page,
+                cursor.page_num,
+            )
+            return False
+        try:
+            cards = self.extract_candidates_from_page(page)
+        except Exception as exc:
+            logger.warning("search cursor validation extraction failed: %s", exc)
+            return False
+        if cards:
+            first_key = self._candidate_dedupe_key(cards[0])
+            if first_key and first_key not in cursor.seen_keys:
+                logger.warning(
+                    "search cursor validation failed: first card fingerprint mismatch"
+                )
+                return False
+        return True
+
+    def _recover_search_cursor(self, page: Page, cursor: SearchCursor) -> None:
+        """Rebuild the search from the cursor and click-advance to its page.
+
+        Result page numbers live in SPA memory (the URL carries no
+        ``curPage``), so the only way back is re-running the search and
+        clicking the next-page control up to ``cursor.page_num``.
+        """
+        logger.warning(
+            "search cursor lost at page %s, rebuilding search query=%s",
+            cursor.page_num,
+            cursor.query,
+        )
+        try:
+            try:
+                self._execute_search(
+                    page,
+                    cursor.query,
+                    match_mode=cursor.match_mode,
+                    scope=cursor.scope,
+                    position_filter=cursor.position_filter,
+                )
+            except TypeError:
+                self._execute_search(page, cursor.query)
+            if cursor.filters:
+                self._apply_filters_on_page(page, cursor.filters)
+
+            target = max(1, int(cursor.page_num))
+            max_steps = 10  # the product page hard cap bounds click advance
+            steps = 0
+            while (
+                target > 1
+                and self._get_current_page_number(page) < target
+                and steps < max_steps
+            ):
+                if not self.go_to_next_result_page():
+                    break
+                steps += 1
+            if target > 1 and self._get_current_page_number(page) != target:
+                raise SearchCursorLostError(
+                    "搜索游标恢复失败：无法回到第 {} 页".format(target)
+                )
+        except SearchCursorLostError:
+            raise
+        except Exception as exc:
+            raise SearchCursorLostError(
+                "搜索游标恢复失败：{}".format(exc)
+            ) from exc
+        logger.warning("search cursor recovered at page %s", cursor.page_num)
+
+    def _paginate_from_current_page(
+        self,
+        page: Page,
+        *,
+        start_page_num: int,
+        pages_to_fetch: int,
+        page_cap: int,
+        cursor: SearchCursor,
+        historical_keys: Optional[Set[str]] = None,
+        candidate_classifier: Optional[Callable[[LiepinSearchCandidate], str]] = None,
+        on_page: Optional[Callable[[PageYieldStats], None]] = None,
+        active_policy: Optional[AdaptivePaginationPolicy] = None,
+        policy_signal_only: bool = False,
+        raise_on_first_page_error: bool = False,
+        advance_first: bool = False,
+    ) -> List[LiepinSearchCandidate]:
+        """Shared fetch/dedupe/classify loop for ``search``/``resume_pagination``.
+
+        Mutates ``cursor`` in place (page_num, seen_keys, history,
+        total_results, exhausted) and returns the raw page cards of this
+        batch, including duplicates.
+
+        With ``advance_first`` the loop first turns to the next result page:
+        resume batches only collect pages not yet extracted.
+        """
+        historical = historical_keys or set()
+        all_candidates: List[LiepinSearchCandidate] = []
+        page_num = max(1, int(start_page_num))
+        if advance_first:
+            if not self.go_to_next_result_page():
+                cursor.exhausted = True
+                logger.warning("search: no next page to resume from page %s", page_num)
+                return []
+            page_num += 1
+        fetched = 0
+        while fetched < max(1, int(pages_to_fetch)) and page_num <= page_cap:
+            try:
+                candidates = self.extract_candidates_from_page(page)
+            except Exception as exc:
+                if fetched == 0 and raise_on_first_page_error:
+                    raise
+                logger.warning(
+                    "search: page %s extraction failed, stopping pagination: %s",
+                    page_num,
+                    exc,
+                )
+                break
+
+            page_meta = self._extract_page_meta(page)
+            if page_meta.get("total_results") is not None:
+                cursor.total_results = page_meta.get("total_results")
+
+            new_unique_candidates = []
+            duplicate_count = 0
+            for page_index, c in enumerate(candidates):
+                c.page_meta = {**page_meta, "page_num": page_num}
+                if c.result_index < 0:
+                    c.result_index = page_index
+                dedupe_key = self._candidate_dedupe_key(c)
+                if dedupe_key in cursor.seen_keys:
+                    duplicate_count += 1
+                    c.page_meta["duplicate_in_search"] = True
+                    if dedupe_key in historical:
+                        c.page_meta["seen_in_previous_round"] = True
+                    continue
+                cursor.seen_keys.add(dedupe_key)
+                new_unique_candidates.append(c)
+
+            # Return the raw page cards, including historical/cross-page
+            # duplicates. Runtime persists those occurrences as candidate
+            # sources while pagination yield only counts first-seen keys.
+            all_candidates.extend(candidates)
+
+            potential_count = 0
+            validate_count = 0
+            for candidate in new_unique_candidates:
+                bucket = self._pagination_candidate_bucket(
+                    candidate, candidate_classifier
+                )
+                if bucket == "potential":
+                    potential_count += 1
+                elif bucket == "validate":
+                    validate_count += 1
+            stats = PageYieldStats(
+                page_num=page_num,
+                raw_count=len(candidates),
+                new_unique=len(new_unique_candidates),
+                duplicate_count=duplicate_count,
+                potential_count=potential_count,
+                validate_count=validate_count,
+            )
+            cursor.history.append(stats)
+            if active_policy is not None:
+                pagination_decision = active_policy.assess(cursor.history)
+                logger.info(
+                    "search pagination decision continue=%s reason=%s",
+                    pagination_decision.continue_paging,
+                    pagination_decision.reason,
+                )
+                if policy_signal_only:
+                    cursor.history[-1] = replace(
+                        stats,
+                        policy_continue=pagination_decision.continue_paging,
+                        policy_reason=pagination_decision.reason,
+                    )
+                elif not pagination_decision.continue_paging:
+                    cursor.page_num = page_num
+                    break
+            logger.info("search pagination page=%s", cursor.history[-1].to_dict())
+            if on_page is not None:
+                try:
+                    on_page(cursor.history[-1])
+                except Exception as exc:
+                    logger.warning("search: on_page callback failed: %s", exc)
+
+            cursor.page_num = page_num
+            fetched += 1
+            if fetched >= pages_to_fetch or page_num >= page_cap:
+                break
+            next_ok = self.go_to_next_result_page()
+            if not next_ok:
+                cursor.exhausted = True
+                logger.warning("search: pagination stopped at page %s", page_num)
+                break
+            page_num += 1
+
+        return all_candidates
 
     @staticmethod
     def _candidate_dedupe_key(candidate: LiepinSearchCandidate) -> str:

@@ -240,7 +240,8 @@ class _CriteriaMixin:
                 "city_requirement": str(ai_raw.get("city_requirement") or "").strip(),
                 "position_filter": str(ai_raw.get("position_filter") or "").strip(),
                 "selected_direction": str(ai_raw.get("selected_direction") or "").strip(),
-                # 性别要求只传给 matcher 作为已确认条件，不自动转成猎聘硬筛选。
+                # 性别要求：传给 matcher 做软标注；同时为 男/女 时护栏会
+                # 自动转成猎聘搜索的性别硬筛选（brain._guard_search_filters）。
                 "gender_requirement": str(ai_raw.get("gender_requirement") or "").strip(),
                 "criteria_items": version.get("criteria_items") or [],
                 "personas": version.get("personas") or [],

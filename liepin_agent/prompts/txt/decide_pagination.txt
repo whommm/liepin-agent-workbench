@@ -1,0 +1,31 @@
+请决定本轮猎聘搜索是否继续翻页，输出 JSON：
+{{
+  "action": "continue/stop",
+  "additional_pages": 数字（action 为 continue 时必填）,
+  "reason": "一句话说明依据"
+}}
+
+## 背景
+- 搜索按批次翻页，当前停在第 {current_page} 页，硬上限第 {hard_cap} 页（最多还能再翻 {max_additional} 页）。
+- 搜索结果总数：{total_results}；是否还有下一页：{has_next_page}。
+- page_stats 是逐页产出统计：new_unique（本页新增去重候选数）、duplicate_rate（重复率）、
+  potential_count/validate_count（本地规则预判的潜力/待验证数）、
+  policy_continue/policy_reason（本地低收益策略的参考判定，仅供参考，不由它做决定）。
+
+## 判断规则
+- 最新一页仍有足量新增、且抽样卡片与目标方向相关 → continue，按新增趋势申报 1-{max_additional} 页。
+- 连续多页新增骤降、重复率高、或抽样卡片明显偏离目标方向 → stop。
+- 新增虽少但出现强相关信号（目标行业/技能/公司）→ 可 continue 1-2 页验证。
+- 不要为了凑满硬上限而翻页；也不要在产出仍然很好时提前停。
+
+【本轮搜索计划】
+{plan}
+
+【匹配标准核心词/负向词】
+{criteria}
+
+【逐页产出统计】
+{page_stats}
+
+【本批新增卡片抽样（最多 10 条）】
+{samples}

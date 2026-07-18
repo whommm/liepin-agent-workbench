@@ -98,8 +98,10 @@ class Planner:
             query = position_filter or "产品"
         # Emergency fallback must preserve the same recall safeguards as the
         # LLM plan path. Only a city scope carried by the confirmed criteria is
-        # eligible for a platform filter; education, age and gender remain
-        # matching facts rather than automatic search exclusions.
+        # eligible for a platform filter; education and age remain matching
+        # facts rather than automatic search exclusions. Gender is the one
+        # exception: an explicit JD gender requirement becomes a hard filter
+        # (same as the LLM plan guard in brain._guard_search_filters).
         filters = {"active_days": 30}
         confirmed_cities = [
             str(item).strip()
@@ -108,6 +110,9 @@ class Planner:
         ]
         if confirmed_cities:
             filters["city"] = confirmed_cities
+        gender_requirement = str(criteria.get("gender_requirement") or "").strip()
+        if gender_requirement in ("男", "女"):
+            filters["gender"] = gender_requirement
         if position_filter and position_filter in query:
             position_filter = ""
         return SearchPlan(

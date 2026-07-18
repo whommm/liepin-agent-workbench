@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 import threading
 from pathlib import Path
 from typing import Dict, List
@@ -37,6 +36,7 @@ from ..domain.greeting_policy import (
 )
 from ..domain.recommendation import RECOMMENDATION_LABELS
 from ..tools.excel_greeting import ExcelGreetingService
+from .chat_bubbles import bubble_html
 
 
 class _GreetingGenerationSignals(QObject):
@@ -229,29 +229,8 @@ class NewSessionDialog(QDialog):
     def _can_finalize(self) -> bool:
         return self._user_message_count() >= self.MIN_USER_MESSAGES
 
-    _BUBBLE_STYLES = {
-        # (气泡底色, 角色标签色, 角色名)
-        "user": ("#f6e9da", "#a96632", "用户"),
-        "assistant": ("#f2f4f7", "#475467", "寻访顾问"),
-    }
-
     def _append_message(self, role: str, content: str) -> None:
-        bg, fg, label = self._BUBBLE_STYLES.get(role, self._BUBBLE_STYLES["assistant"])
-        body = html.escape(content).replace("\n", "<br>")
-        bubble = (
-            '<td width="82%" bgcolor="{bg}">'
-            '<div style="font-size:11px; font-weight:600; color:{fg};">{label}</div>'
-            '<div style="color:#252a32;">{body}</div>'
-            "</td>"
-        ).format(bg=bg, fg=fg, label=label, body=body)
-        spacer = '<td width="18%"></td>'
-        # 用户气泡靠右，顾问气泡靠左
-        cells = (spacer + bubble) if role == "user" else (bubble + spacer)
-        self.chat_view.append(
-            '<table width="100%" cellpadding="10" cellspacing="0">'
-            "<tr>{}</tr></table>".format(cells)
-        )
-        self.chat_view.append('<div style="font-size:6px;"> </div>')
+        self.chat_view.append(bubble_html(role, content))
 
     def _send_message(self) -> None:
         if self._busy:

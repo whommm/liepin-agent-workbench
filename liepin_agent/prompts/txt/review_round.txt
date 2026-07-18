@@ -42,7 +42,7 @@
 - 结果多但噪音高：定位泛化词、岗位/职级错配或行业偏差，只收紧一个维度。
 - city 非空且结果稀少：优先只去掉 city，保持 query 不变。
 - target_company：公司名放 filters.company；query 写业务词，不把公司名重复放进 query。
-- query 通常 1-3 个简历中会出现的词。filters 仅允许 city、active_days、education、company，严禁 work_years；年龄和性别不得自动转成平台硬筛选。
+- query 通常 1-3 个简历中会出现的词。filters 仅允许 city、active_days、education、company，严禁 work_years；年龄不得自动转成平台硬筛选；性别筛选由系统按 JD 性别要求自动处理，无需填写。
 - filters.city 只能填直辖市/地级市：发现义乌、昆山、晋江、顺德、龙岗、宝安 这类县级市/区名必须映射到所属地级市（义乌→金华、昆山→苏州、晋江→泉州、顺德→佛山、龙岗→深圳），猎聘城市弹窗选不到县级市会直接报错中断。
 - 只有达到明确停止条件、预算耗尽或不同假设均已验证失败时才 stop。
 

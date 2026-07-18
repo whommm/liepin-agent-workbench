@@ -10,6 +10,8 @@ from ._models import (
     LiepinSearchPageChangedError,
     PageYieldStats,
     PaginationDecision,
+    SearchCursor,
+    SearchCursorLostError,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "AdaptivePaginationPolicy",
     "PageYieldStats",
     "PaginationDecision",
+    "SearchCursor",
+    "SearchCursorLostError",
 ]

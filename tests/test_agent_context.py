@@ -1,6 +1,7 @@
 import json
 
 from liepin_agent.agent.brain import LLMAgentBrain
+from liepin_agent.agent.planner import Planner
 from liepin_agent.agent.context import (
     FETCH_CONTEXT_CHAR_BUDGET,
     FETCH_DISPUTED_LIMIT,
@@ -320,6 +321,89 @@ def test_plan_filter_guard_keeps_only_confirmed_recall_safe_filters():
     plan = LLMAgentBrain._plan_from_data(data, criteria)
 
     assert plan.filters == {"city": ["深圳"], "education": "本科"}
+
+
+def test_plan_filter_guard_injects_gender_from_jd_requirement():
+    data = {
+        "query": "LNG 销售",
+        "filters": {"city": ["深圳"]},
+        "search_hypothesis_type": "core_background",
+    }
+    criteria = {
+        "city_scope": ["深圳"],
+        "gender_requirement": "男",
+    }
+
+    plan = LLMAgentBrain._plan_from_data(data, criteria)
+
+    assert plan.filters["gender"] == "男"
+
+
+def test_plan_filter_guard_overrides_wrong_llm_gender():
+    data = {
+        "query": "LNG 销售",
+        "filters": {"gender": "女"},
+        "search_hypothesis_type": "core_background",
+    }
+    criteria = {"gender_requirement": "男"}
+
+    plan = LLMAgentBrain._plan_from_data(data, criteria)
+
+    assert plan.filters["gender"] == "男"
+
+
+def test_plan_filter_guard_pops_gender_when_requirement_not_specific():
+    for requirement in ("不限", ""):
+        data = {
+            "query": "LNG 销售",
+            "filters": {"gender": "男"},
+            "search_hypothesis_type": "core_background",
+        }
+        criteria = {"gender_requirement": requirement}
+
+        plan = LLMAgentBrain._plan_from_data(data, criteria)
+
+        assert "gender" not in plan.filters
+
+
+def test_planner_fallback_injects_gender_filter():
+    planner = Planner()
+    criteria = planner.build_criteria("岗位名称：销售总监\n性别要求：女", "")
+    assert criteria["gender_requirement"] == "女"
+
+    plan = planner.initial_plan("岗位名称：销售总监\n性别要求：女", "", criteria)
+
+    assert plan.filters.get("gender") == "女"
+
+
+class _CriteriaWithoutGenderClient:
+    """LLM 的 build_criteria 提示词不要求输出 gender_requirement。"""
+
+    def chat(self, prompt, system_message=""):
+        return json.dumps({"core_requirement": "销售经验"}, ensure_ascii=False)
+
+
+def test_llm_build_criteria_extracts_gender_deterministically():
+    brain = LLMAgentBrain(_CriteriaWithoutGenderClient())
+
+    criteria = brain.build_criteria("岗位名称：销售总监\n性别要求：男", "")
+
+    assert criteria["gender_requirement"] == "男"
+
+
+def test_plan_filter_guard_extracts_gender_from_requirements_text():
+    # 讨论确认环节人工把性别要求写进了 requirements_text，但
+    # gender_requirement 字段未同步时，护栏应从要求文本补提。
+    data = {
+        "query": "LNG 销售",
+        "filters": {},
+        "search_hypothesis_type": "core_background",
+    }
+    criteria = {"requirements_text": "本科以上，性别要求：女"}
+
+    plan = LLMAgentBrain._plan_from_data(data, criteria)
+
+    assert plan.filters["gender"] == "女"
 
 
 def test_plan_signature_and_duplicate_fallback_are_deterministic():

@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -22,9 +23,19 @@ from ..core.liepin_search_service import (
     LiepinSearchCandidate,
     LiepinSearchService,
 )
+from ..core.search import SearchCursor
 from ..domain.models import CandidateDetail, CandidateSummary, SearchPlan
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SearchRoundResult:
+    """One search batch: candidate cards plus the pagination cursor/state."""
+
+    candidates: List[CandidateSummary] = field(default_factory=list)
+    cursor: Optional[SearchCursor] = None
+    page_stats: List[Dict[str, object]] = field(default_factory=list)
 
 
 def _load_json_config(name: str) -> Dict[str, object]:
@@ -83,55 +94,33 @@ class RealLiepinTool:
         round_id: str,
         plan: SearchPlan,
         known_candidate_keys: Optional[List[str]] = None,
-    ) -> List[CandidateSummary]:
-        """Run one real Liepin search and return only result-card summaries."""
+    ) -> SearchRoundResult:
+        """Run one real Liepin search and return cards plus pagination state."""
         _ = session_id, round_id
         filters = self._map_filters(plan.filters or {})
 
         query = plan.query
 
-        max_pages = getattr(
-            self.config_manager.config, "search_max_pages_per_round", 10
+        max_pages = self._page_cap()
+        pagination_policy = self._build_pagination_policy(max_pages)
+        candidate_classifier = (
+            self._pagination_classifier(plan) if pagination_policy is not None else None
         )
-        pagination_policy = None
-        candidate_classifier = None
+        checkpoint_pages = None
         if getattr(
-            self.config_manager.config, "search_adaptive_pagination_enabled", True
+            self.config_manager.config, "search_agent_pagination_enabled", True
         ):
-            pagination_policy = AdaptivePaginationPolicy(
-                min_pages=getattr(
-                    self.config_manager.config, "search_min_pages_per_round", 3
-                ),
-                max_pages=max_pages,
-                low_yield_patience=getattr(
-                    self.config_manager.config,
-                    "search_low_yield_page_patience",
-                    2,
-                ),
-                min_new_unique=getattr(
-                    self.config_manager.config,
-                    "search_min_new_unique_per_page",
-                    3,
-                ),
-                min_promising=getattr(
-                    self.config_manager.config,
-                    "search_min_promising_per_page",
-                    1,
-                ),
-                duplicate_rate_threshold=getattr(
-                    self.config_manager.config,
-                    "search_duplicate_rate_threshold",
-                    0.8,
-                ),
+            checkpoint_pages = getattr(
+                self.config_manager.config, "search_pagination_checkpoint_pages", 3
             )
-            candidate_classifier = self._pagination_classifier(plan)
         logger.warning(
-            "RealLiepinTool search query=%s position=%s filters=%s max_pages=%s adaptive=%s",
+            "RealLiepinTool search query=%s position=%s filters=%s max_pages=%s adaptive=%s agent_pagination=%s",
             query,
             plan.position_filter,
             filters,
             max_pages,
             pagination_policy is not None,
+            checkpoint_pages is not None,
         )
         candidates = self.search_service.search(
             query,
@@ -143,11 +132,83 @@ class RealLiepinTool:
             pagination_policy=pagination_policy,
             candidate_classifier=candidate_classifier,
             known_candidate_keys=known_candidate_keys,
+            checkpoint_pages=checkpoint_pages,
         )
-        return [
-            self._to_candidate_summary(item, index)
-            for index, item in enumerate(candidates or [])
-        ]
+        return self._to_search_round_result(candidates)
+
+    def continue_search_round(
+        self,
+        plan: SearchPlan,
+        cursor: SearchCursor,
+        additional_pages: int,
+    ) -> SearchRoundResult:
+        """Continue paging from ``cursor`` after an agent pagination decision."""
+        pagination_policy = self._build_pagination_policy(self._page_cap())
+        candidate_classifier = (
+            self._pagination_classifier(plan) if pagination_policy is not None else None
+        )
+        candidates = self.search_service.resume_pagination(
+            cursor,
+            additional_pages,
+            page_cap=self._page_cap(),
+            pagination_policy=pagination_policy,
+            candidate_classifier=candidate_classifier,
+        )
+        return self._to_search_round_result(candidates, cursor=cursor)
+
+    def _page_cap(self) -> int:
+        return getattr(self.config_manager.config, "search_max_pages_per_round", 10)
+
+    def _build_pagination_policy(
+        self, max_pages: int
+    ) -> Optional[AdaptivePaginationPolicy]:
+        """Build the bounded policy used as pagination signal/rule fallback."""
+        if not getattr(
+            self.config_manager.config, "search_adaptive_pagination_enabled", True
+        ):
+            return None
+        return AdaptivePaginationPolicy(
+            min_pages=getattr(
+                self.config_manager.config, "search_min_pages_per_round", 3
+            ),
+            max_pages=max_pages,
+            low_yield_patience=getattr(
+                self.config_manager.config,
+                "search_low_yield_page_patience",
+                2,
+            ),
+            min_new_unique=getattr(
+                self.config_manager.config,
+                "search_min_new_unique_per_page",
+                3,
+            ),
+            min_promising=getattr(
+                self.config_manager.config,
+                "search_min_promising_per_page",
+                1,
+            ),
+            duplicate_rate_threshold=getattr(
+                self.config_manager.config,
+                "search_duplicate_rate_threshold",
+                0.8,
+            ),
+        )
+
+    def _to_search_round_result(
+        self,
+        candidates: Optional[List[LiepinSearchCandidate]],
+        cursor: Optional[SearchCursor] = None,
+    ) -> SearchRoundResult:
+        cursor = cursor or getattr(self.search_service, "last_search_cursor", None)
+        history = list(getattr(cursor, "history", None) or [])
+        return SearchRoundResult(
+            candidates=[
+                self._to_candidate_summary(item, index)
+                for index, item in enumerate(candidates or [])
+            ],
+            cursor=cursor,
+            page_stats=[stats.to_dict() for stats in history],
+        )
 
     @staticmethod
     def _pagination_classifier(

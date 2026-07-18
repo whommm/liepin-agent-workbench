@@ -9,7 +9,6 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QPushButton,
     QVBoxLayout,
 )
@@ -22,6 +21,7 @@ if TYPE_CHECKING:
 STATUS_COLORS: Dict[str, str] = {
     "running": "#2f6b4f",
     "waiting_approval": "#a96632",
+    "user_dialog": "#a96632",
     "paused": "#667085",
     "criteria_draft": "#a96632",
     "criteria_confirmed": "#2f6b4f",
@@ -34,6 +34,7 @@ STATUS_LABELS: Dict[str, str] = {
     "criteria_draft": "待确认基准",
     "criteria_confirmed": "已确认",
     "running": "运行中",
+    "user_dialog": "对话中",
     "waiting_approval": "等待确认",
     "paused": "已暂停",
     "completed": "已完成",
@@ -135,26 +136,9 @@ class SessionListItemWidget(QFrame):
         btn_row.addStretch(1)
         content.addLayout(btn_row)
 
-        # 指令输入
-        cmd_layout = QHBoxLayout()
-        cmd_layout.setSpacing(4)
-        cmd_layout.setContentsMargins(0, 0, 0, 0)
-        self.command_input = QLineEdit()
-        self.command_input.setPlaceholderText("输入指令…")
-        self.command_input.setFixedHeight(22)
-        self.command_input.setStyleSheet("font-size: 11px; padding: 2px 6px;")
-        self.send_cmd_btn = QPushButton("发送")
-        self.send_cmd_btn.setStyleSheet(_mini_btn_style("primary"))
-        self.send_cmd_btn.setFixedHeight(22)
-        cmd_layout.addWidget(self.command_input, 1)
-        cmd_layout.addWidget(self.send_cmd_btn)
-        content.addLayout(cmd_layout)
-
         root_layout.addLayout(content, 1)
 
         # 事件绑定
-        self.send_cmd_btn.clicked.connect(self._on_send_command)
-        self.command_input.returnPressed.connect(self._on_send_command)
         self.continue_btn.clicked.connect(
             lambda: parent_window.toggle_session_run(self.session_id)
         )
@@ -170,13 +154,6 @@ class SessionListItemWidget(QFrame):
 
         if status in {"completed", "failed", "cancelled"}:
             self.stop_btn.setEnabled(False)
-            self.send_cmd_btn.setEnabled(False)
-
-    def _on_send_command(self) -> None:
-        text = self.command_input.text().strip()
-        if text:
-            self.parent_window.send_user_command(self.session_id, text)
-            self.command_input.clear()
 
     def update_from_session(self, session: Dict[str, object]) -> None:
         """增量更新状态，避免重建 widget 导致焦点丢失。"""
@@ -209,4 +186,3 @@ class SessionListItemWidget(QFrame):
 
         finished = status in {"completed", "failed", "cancelled"}
         self.stop_btn.setEnabled(not finished)
-        self.send_cmd_btn.setEnabled(not finished)

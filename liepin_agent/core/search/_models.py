@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 class LiepinSearchError(Exception):
@@ -16,6 +16,10 @@ class LiepinSearchPageChangedError(LiepinSearchError):
 
 class LiepinSearchNoResultsError(LiepinSearchError):
     """Raised when search succeeds but the page contains no candidate results."""
+
+
+class SearchCursorLostError(LiepinSearchError):
+    """Raised when a pagination cursor cannot be validated or recovered."""
 
 
 @dataclass
@@ -47,6 +51,11 @@ class PageYieldStats:
     duplicate_count: int = 0
     potential_count: int = 0
     validate_count: int = 0
+    # Signal-only verdict from AdaptivePaginationPolicy.assess for this page.
+    # None means no policy was active; the policy never terminates pagination
+    # directly in agent-driven (checkpoint) mode.
+    policy_continue: Optional[bool] = None
+    policy_reason: str = ""
 
     @property
     def duplicate_rate(self) -> float:
@@ -68,7 +77,30 @@ class PageYieldStats:
             "potential_count": self.potential_count,
             "validate_count": self.validate_count,
             "promising_count": self.promising_count,
+            "policy_continue": self.policy_continue,
+            "policy_reason": self.policy_reason,
         }
+
+
+@dataclass
+class SearchCursor:
+    """In-memory pagination cursor handed to the agent between search batches.
+
+    Not persisted and not shared across processes: on restart or session
+    recovery the cursor is dropped and the round finishes with already
+    persisted candidates (``known_candidate_keys`` replay prevents re-entry).
+    """
+
+    query: str
+    filters: Dict[str, Any] = field(default_factory=dict)
+    match_mode: str = ""
+    scope: str = ""
+    position_filter: str = ""
+    page_num: int = 0  # result page the browser is currently parked on
+    seen_keys: Set[str] = field(default_factory=set)  # cross-batch dedupe keys
+    history: List[PageYieldStats] = field(default_factory=list)
+    total_results: Optional[int] = None  # from page_meta
+    exhausted: bool = False  # no next result page available
 
 
 @dataclass(frozen=True)

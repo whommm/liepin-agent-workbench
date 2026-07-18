@@ -213,3 +213,19 @@ class RoundReview:
             "next_plan": self.next_plan.to_dict() if self.next_plan else None,
             "evidence": dict(self.evidence or {}),
         }
+
+
+@dataclass
+class PaginationVerdict:
+    """Agent decision on whether to keep paging the current search."""
+
+    action: str  # "continue" | "stop"
+    additional_pages: int = 0
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": self.action,
+            "additional_pages": int(self.additional_pages or 0),
+            "reason": self.reason,
+        }

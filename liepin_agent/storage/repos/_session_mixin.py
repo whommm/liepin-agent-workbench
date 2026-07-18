@@ -100,12 +100,13 @@ class _SessionMixin:
         interrupted_statuses = (
             SessionStatus.RUNNING.value,
             SessionStatus.WAITING_APPROVAL.value,
+            SessionStatus.USER_DIALOG.value,
         )
         with self.connect() as connection:
             rows = connection.execute(
                 """
                 SELECT id, title FROM search_sessions
-                WHERE status IN (?, ?)
+                WHERE status IN (?, ?, ?)
                 """,
                 interrupted_statuses,
             ).fetchall()

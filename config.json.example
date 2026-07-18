@@ -65,6 +65,11 @@
   "search_min_promising_per_page": 1,
   "search_duplicate_rate_threshold": 0.8,
 
+  "_comment_agent_pagination": "【Agent驱动续翻】搜索在检查点暂停，由 Agent 依据逐页产出决定再翻几页；search_max_pages_per_round 仍是 10 页硬帽。关闭 search_agent_pagination_enabled 即回退旧策略路径",
+  "search_agent_pagination_enabled": true,
+  "search_pagination_checkpoint_pages": 3,
+  "search_pagination_batch_max_pages": 3,
+
   "_comment_debug": "【调试】是否保存浏览器页面快照用于排错",
   "debug_snapshots_enabled": false
 }

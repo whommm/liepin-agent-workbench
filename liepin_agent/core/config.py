@@ -99,6 +99,14 @@ class AppConfig(BaseModel):
     search_min_promising_per_page: int = Field(default=1, ge=0, le=50)
     search_duplicate_rate_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
+    # Agent 驱动续翻分页：搜索在检查点暂停，由 brain 依据逐页产出决定
+    # 再翻几页；search_max_pages_per_round 仍是 10 页安全硬帽。关闭
+    # search_agent_pagination_enabled 即回退到 AdaptivePaginationPolicy
+    # 直接决策的旧路径（回滚保险）。
+    search_agent_pagination_enabled: bool = True
+    search_pagination_checkpoint_pages: int = Field(default=3, ge=1, le=10)
+    search_pagination_batch_max_pages: int = Field(default=3, ge=1, le=10)
+
     # 浏览器自动化参数
     browser_task_timeout: int = Field(default=180, ge=30, le=600)
     detail_page_wait_seconds: float = Field(default=0.6, ge=0.0, le=10.0)

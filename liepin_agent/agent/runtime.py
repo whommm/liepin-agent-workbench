@@ -132,6 +132,31 @@ class AgentRuntime:
             self.store.update_session_status(session_id, SessionStatus.RUNNING.value)
             self._notify(session_id)
 
+    def interrupt_for_dialog(self, session_id: str) -> bool:
+        """Pause the agent at its next checkpoint and enter user-dialog state.
+
+        Unlike cancel, this is cooperative: the runtime thread parks inside
+        ``_respect_control_flags`` and background match results keep being
+        written. Returns False when no live thread exists for the session.
+        """
+        event = self._pause_events.get(session_id)
+        if event is None or not self.is_active(session_id):
+            return False
+        event.set()
+        self.store.update_session_status(
+            session_id, SessionStatus.USER_DIALOG.value
+        )
+        self._notify(session_id)
+        return True
+
+    def end_dialog(self, session_id: str) -> None:
+        """Leave user-dialog state and let the parked runtime thread continue."""
+        event = self._pause_events.get(session_id)
+        if event:
+            event.clear()
+        self.store.update_session_status(session_id, SessionStatus.RUNNING.value)
+        self._notify(session_id)
+
     def run_session(
         self,
         session_id: str,
@@ -380,6 +405,9 @@ class AgentRuntime:
                     {"query": plan.query, "position_filter": plan.position_filter},
                 )
                 search_started = time.monotonic()
+                raw_candidates: List[CandidateSummary] = []
+                search_cursor = None
+                page_stats: List[Dict[str, object]] = []
                 try:
                     search_kwargs = {}
                     if "known_candidate_keys" in inspect.signature(
@@ -388,13 +416,16 @@ class AgentRuntime:
                         search_kwargs["known_candidate_keys"] = (
                             self.store.list_candidate_dedupe_keys(session_id)
                         )
-                    raw_candidates = self.browser_queue.run(
+                    search_result = self.browser_queue.run(
                         self.liepin_tool.run_search_round,
                         session_id,
                         round_id,
                         plan,
                         cancel_event=cancel_event,
                         **search_kwargs,
+                    )
+                    raw_candidates, search_cursor, page_stats = (
+                        self._normalize_search_result(search_result)
                     )
                 except Exception as exc:
                     if not self._is_no_results_error(exc):
@@ -417,6 +448,18 @@ class AgentRuntime:
                     criteria,
                 )
                 self._respect_control_flags(session_id, cancel_event, pause_event)
+                candidates = self._run_pagination_batches(
+                    session_id,
+                    round_id,
+                    plan,
+                    criteria,
+                    candidates,
+                    raw_candidates,
+                    search_cursor,
+                    page_stats,
+                    cancel_event,
+                    pause_event,
+                )
                 deduped_count = len({item.id for item in candidates})
                 prequalified_count = sum(
                     1 for item in candidates if item.card_decision == "fetch"
@@ -1006,6 +1049,167 @@ class AgentRuntime:
             saved.append(candidate)
         self._notify(session_id)
         return saved
+
+    @staticmethod
+    def _normalize_search_result(
+        result: object,
+    ) -> Tuple[List[CandidateSummary], Optional[object], List[Dict[str, object]]]:
+        """Accept both ``SearchRoundResult`` and legacy plain candidate lists."""
+        candidates = getattr(result, "candidates", None)
+        if candidates is None:
+            return list(result or []), None, []
+        return (
+            list(candidates or []),
+            getattr(result, "cursor", None),
+            list(getattr(result, "page_stats", None) or []),
+        )
+
+    @staticmethod
+    def _is_cursor_lost_error(exc: Exception) -> bool:
+        return exc.__class__.__name__ == "SearchCursorLostError"
+
+    @staticmethod
+    def _pagination_card_samples(
+        candidates: List[CandidateSummary], limit: int = 10
+    ) -> List[Dict[str, str]]:
+        samples: List[Dict[str, str]] = []
+        for item in list(candidates or [])[-limit:]:
+            samples.append(
+                {
+                    "name": getattr(item, "name", "") or "",
+                    "current_title": getattr(item, "current_title", "") or "",
+                    "current_company": getattr(item, "current_company", "") or "",
+                    "city": getattr(item, "city", "") or "",
+                }
+            )
+        return samples
+
+    def _run_pagination_batches(
+        self,
+        session_id: str,
+        round_id: str,
+        plan: SearchPlan,
+        criteria: Dict[str, object],
+        candidates: List[CandidateSummary],
+        raw_candidates: List[CandidateSummary],
+        search_cursor: Optional[object],
+        page_stats: List[Dict[str, object]],
+        cancel_event: threading.Event,
+        pause_event: threading.Event,
+    ) -> List[CandidateSummary]:
+        """Let the brain keep paging the current search between browser tasks.
+
+        No-op unless agent-driven pagination is enabled and the tool returned
+        a cursor. Each brain decision grants N more pages; one browser task
+        fetches at most ``search_pagination_batch_max_pages`` pages so
+        cancellation stays responsive and the browser task timeout is never
+        pressured. The 10-page hard cap remains the final risk guardrail.
+        """
+        if search_cursor is None:
+            return candidates
+        if not getattr(self.config, "search_agent_pagination_enabled", True):
+            return candidates
+        continue_search = getattr(self.liepin_tool, "continue_search_round", None)
+        decide_pagination = getattr(self.brain, "decide_pagination", None)
+        if continue_search is None or decide_pagination is None:
+            return candidates
+
+        hard_cap = min(
+            10,
+            max(
+                1,
+                int(getattr(self.config, "search_max_pages_per_round", 10) or 10),
+            ),
+        )
+        batch_max = min(
+            10,
+            max(
+                1,
+                int(getattr(self.config, "search_pagination_batch_max_pages", 3) or 3),
+            ),
+        )
+        cursor = search_cursor
+        latest_batch = list(raw_candidates)
+        remaining_grant = 0
+        while not cursor.exhausted and cursor.page_num < hard_cap:
+            self._respect_control_flags(session_id, cancel_event, pause_event)
+            if remaining_grant <= 0:
+                verdict = decide_pagination(
+                    plan=plan,
+                    criteria=criteria,
+                    page_stats=list(page_stats),
+                    cursor_page_num=cursor.page_num,
+                    hard_cap=hard_cap,
+                    total_results=cursor.total_results,
+                    has_next_page=not cursor.exhausted,
+                    new_card_samples=self._pagination_card_samples(latest_batch),
+                )
+                self._event(
+                    session_id,
+                    round_id,
+                    AgentEventType.PAGINATION_DECISION.value,
+                    "翻页决策",
+                    verdict.reason,
+                    {
+                        **verdict.to_dict(),
+                        "page_num": cursor.page_num,
+                        "hard_cap": hard_cap,
+                        "total_results": cursor.total_results,
+                        "page_stats": list(page_stats),
+                        "prompt_metrics": dict(
+                            getattr(self.brain, "last_prompt_metrics", {}).get(
+                                "decide_pagination", {}
+                            )
+                        ),
+                    },
+                )
+                if str(verdict.action) != "continue":
+                    break
+                remaining_grant = max(
+                    1,
+                    min(
+                        int(verdict.additional_pages or 1),
+                        hard_cap - cursor.page_num,
+                    ),
+                )
+            batch_pages = min(remaining_grant, batch_max, hard_cap - cursor.page_num)
+            if batch_pages <= 0:
+                break
+            try:
+                batch_result = self.browser_queue.run(
+                    continue_search,
+                    plan,
+                    cursor,
+                    batch_pages,
+                    cancel_event=cancel_event,
+                )
+            except Exception as exc:
+                if self._is_cursor_lost_error(exc):
+                    self._event(
+                        session_id,
+                        round_id,
+                        AgentEventType.PAGINATION_DECISION.value,
+                        "搜索游标丢失",
+                        "两批之间猎聘页面状态丢失且恢复失败，按已入库候选收尾本轮。",
+                        {"error": str(exc), "page_num": cursor.page_num},
+                    )
+                    break
+                raise
+            batch_candidates, cursor, page_stats = self._normalize_search_result(
+                batch_result
+            )
+            remaining_grant -= batch_pages
+            saved = self._persist_round_candidates(
+                session_id,
+                round_id,
+                batch_candidates,
+                plan,
+                criteria,
+            )
+            candidates.extend(saved)
+            raw_candidates.extend(batch_candidates)
+            latest_batch = list(batch_candidates)
+        return candidates
 
     @staticmethod
     def _plan_from_round(row: Dict[str, object]) -> SearchPlan:
@@ -1780,13 +1984,20 @@ class AgentRuntime:
         ):
             raise RuntimeError("用户已取消任务")
         while pause_event.is_set():
-            self.store.update_session_status(session_id, SessionStatus.PAUSED.value)
+            # 对话状态下保持 user_dialog，不覆盖成 paused，方便 UI 区分
+            # 「用户手动暂停」和「打断后与 Agent 对话中」。
+            current_status = self._session_status(session_id)
+            if current_status != SessionStatus.USER_DIALOG.value:
+                self.store.update_session_status(session_id, SessionStatus.PAUSED.value)
             self._notify(session_id)
             time.sleep(0.3)
             if cancel_event.is_set():
                 raise RuntimeError("用户已取消任务")
         current = self.store.get_session(session_id)
-        if current and current.get("status") == SessionStatus.PAUSED.value:
+        if current and current.get("status") in {
+            SessionStatus.PAUSED.value,
+            SessionStatus.USER_DIALOG.value,
+        }:
             self.store.update_session_status(session_id, SessionStatus.RUNNING.value)
             self._notify(session_id)
 

@@ -12,7 +12,7 @@ from html import escape
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
+from PySide6.QtCore import QEvent, QItemSelectionModel, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -46,6 +46,7 @@ from ..core.config import ConfigManager
 from ..domain.job_profile import normalize_job_profile
 from ..domain.greeting_policy import parse_recommendation_state
 from ..domain.recommendation import RECOMMENDATION_LABELS, recommendation_label
+from ..services.agent_chat import AgentChatService
 from ..services.event_bus import EventBus
 from ..storage.sqlite_store import SQLiteStore, from_json
 from ..tools.exporter import ExportService
@@ -59,11 +60,17 @@ from .dialogs import (
     PoolNotificationDialog,
     SettingsDialog,
 )
-from .session_list_item import SessionListItemWidget
+from .chat_bubbles import bubble_html
+from .session_list_item import STATUS_LABELS, SessionListItemWidget
 from .styles import MAIN_STYLESHEET
 
 
 logger = logging.getLogger(__name__)
+
+
+class _AgentChatSignals(QObject):
+    replied = Signal(str, str)
+    failed = Signal(str, str)
 
 
 class MainWindow(QMainWindow):
@@ -93,6 +100,13 @@ class MainWindow(QMainWindow):
         self._runtime_refresh_interval = 1.0
         self._heavy_refresh_interval = 5.0
         self._feedback_summary_snapshot: Dict[str, object] = {}
+        self.chat_service = AgentChatService.from_config(
+            self.config_manager, self.store
+        )
+        self._chat_signals = _AgentChatSignals(self)
+        self._chat_signals.replied.connect(self._on_chat_reply)
+        self._chat_signals.failed.connect(self._on_chat_failed)
+        self._chat_busy = False
 
         # Cache for incremental session-list updates
         self._session_list_ids: List[str] = []
@@ -135,6 +149,9 @@ class MainWindow(QMainWindow):
         self.runtime.browser_queue.shutdown()
         self.runtime.match_queue.shutdown()
         self.runtime = self._build_runtime()
+        self.chat_service = AgentChatService.from_config(
+            self.config_manager, self.store
+        )
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -310,6 +327,30 @@ class MainWindow(QMainWindow):
         self.timeline = QTextBrowser()
         self.timeline.setOpenExternalLinks(False)
         timeline_layout.addWidget(self.timeline, 1)
+
+        # 对话栏：随时打断 Agent 并与其沟通，消息与回复渲染进运行记录
+        self.chat_hint_label = QLabel("选择任务后，可随时给 Agent 发消息。")
+        self.chat_hint_label.setObjectName("HintLabel")
+        timeline_layout.addWidget(self.chat_hint_label)
+        chat_row = QHBoxLayout()
+        chat_row.setSpacing(6)
+        self.chat_input = QTextEdit()
+        self.chat_input.setPlaceholderText(
+            "向 Agent 说明你的想法（Ctrl+Enter 发送）；运行中的任务会被打断进入对话"
+        )
+        self.chat_input.setFixedHeight(52)
+        self.chat_input.installEventFilter(self)
+        chat_row.addWidget(self.chat_input, 1)
+        self.chat_send_btn = QPushButton("发送")
+        self.chat_send_btn.setObjectName("AccentBtn")
+        self.chat_send_btn.setFixedWidth(72)
+        self.end_dialog_btn = QPushButton("继续执行")
+        self.end_dialog_btn.setObjectName("SuccessBtn")
+        self.end_dialog_btn.setToolTip("结束对话，Agent 继续工作并采纳沟通结论")
+        self.end_dialog_btn.setVisible(False)
+        chat_row.addWidget(self.chat_send_btn, 0, Qt.AlignBottom)
+        chat_row.addWidget(self.end_dialog_btn, 0, Qt.AlignBottom)
+        timeline_layout.addLayout(chat_row)
 
         table_frame = QFrame()
         table_frame.setObjectName("Panel")
@@ -687,6 +728,8 @@ class MainWindow(QMainWindow):
         self.refresh_ranking_btn.clicked.connect(self._refresh_candidate_ranking)
         self.session_list.currentItemChanged.connect(self._on_session_changed)
         self.candidate_table.itemSelectionChanged.connect(self._on_candidate_selected)
+        self.chat_send_btn.clicked.connect(self._send_chat_message)
+        self.end_dialog_btn.clicked.connect(self._end_dialog_and_resume)
         self.save_feedback_btn.clicked.connect(self._save_candidate_feedback)
         self.pairwise_feedback_btn.clicked.connect(self._save_pairwise_feedback)
         self.save_outcome_btn.clicked.connect(self._save_candidate_outcome)
@@ -732,6 +775,11 @@ class MainWindow(QMainWindow):
 
     def toggle_session_run(self, session_id: str) -> None:
         session = self.store.get_session(session_id) or {}
+        if str(session.get("status") or "") == "user_dialog":
+            # 对话状态下"继续"= 结束对话并恢复执行
+            self.selected_session_id = session_id
+            self._end_dialog_and_resume()
+            return
         if (
             str(session.get("status") or "") == "running"
             and self.runtime.is_active(session_id)
@@ -836,20 +884,136 @@ class MainWindow(QMainWindow):
         self._criteria_dirty = False
         self._mark_dirty()
 
-    def send_user_command(self, session_id: str, command: str) -> None:
-        command = command.strip()
-        if not command:
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt API
+        if obj is self.chat_input and event.type() == QEvent.Type.KeyPress:
+            if (
+                event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and event.modifiers() & Qt.ControlModifier
+            ):
+                self._send_chat_message()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _send_chat_message(self) -> None:
+        text = self.chat_input.toPlainText().strip()
+        session_id = self.selected_session_id
+        if not text or not session_id or self._chat_busy:
             return
-        self.store.set_pending_user_command(session_id, command)
+        session = self.store.get_session(session_id) or {}
+        status = str(session.get("status") or "")
+        if status in {"completed", "cancelled", "failed"}:
+            return
+        self.store.add_event(session_id, None, "user_message", "我", text, {})
+        self.chat_input.clear()
+        interrupted = False
+        if status == "running" and self.runtime.is_active(session_id):
+            interrupted = self.runtime.interrupt_for_dialog(session_id)
+        if interrupted:
+            self.store.add_event(
+                session_id,
+                None,
+                "dialog_interrupted",
+                "已进入对话",
+                "收到你的消息，Agent 会在当前操作完成后暂停，沟通好后点击「继续执行」。",
+                {},
+            )
+        self._mark_dirty()
+
+        self._chat_busy = True
+        self.chat_send_btn.setEnabled(False)
+        self.chat_send_btn.setText("思考中...")
+        history = self.chat_service.load_history(session_id)
+
+        def _run() -> None:
+            try:
+                reply = self.chat_service.reply(session_id, history)
+                self._chat_signals.replied.emit(session_id, reply)
+            except Exception as exc:  # reply() 内部已有兜底，这里是双保险
+                self._chat_signals.failed.emit(session_id, str(exc))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_chat_reply(self, session_id: str, reply: str) -> None:
+        self.store.add_event(session_id, None, "agent_reply", "寻访 Agent", reply, {})
+        self._chat_busy = False
+        self.chat_send_btn.setText("发送")
+        self._mark_dirty()
+
+    def _on_chat_failed(self, session_id: str, error: str) -> None:
         self.store.add_event(
             session_id,
             None,
-            "user_command",
-            "用户发送指令",
-            command,
+            "agent_reply",
+            "寻访 Agent",
+            "（回复失败：{}；你的消息已记录，继续执行后会生效）".format(error or "未知错误"),
+            {},
+        )
+        self._chat_busy = False
+        self.chat_send_btn.setText("发送")
+        self._mark_dirty()
+
+    def _end_dialog_and_resume(self) -> None:
+        session_id = self.selected_session_id
+        if not session_id:
+            return
+        session = self.store.get_session(session_id) or {}
+        status = str(session.get("status") or "")
+
+        # 收集本轮对话中用户的消息作为结论：自上一个 dialog_resumed 以来的 user_message
+        events = self.store.list_events(session_id)
+        boundary = 0
+        for index, event in enumerate(events):
+            if str(event.get("event_type") or "") == "dialog_resumed":
+                boundary = index + 1
+        user_turns = [
+            str(event.get("message") or "").strip()
+            for event in events[boundary:]
+            if str(event.get("event_type") or "") == "user_message"
+            and str(event.get("message") or "").strip()
+        ]
+        if user_turns:
+            self.store.set_pending_user_command(session_id, "\n".join(user_turns))
+
+        if status == "user_dialog":
+            self.runtime.end_dialog(session_id)
+        self.store.add_event(
+            session_id,
+            None,
+            "dialog_resumed",
+            "继续执行",
+            "对话结束，沟通结论将在本轮结束后纳入下一轮搜索计划。"
+            if user_turns
+            else "对话结束，继续执行当前任务。",
             {},
         )
         self._mark_dirty()
+
+    def _update_chat_bar_state(self) -> None:
+        session_id = self.selected_session_id
+        session: Dict[str, object] = {}
+        if session_id:
+            session = (
+                self._session_rows_by_id.get(session_id)
+                or self.store.get_session(session_id)
+                or {}
+            )
+        status = str(session.get("status") or "")
+        terminal = not session_id or status in {"completed", "cancelled", "failed"}
+        in_dialog = status == "user_dialog"
+        self.chat_input.setEnabled(not terminal)
+        self.chat_send_btn.setEnabled(not terminal and not self._chat_busy)
+        self.end_dialog_btn.setVisible(in_dialog)
+        if not session_id:
+            hint = "选择任务后，可随时给 Agent 发消息。"
+        elif terminal:
+            hint = "任务已结束，无法继续对话。"
+        elif in_dialog:
+            hint = "对话中：Agent 已暂停。沟通好后点击「继续执行」，结论将用于调整下一轮搜索。"
+        elif status == "running":
+            hint = "发送消息会打断 Agent 进入对话（Ctrl+Enter 发送）。"
+        else:
+            hint = "可随时给 Agent 留言（Ctrl+Enter 发送）。"
+        self.chat_hint_label.setText(hint)
 
     def export_session(self, session_id: str) -> None:
         exporter = ExportService(self.store, self.workspace_root / "exports")
@@ -2089,6 +2253,7 @@ class MainWindow(QMainWindow):
             self.log_view.clear()
             self._update_manual_greeting_button_state()
             self._update_feedback_controls_state()
+            self._update_chat_bar_state()
             return
         session = self._session_rows_by_id.get(self.selected_session_id) or {}
         if not session:
@@ -2112,7 +2277,9 @@ class MainWindow(QMainWindow):
             )
         self.stage_label.setText(
             "状态：{}{}".format(
-                session.get("status") or "",
+                STATUS_LABELS.get(
+                    str(session.get("status") or ""), str(session.get("status") or "")
+                ),
                 " | {}".format(stage_text) if stage_text else "",
             )
         )
@@ -2142,12 +2309,23 @@ class MainWindow(QMainWindow):
             self._render_quality_dashboard()
         self._update_manual_greeting_button_state()
         self._update_feedback_controls_state()
+        self._update_chat_bar_state()
 
     def _render_timeline(
         self, events: List[Dict[str, object]], limit: int = 80
     ) -> None:
         lines = []
         for event in events[-max(1, int(limit)):]:
+            event_type = str(event.get("event_type") or "")
+            if event_type in {"user_message", "agent_reply"}:
+                role = "user" if event_type == "user_message" else "assistant"
+                label = "我" if role == "user" else "寻访 Agent"
+                lines.append(
+                    bubble_html(
+                        role, str(event.get("message") or ""), label=label
+                    )
+                )
+                continue
             lines.append(
                 "<p><b>{}</b> <span style='color:#8a8070'>{}</span><br>{}</p>".format(
                     self._html(event.get("title")),
@@ -2863,7 +3041,7 @@ class MainWindow(QMainWindow):
             if status in {"completed", "failed", "cancelled"}:
                 self.store.update_pool_status(active["session_id"], "completed")
                 active = None
-            elif status in {"running", "waiting_approval", "criteria_draft", "criteria_confirmed", "ready", "paused"}:
+            elif status in {"running", "user_dialog", "waiting_approval", "criteria_draft", "criteria_confirmed", "ready", "paused"}:
                 # Still in progress; do nothing
                 self._active_pool_session_id = active["session_id"]
                 self._refresh_pool()
@@ -3009,6 +3187,7 @@ class MainWindow(QMainWindow):
                 "criteria_draft": "待确认基准",
                 "criteria_confirmed": "已确认",
                 "running": "运行中",
+                "user_dialog": "对话中",
                 "waiting_approval": "等待确认",
                 "paused": "已暂停",
             }
